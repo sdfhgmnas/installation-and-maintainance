@@ -3,10 +3,48 @@ const modalOverlay = document.getElementById("modalOverlay");
 const modal = document.getElementById("modal");
 const toast = document.getElementById("toast");
 
+// App version — bump on every meaningful edit so deployed copies are
+// visibly identifiable.
+const APP_VERSION = "3.9.15";
+
 const USERS = {
-  akash: { password: "akash", role: "akash" },
-  admin: { password: "Password", role: "admin" },
+  akash:     { password: "akash",     role: "akash" },
+  admin:     { password: "password1", role: "admin" },
+  abhinav:   { password: "abhinav",   role: "stock-manager" },
+  collector: { password: "collector", role: "collector" },
 };
+
+// Default page permissions (used as fallback when DB doesn't have a row)
+const DEFAULT_PERMISSIONS = {
+  admin:     { displayName: "Admin",                   isAdmin: true,  allowedPages: ["dashboard","installations","repairs","pending","sim-db","stock","accounts","renewals","timeline","deletions","user-access"] },
+  akash:     { displayName: "Akash (Field Worker)",    isAdmin: false, allowedPages: ["akash-home","akash-deleted","install","repair"] },
+  abhinav:   { displayName: "Abhinav (Stock Manager)", isAdmin: false, allowedPages: ["stock"] },
+  collector: { displayName: "Collector (Renewals)",    isAdmin: false, allowedPages: ["renewals"] },
+};
+
+// Loaded from DB on app init; falls back to DEFAULT_PERMISSIONS
+let userPermissions = {};
+
+function getUserPerms(username) {
+  return userPermissions[username] || DEFAULT_PERMISSIONS[username] || null;
+}
+
+function userCanAccess(pageKey) {
+  if (!currentUser) return false;
+  const perms = getUserPerms(currentUser);
+  if (!perms) return false;
+  if (perms.isAdmin) return true; // admin gets everything
+  return (perms.allowedPages || []).includes(pageKey);
+}
+
+function landingPageFor(username) {
+  const perms = getUserPerms(username);
+  if (!perms) return "login";
+  if (username === "akash") return "akash-home";
+  if (username === "admin") return "dashboard";
+  // Other users: land on their first allowed page
+  return (perms.allowedPages || [])[0] || "login";
+}
 
 function validateLogin(username, password) {
   const user = USERS[username.toLowerCase().trim()];
@@ -16,19 +54,1136 @@ function validateLogin(username, password) {
 
 let currentUser = null;
 let view = "login";
-let adminTab = "installations";
+let notifications = []; // {id, title, body, type, timestamp, read, link}
+let notifPanelOpen = false;
+let appLoadedAt = Date.now(); // baseline for filtering "new" events
+let knownInstallIds = new Set(); // tracks what we've already seen
+let knownRepairIds = new Set();
 let searchQuery = "";
+let pendingFilter = "all";
+let showCompleted = false;
+let timelineQuery = "";
+let simDbQuery = "";
+let simSourceFilter = "all"; // all | installed | stock | manual
+let simCompletenessFilter = "all"; // all | needs_primary | needs_secondary | complete
+let stockQuery = "";
+let stockCategoryFilter = "all";
 let installations = [];
 let maintenanceRecords = [];
+let sims = [];
+let stockItems = [];
+let stockTransactions = [];
+let stockCategories = [];
+let suppliers = [];
+let deletionLog = [];
+let accountsProjects = [];
+let accountsTransactions = [];
+let renewals = [];
+let renewalsTableReady = true;
+let renewalsQuery = "";
+let renewalsCompanyFilter = "all";
+let renewalsStatusFilter = "all";  // all | overdue | expired | urgent | soon | upcoming | active | paid
+let renewalsYearFilter = "all";
+// v3.9.0 — accounts, seller profile, documents
+let renewalAccounts = [];
+let renewalAccountsTableReady = true;
+let sellerProfile = null;
+let sellerProfileTableReady = true;
+let renewalDocuments = [];
+let renewalDocumentsTableReady = true;
+let renewalSubView = "vehicles"; // vehicles | accounts | documents | settings
+let selectedVehicleIds = new Set();
+let accountFormData = null;
+let simsTableReady = true;
+let stockItemsTableReady = true;
+let stockTxTableReady = true;
+let stockCategoriesTableReady = true;
+let suppliersTableReady = true;
+let deletionLogTableReady = true;
 let isLoadingData = false;
+let lastSyncedAt = null;
+
+// Realtime state
+let realtimeChannel = null;
+let realtimeStatus = "idle";
+let refreshTimer = null;
+
+/* ============================================================
+   DELETION REASON PROMPT + AUDIT
+   Every destructive action goes through promptForReason and is
+   logged to deletion_log (visible to admin in the Deletions tab).
+   ============================================================ */
+
+function promptForReason({ title, message, confirmLabel = "Delete", placeholder = "Why are you deleting this?" }) {
+  return new Promise((resolve) => {
+    modal.innerHTML = `
+      <h3>🗑️ ${escapeHtml(title)}</h3>
+      ${message ? `<p class="modal-desc">${message}</p>` : ""}
+      <div class="field">
+        <label for="delReason">Reason for deletion <span class="required">*</span></label>
+        <input type="text" id="delReason" autocomplete="off" placeholder="${escapeHtml(placeholder)}" />
+        <p class="hint">This reason will be saved permanently in the audit log so admin can review what was deleted and why.</p>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+        <button type="button" class="btn btn-danger" data-act="confirm">${escapeHtml(confirmLabel)}</button>
+      </div>
+    `;
+    modalOverlay.classList.remove("hidden");
+    const input = modal.querySelector("#delReason");
+    input?.focus();
+    const done = (val) => {
+      closeModal();
+      resolve(val);
+    };
+    modal.querySelector('[data-act="cancel"]').onclick = () => done(null);
+    modal.querySelector('[data-act="confirm"]').onclick = () => {
+      const v = (input.value || "").trim();
+      if (!v) {
+        showToast("Please enter a reason for deletion.", true);
+        return;
+      }
+      done(v);
+    };
+    input?.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") done(null);
+      if (e.key === "Enter") {
+        e.preventDefault();
+        modal.querySelector('[data-act="confirm"]').click();
+      }
+    });
+    modalOverlay.onclick = (e) => {
+      if (e.target === modalOverlay) done(null);
+    };
+  });
+}
+
+async function auditDeletion({ entityType, entityId, entityLabel, reason, snapshot }) {
+  if (!deletionLogTableReady) return;
+  try {
+    await insertDeletionLog({
+      entityType,
+      entityId,
+      entityLabel,
+      reason,
+      deletedBy: currentUser || "unknown",
+      snapshot,
+    });
+  } catch (err) {
+    console.warn("Audit log write failed:", err);
+  }
+}
+
+
+/* ============================================================
+   STOCK AUTO-CONSUME
+   When an installation / repair uses an identifier (IMEI, SIM
+   secondary, sensor number, MAC), decrement the matching
+   stock_items row by 1 and log a transaction linked to the
+   installation so the Stock page shows "Used in VEHICLE-X" with
+   no manual ± Adjust needed.
+   ============================================================ */
+
+async function consumeStockFor(identifiers, link) {
+  if (!stockItemsTableReady) return { consumed: [] };
+  const seen = new Set();
+  const candidates = [];
+
+  function matchBy(predicate) {
+    for (const it of loadStockItems()) {
+      if (seen.has(it.id)) continue;
+      if (it.quantity <= 0) continue;
+      if (predicate(it)) {
+        candidates.push(it);
+        seen.add(it.id);
+      }
+    }
+  }
+
+  if (identifiers.imei) {
+    const v = String(identifiers.imei).trim().toLowerCase();
+    // Match metadata.imei (GPS items) — both lookup fields use it
+    matchBy((it) => (it.metadata?.imei || "").toLowerCase() === v);
+  }
+  if (identifiers.simSecondary) {
+    const v = String(identifiers.simSecondary).trim().toLowerCase();
+    matchBy(
+      (it) =>
+        (it.metadata?.secondary || "").toLowerCase() === v ||
+        (it.metadata?.primary || "").toLowerCase() === v ||
+        // FALLBACK: bulk-scanned SIM ICCIDs land in metadata.imei
+        // (only match this for SIM-category items to avoid GPS IMEI false positives)
+        ((categoryKind(it.category) === "sim") && (it.metadata?.imei || "").toLowerCase() === v)
+    );
+  }
+  if (identifiers.simPrimary) {
+    const v = String(identifiers.simPrimary).trim().toLowerCase();
+    matchBy(
+      (it) =>
+        (it.metadata?.primary || "").toLowerCase() === v ||
+        (it.metadata?.secondary || "").toLowerCase() === v
+    );
+  }
+  if (identifiers.sensorNo) {
+    const v = String(identifiers.sensorNo).trim().toLowerCase();
+    matchBy((it) => (it.metadata?.sensorNo || "").toLowerCase() === v);
+  }
+  if (identifiers.macId) {
+    const v = String(identifiers.macId).trim().toLowerCase();
+    matchBy((it) => (it.metadata?.macId || "").toLowerCase() === v);
+  }
+
+  const consumed = [];
+  for (const it of candidates) {
+    const next = it.quantity - 1;
+    try {
+      // Mark used in metadata for traceability
+      const newMeta = {
+        ...(it.metadata || {}),
+        usedInVehicle: link.vehicleNo || null,
+        usedAt: new Date().toISOString(),
+        usedInInstallation: link.installationId || null,
+      };
+      await updateStockItem({ ...it, quantity: next, metadata: newMeta });
+      consumed.push({ name: it.name, vehicle: link.vehicleNo });
+      if (stockTxTableReady) {
+        try {
+          await insertStockTransaction({
+            stockItemId: it.id,
+            installationId: link.installationId || null,
+            maintenanceRecordId: link.maintenanceRecordId || null,
+            vehicleNo: link.vehicleNo || null,
+            delta: -1,
+            resultingQuantity: next,
+            note: link.note || "Auto-consumed on installation",
+            createdBy: currentUser || "akash",
+            itemNameSnapshot: it.name + (it.category ? ` (${it.category})` : ""),
+          });
+        } catch (txErr) {
+          console.warn("Auto-consume transaction record failed:", txErr);
+        }
+      }
+    } catch (err) {
+      console.warn("Auto-consume failed for stock item", it.name, err);
+    }
+  }
+  return { consumed };
+}
+
+/**
+ * Reverse all consumption recorded against an installation or maintenance
+ * record. For each negative-delta transaction whose stock_item still exists,
+ * increment that item's quantity back and log a positive "restored" tx.
+ */
+async function restoreStockFor({ installationId, maintenanceRecordId, reason }) {
+  if (!stockItemsTableReady || !stockTxTableReady) return;
+  const txs = loadStockTransactions().filter((t) => {
+    if (maintenanceRecordId) return t.maintenanceRecordId === maintenanceRecordId && t.delta < 0;
+    if (installationId) return t.installationId === installationId && t.delta < 0;
+    return false;
+  });
+  for (const tx of txs) {
+    if (!tx.stockItemId) continue; // item was deleted; no row to restore on
+    const item = loadStockItems().find((i) => i.id === tx.stockItemId);
+    if (!item) continue;
+    const restoreQty = Math.abs(tx.delta);
+    const next = item.quantity + restoreQty;
+    try {
+      await updateStockItem({ ...item, quantity: next });
+      await insertStockTransaction({
+        stockItemId: item.id,
+        installationId: installationId || null,
+        maintenanceRecordId: maintenanceRecordId || null,
+        vehicleNo: tx.vehicleNo,
+        delta: +restoreQty,
+        resultingQuantity: next,
+        note: reason || "Restored after deletion",
+        createdBy: currentUser || "system",
+        itemNameSnapshot: item.name + (item.category ? ` (${item.category})` : ""),
+      });
+    } catch (err) {
+      console.warn("Stock restore failed for", item.name, err);
+    }
+  }
+}
+
+/* ============================================================
+   TASK ENGINE
+   Each repair entry generates one or more follow-up tasks based
+   on what work was done. Each task is a simple to-do with a single
+   Complete button (done / not done).
+   ============================================================ */
+
+const TASK_TYPES = {
+  update_portal: { label: "Update on GPS Portal", icon: "🖥️", category: "Portal" },
+  update_vehicle_number: { label: "Check and update vehicle number", icon: "🚛", category: "Portal" },
+  update_sim_primary: { label: "Update primary number for SIM", icon: "📞", category: "Portal" },
+  deactivate_sim: { label: "Deactivate the old SIM", icon: "📵", category: "SIM" },
+  repair_device: { label: "Send device for repair", icon: "🔧", category: "Service" },
+  repair_sensor: { label: "Send sensor for repair", icon: "🛰️", category: "Service" },
+};
+
+const TASK_ORDER = [
+  "update_portal",
+  "update_vehicle_number",
+  "deactivate_sim",
+  "update_sim_primary",
+  "repair_device",
+  "repair_sensor",
+];
+
+function taskFlow(type) {
+  return TASK_TYPES[type];
+}
+
+function isTaskDone(task) {
+  return Boolean(task.done);
+}
+
+function makeTask(type, meta = {}) {
+  return {
+    id: generateId(),
+    type,
+    done: false,
+    completedAt: null,
+    completedBy: null,
+    ...meta,
+  };
+}
+
+// Decide which follow-up tasks an entry generates.
+function taskTypesForRepair({ simChange, deviceChange, deviceOutForRepair, sensorOutForRepair }) {
+  const types = new Set();
+  if (simChange) {
+    types.add("update_portal");
+    types.add("deactivate_sim");
+  }
+  if (deviceChange) {
+    types.add("update_portal");
+    types.add("repair_device");
+  }
+  if (deviceOutForRepair) types.add("repair_device");
+  if (sensorOutForRepair) types.add("repair_sensor");
+  return TASK_ORDER.filter((t) => types.has(t));
+}
+
+// Build tasks. If `unknownSimSecondary` is provided, also append an
+// `update_sim_primary` task carrying the ICCID that needs a primary.
+function buildTasksForRepair(opts) {
+  const tasks = taskTypesForRepair(opts).map((type) => makeTask(type));
+  if (opts.unknownSimSecondary) {
+    tasks.push(
+      makeTask("update_sim_primary", {
+        simSecondary: String(opts.unknownSimSecondary).trim(),
+      })
+    );
+  }
+  return tasks;
+}
+
+// Old records (created before the task engine) derive their tasks from
+// legacy boolean flags so they appear in Pending Actions correctly.
+function getTasks(record) {
+  if (Array.isArray(record.tasks) && record.tasks.length) return record.tasks;
+  const types = taskTypesForRepair({
+    simChange: record.simChange,
+    deviceChange: record.deviceChange,
+    deviceOutForRepair: record.deviceOutForRepair,
+    sensorOutForRepair: record.sensorOutForRepair,
+  });
+  return types.map((type) => ({
+    id: `legacy-${record.id}-${type}`,
+    type,
+    done: type === "deactivate_sim" ? Boolean(record.simDeactivated) : false,
+    completedAt: type === "deactivate_sim" && record.simDeactivated ? record.simDeactivatedAt : null,
+    completedBy: null,
+  }));
+}
+
+// Install-level tasks: every new installation must be marked as
+// "Updated on GPS Portal" and "Vehicle number checked & updated" by admin.
+const INSTALL_TASK_TYPES = ["update_portal", "update_vehicle_number"];
+
+function defaultInstallTasks() {
+  const t = {};
+  for (const type of INSTALL_TASK_TYPES) {
+    t[type] = { completedAt: null, completedBy: null };
+  }
+  return t;
+}
+
+// Get a normalised tasks object for an installation. Legacy rows that
+// predate the feature (tasks=null/{}) get default tasks generated lazily.
+function getInstallTasks(inst) {
+  if (inst.tasks && typeof inst.tasks === "object" && Object.keys(inst.tasks).length) {
+    return inst.tasks;
+  }
+  return defaultInstallTasks();
+}
+
+function isInstallTaskDone(inst, type) {
+  const t = getInstallTasks(inst)[type];
+  return Boolean(t && t.completedAt);
+}
+
+/* Live status — stored inside tasks jsonb under live_status key.
+   Returns "live", "offline", or "unknown" (never set). */
+function getInstallLiveStatus(inst) {
+  const ls = (inst.tasks || {}).live_status;
+  if (!ls) return "unknown";
+  if (ls.isLive === true) return "live";
+  if (ls.isLive === false) return "offline";
+  return "unknown";
+}
+
+function getInstallLiveMeta(inst) {
+  const ls = (inst.tasks || {}).live_status || {};
+  return {
+    updatedAt: ls.updatedAt || null,
+    updatedBy: ls.updatedBy || null,
+  };
+}
+
+async function updateInstallLiveStatus(installId, isLive) {
+  const inst = installations.find((i) => i.id === installId);
+  if (!inst) return;
+  const tasks = { ...(inst.tasks || {}) };
+  tasks.live_status = {
+    isLive: isLive,
+    updatedAt: new Date().toISOString(),
+    updatedBy: currentUser || "admin",
+  };
+  const updated = { ...inst, tasks };
+  try {
+    await updateInstallation(updated);
+    const idx = installations.findIndex((i) => i.id === installId);
+    if (idx >= 0) installations[idx] = updated;
+    render();
+    const label = isLive === true ? "Live" : isLive === false ? "Offline" : "Unknown";
+    showToast(`✓ ${inst.vehicleNo} marked ${label}.`);
+  } catch (err) {
+    showToast(err.message || "Failed to update status.", true);
+  }
+}
+
+function getPendingActionRows() {
+  const rows = [];
+  // Maintenance / repair tasks
+  for (const record of loadMaintenance()) {
+    for (const task of getTasks(record)) {
+      if (!isTaskDone(task)) rows.push({ kind: "maintenance", record, task });
+    }
+  }
+  // Install-level tasks (Update on Portal + Vehicle number check)
+  for (const inst of loadInstallations()) {
+    const tasks = getInstallTasks(inst);
+    for (const type of INSTALL_TASK_TYPES) {
+      const t = tasks[type];
+      if (!t || !t.completedAt) {
+        rows.push({
+          kind: "installation",
+          install: inst,
+          task: { id: `inst-${inst.id}-${type}`, type, done: false, completedAt: null },
+        });
+      }
+    }
+  }
+  rows.sort((a, b) => {
+    const aDate = new Date(a.kind === "installation" ? a.install.createdAt : a.record.createdAt);
+    const bDate = new Date(b.kind === "installation" ? b.install.createdAt : b.record.createdAt);
+    return bDate - aDate;
+  });
+  return rows;
+}
+
+function taskDetail(record, task, kind) {
+  const mono = (v) => `<span class="mono">${escapeHtml(v || "—")}</span>`;
+  // Install-level tasks: the record IS the install (pseudo-record).
+  if (kind === "installation") {
+    const inst = loadInstallations().find((i) => i.id === record.id);
+    switch (task.type) {
+      case "update_portal":
+        return `New install — IMEI ${mono(inst ? getCurrentImei(inst) : "")} · SIM ${mono(inst ? resolvePrimarySim(getCurrentSim(inst)) : "")}`;
+      case "update_vehicle_number":
+        return `Vehicle entered: ${mono(record.vehicleNo)} — confirm correctness with portal`;
+      default:
+        return "—";
+    }
+  }
+  // Maintenance tasks
+  const inst = loadInstallations().find((i) => i.id === record.installationId);
+  switch (task.type) {
+    case "update_portal": {
+      const bits = [];
+      if (record.simChange && record.newSimNo) bits.push(`SIM → ${mono(resolvePrimarySim(record.newSimNo))}`);
+      if (record.deviceChange && record.newImei) bits.push(`IMEI → ${mono(record.newImei)}`);
+      return bits.length ? bits.join(" · ") : "—";
+    }
+    case "deactivate_sim":
+      return `Old SIM ${mono(resolvePrimarySim(record.oldSimNo))}`;
+    case "repair_device":
+      return `Device ${mono(record.oldImei || record.imei || (inst ? getCurrentImei(inst) : ""))}`;
+    case "repair_sensor":
+      return `Sensor ${mono(inst ? inst.sensorNo : "")}`;
+    case "update_sim_primary":
+      return `ICCID ${mono(task.simSecondary)} — primary not yet known`;
+    default:
+      return "—";
+  }
+}
+
+// Look up the resolved PRIMARY number for a given value. If the value is
+// a known secondary (ICCID), return the primary from the sims table;
+// otherwise return the value as-is. Returns "" if nothing found.
+function resolvePrimarySim(value) {
+  if (!value) return "";
+  const v = String(value).trim();
+  if (!v) return "";
+  // If value is already a primary (matches a sim's primaryNumber), return it.
+  const byPri = sims.find((s) => (s.primaryNumber || "").toLowerCase() === v.toLowerCase());
+  if (byPri) return byPri.primaryNumber;
+  // If value is a secondary (ICCID), look up the primary.
+  const bySec = sims.find((s) => (s.secondaryNumber || "").toLowerCase() === v.toLowerCase());
+  if (bySec && bySec.primaryNumber) return bySec.primaryNumber;
+  // Unknown — return original.
+  return v;
+}
+
+function taskDetailText(record, task) {
+  const inst = loadInstallations().find((i) => i.id === record.installationId);
+  switch (task.type) {
+    case "update_portal": {
+      const bits = [];
+      if (record.simChange && record.newSimNo) bits.push(`SIM -> ${record.newSimNo}`);
+      if (record.deviceChange && record.newImei) bits.push(`IMEI -> ${record.newImei}`);
+      return bits.join(" | ") || "-";
+    }
+    case "deactivate_sim":
+      return `Old SIM ${record.oldSimNo || "-"}`;
+    case "repair_device":
+      return `Device ${record.oldImei || record.imei || (inst ? getCurrentImei(inst) : "") || "-"}`;
+    case "repair_sensor":
+      return `Sensor ${inst ? inst.sensorNo : "-"}`;
+    case "update_sim_primary":
+      return `ICCID ${task.simSecondary || "-"} | primary not yet known`;
+    default:
+      return "-";
+  }
+}
+
+// Export the actions currently in view (respects category filter and the
+// Show-completed toggle) to an Excel report.
+function exportPendingActions() {
+  const rows = [["Vehicle", "Task", "Detail", "Status", "Remark", "Remark By", "Entry Date", "Completed At", "Completed By"]];
+  for (const record of loadMaintenance()) {
+    for (const task of getTasks(record)) {
+      const flow = taskFlow(task.type);
+      if (!flow) continue;
+      if (pendingFilter !== "all" && flow.category !== pendingFilter) continue;
+      const done = isTaskDone(task);
+      if (done && !showCompleted) continue;
+      rows.push([
+        record.vehicleNo,
+        flow.label,
+        taskDetailText(record, task),
+        done ? "Completed" : "Pending",
+        task.remark || "",
+        task.remarkBy || "",
+        formatDateTime(record.createdAt),
+        task.completedAt ? formatDateTime(task.completedAt) : "",
+        task.completedBy || "",
+      ]);
+    }
+  }
+  if (rows.length === 1) {
+    showToast("Nothing to export for this filter.", true);
+    return;
+  }
+  const stamp = new Date().toISOString().slice(0, 16).replace("T", "_").replace(":", "");
+  downloadXlsx(`pending-actions_${stamp}.xlsx`, rows, "Pending actions", ["Detail"]);
+  showToast(`Exported ${rows.length - 1} action${rows.length - 1 === 1 ? "" : "s"}.`);
+}
+
+async function completeTask(recordId, taskId) {
+  const record = loadMaintenance().find((m) => m.id === recordId);
+  if (!record) return;
+
+  // Materialize tasks onto the record (so legacy-derived records persist correctly).
+  const tasks = getTasks(record).map((t) => ({ ...t }));
+  const task = tasks.find((t) => t.id === taskId);
+  if (!task || task.done) return;
+
+  // Special path: update_sim_primary needs the admin to enter the primary
+  // number before the task can be marked complete.
+  if (task.type === "update_sim_primary") {
+    await completeUpdateSimPrimary(record, task);
+    return;
+  }
+
+  const flow = taskFlow(task.type);
+  const now = new Date().toISOString();
+  task.done = true;
+  task.completedAt = now;
+  task.completedBy = currentUser || "admin";
+  record.tasks = tasks;
+
+  // Side effect: completing "Deactivate the SIM" also closes the old SIM entry.
+  const inst = loadInstallations().find((i) => i.id === record.installationId);
+  let instTouched = false;
+  if (task.type === "deactivate_sim") {
+    record.simDeactivated = true;
+    record.simDeactivatedAt = now;
+    record.simDeactivationPending = false;
+    if (inst && record.oldSimNo) {
+      inst.simHistory.forEach((s) => {
+        if (s.value === record.oldSimNo && s.pendingDeactivation) {
+          s.active = false;
+          s.pendingDeactivation = false;
+          s.deactivatedAt = now;
+        }
+      });
+      instTouched = true;
+    }
+  }
+
+  // Optimistic: update the UI immediately so the row clears right away.
+  render();
+
+  try {
+    await updateMaintenanceRecord(record);
+    if (instTouched) await updateInstallation(inst);
+    showToast(`Completed: ${flow.label}`);
+    await refreshAllData();
+    render();
+  } catch (err) {
+    // Roll back the optimistic change.
+    task.done = false;
+    task.completedAt = null;
+    if (task.type === "deactivate_sim") {
+      record.simDeactivated = false;
+      record.simDeactivatedAt = null;
+      record.simDeactivationPending = true;
+    }
+    render();
+    const raw = err.message || "";
+    const schemaIssue = /tasks|secondary_sim|column|schema cache|could not find/i.test(raw);
+    showToast(
+      schemaIssue
+        ? "Save failed: database setup incomplete — contact admin (the 'tasks' column is missing)."
+        : raw || "Failed to update task.",
+      true
+    );
+  }
+}
+
+async function completeUpdateSimPrimary(record, task) {
+  const secondary = task.simSecondary || "";
+
+  // Open a small modal to capture the primary number from the admin.
+  const primary = await promptForSimPrimary(secondary);
+  if (primary == null) return; // cancelled
+
+  const trimmedPrimary = String(primary).trim();
+  if (!trimmedPrimary) {
+    showToast("Primary number cannot be empty.", true);
+    return;
+  }
+
+  renderLoading("Saving SIM primary number...");
+  try {
+    // 1. Update / insert the sim row.
+    await upsertSim({ primaryNumber: trimmedPrimary, secondaryNumber: secondary });
+
+    // 2. Patch any installation simHistory entries that were stored as the
+    //    secondary placeholder — bump them to the now-known primary.
+    const lowerSec = secondary.toLowerCase();
+    const installsToFix = loadInstallations().filter((inst) =>
+      inst.simHistory.some((s) => (s.value || "").toLowerCase() === lowerSec)
+    );
+    for (const inst of installsToFix) {
+      const updated = {
+        ...inst,
+        simHistory: inst.simHistory.map((s) =>
+          (s.value || "").toLowerCase() === lowerSec ? { ...s, value: trimmedPrimary } : s
+        ),
+      };
+      try {
+        await updateInstallation(updated);
+      } catch (err) {
+        console.warn("Failed to update simHistory for", inst.vehicleNo, err);
+      }
+    }
+
+    // 3. Mark the task as done.
+    const tasks = getTasks(record).map((t) => ({ ...t }));
+    const me = tasks.find((t) => t.id === task.id);
+    if (me) {
+      me.done = true;
+      me.completedAt = new Date().toISOString();
+      me.completedBy = currentUser || "admin";
+    }
+    record.tasks = tasks;
+    await updateMaintenanceRecord(record);
+
+    await refreshAllData();
+    render();
+    showToast(`Primary number saved for SIM ${secondary}.`);
+  } catch (err) {
+    console.error(err);
+    await refreshAllData();
+    render();
+    const msg = err.message || "";
+    if (err.code === SIMS_TABLE_MISSING || /sims/i.test(msg)) {
+      showToast("Database setup incomplete — contact admin.", true);
+    } else {
+      showToast(msg || "Failed to save primary.", true);
+    }
+  }
+}
+
+function promptForSimPrimary(secondary) {
+  return new Promise((resolve) => {
+    modal.innerHTML = `
+      <h3>📞 Update primary number</h3>
+      <p class="modal-desc">Enter the 13-digit primary SIM number that pairs with this ICCID. The SIM database will be updated and the pending task closed.</p>
+      <div class="field" style="margin-top:0.5rem;">
+        <label>Secondary (ICCID)</label>
+        <input type="text" value="${escapeHtml(secondary)}" readonly class="mono" />
+      </div>
+      <div class="field">
+        <label for="simPrimaryInput">Primary number</label>
+        <input type="text" id="simPrimaryInput" inputmode="numeric" autocomplete="off" placeholder="e.g. 5753200309565" class="mono" />
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+        <button type="button" class="btn btn-primary" data-act="save">Save</button>
+      </div>
+    `;
+    modalOverlay.classList.remove("hidden");
+
+    const input = modal.querySelector("#simPrimaryInput");
+    input?.focus();
+
+    const done = (value) => {
+      closeModal();
+      resolve(value);
+    };
+
+    modal.querySelector('[data-act="cancel"]').onclick = () => done(null);
+    modal.querySelector('[data-act="save"]').onclick = () => done(input.value);
+    input?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") done(input.value);
+      if (e.key === "Escape") done(null);
+    });
+    modalOverlay.onclick = (e) => {
+      if (e.target === modalOverlay) done(null);
+    };
+  });
+}
+
+async function undoTask(recordId, taskId) {
+  const record = loadMaintenance().find((m) => m.id === recordId);
+  if (!record) return;
+
+  const tasks = getTasks(record).map((t) => ({ ...t }));
+  const task = tasks.find((t) => t.id === taskId);
+  if (!task || !task.done) return;
+
+  const flow = taskFlow(task.type);
+  task.done = false;
+  task.completedAt = null;
+  task.completedBy = null;
+  record.tasks = tasks;
+
+  const inst = loadInstallations().find((i) => i.id === record.installationId);
+  let instTouched = false;
+  if (task.type === "deactivate_sim") {
+    record.simDeactivated = false;
+    record.simDeactivatedAt = null;
+    record.simDeactivationPending = true;
+    if (inst && record.oldSimNo) {
+      inst.simHistory.forEach((s) => {
+        if (s.value === record.oldSimNo && !s.active && s.deactivatedAt) {
+          s.active = true;
+          s.pendingDeactivation = true;
+          delete s.deactivatedAt;
+        }
+      });
+      instTouched = true;
+    }
+  }
+
+  render();
+
+  try {
+    await updateMaintenanceRecord(record);
+    if (instTouched) await updateInstallation(inst);
+    showToast(`Reopened: ${flow.label}`);
+    await refreshAllData();
+    render();
+  } catch (err) {
+    task.done = true;
+    render();
+    showToast(err.message || "Failed to undo task.", true);
+  }
+}
+
+/* ============================================================
+   INSTALL-LEVEL TASK HANDLERS
+   For install tasks (Update on Portal, Check vehicle no), the
+   completion state lives on installations.tasks[type].
+   Task ID format: `inst-{installId}-{taskType}`.
+   ============================================================ */
+
+function parseInstallTaskId(taskId) {
+  // "inst-{installId}-{taskType}" — installId is a UUID with hyphens,
+  // so we identify the type by suffix.
+  for (const type of INSTALL_TASK_TYPES) {
+    const suffix = `-${type}`;
+    if (taskId.endsWith(suffix) && taskId.startsWith("inst-")) {
+      const installId = taskId.slice("inst-".length, -suffix.length);
+      return { installId, type };
+    }
+  }
+  return null;
+}
+
+async function completeInstallTask(installId, taskId) {
+  const parsed = parseInstallTaskId(taskId);
+  if (!parsed) return;
+  const inst = loadInstallations().find((i) => i.id === installId);
+  if (!inst) return;
+  const now = new Date().toISOString();
+  const tasks = { ...getInstallTasks(inst) };
+  tasks[parsed.type] = {
+    ...(tasks[parsed.type] || {}),
+    completedAt: now,
+    completedBy: currentUser || "admin",
+  };
+  inst.tasks = tasks;
+  render();
+  try {
+    await updateInstallation(inst);
+    showToast("Marked complete.");
+    await refreshAllData();
+    render();
+  } catch (err) {
+    showToast(err.message || "Failed to mark complete.", true);
+    await refreshAllData();
+    render();
+  }
+}
+
+async function undoInstallTask(installId, taskId) {
+  const parsed = parseInstallTaskId(taskId);
+  if (!parsed) return;
+  const inst = loadInstallations().find((i) => i.id === installId);
+  if (!inst) return;
+  const tasks = { ...getInstallTasks(inst) };
+  tasks[parsed.type] = {
+    ...(tasks[parsed.type] || {}),
+    completedAt: null,
+    completedBy: null,
+  };
+  inst.tasks = tasks;
+  render();
+  try {
+    await updateInstallation(inst);
+    showToast("Reopened.");
+    await refreshAllData();
+    render();
+  } catch (err) {
+    showToast(err.message || "Failed to undo.", true);
+    await refreshAllData();
+    render();
+  }
+}
+
+function openInstallRemarkEditor(installId, taskId) {
+  const parsed = parseInstallTaskId(taskId);
+  if (!parsed) return;
+  const inst = loadInstallations().find((i) => i.id === installId);
+  if (!inst) return;
+  const tasks = getInstallTasks(inst);
+  const existing = tasks[parsed.type] || {};
+  const flow = taskFlow(parsed.type);
+
+  modal.innerHTML = `
+    <h3>📝 Remark for "${escapeHtml(flow.label)}"</h3>
+    <p class="modal-desc">Vehicle <strong class="mono">${escapeHtml(inst.vehicleNo)}</strong></p>
+    <div class="field">
+      <label for="remarkText">Remark</label>
+      <input type="text" id="remarkText" autocomplete="off" value="${escapeHtml(existing.remark || "")}" placeholder="Add a note..." />
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" data-act="save">Save</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) closeModal(); };
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modal.querySelector('[data-act="save"]').onclick = async () => {
+    const text = modal.querySelector("#remarkText").value.trim();
+    closeModal();
+    const newTasks = { ...tasks };
+    newTasks[parsed.type] = {
+      ...(tasks[parsed.type] || {}),
+      remark: text || null,
+      remarkBy: text ? (currentUser || "admin") : null,
+      remarkAt: text ? new Date().toISOString() : null,
+    };
+    inst.tasks = newTasks;
+    try {
+      await updateInstallation(inst);
+      await refreshAllData();
+      render();
+      showToast(text ? "Remark saved." : "Remark cleared.");
+    } catch (err) {
+      showToast(err.message || "Save failed.", true);
+    }
+  };
+}
+
+async function setTaskRemark(recordId, taskId, remarkText) {
+  const record = loadMaintenance().find((m) => m.id === recordId);
+  if (!record) return;
+
+  const tasks = getTasks(record).map((t) => ({ ...t }));
+  const task = tasks.find((t) => t.id === taskId);
+  if (!task) return;
+
+  const prev = { remark: task.remark || null, remarkBy: task.remarkBy || null, remarkAt: task.remarkAt || null };
+  const trimmed = (remarkText || "").trim();
+  const now = new Date().toISOString();
+  task.remark = trimmed || null;
+  task.remarkBy = trimmed ? currentUser || "admin" : null;
+  task.remarkAt = trimmed ? now : null;
+  record.tasks = tasks;
+
+  render();
+
+  try {
+    await updateMaintenanceRecord(record);
+    showToast(trimmed ? "Remark saved." : "Remark cleared.");
+    await refreshAllData();
+    render();
+  } catch (err) {
+    task.remark = prev.remark;
+    task.remarkBy = prev.remarkBy;
+    task.remarkAt = prev.remarkAt;
+    render();
+    const raw = err.message || "";
+    const schemaIssue = /tasks|column|schema cache|could not find/i.test(raw);
+    showToast(
+      schemaIssue
+        ? "Save failed: database setup incomplete — contact admin."
+        : raw || "Failed to save remark.",
+      true
+    );
+  }
+}
+
+function openRemarkEditor(recordId, taskId) {
+  const record = loadMaintenance().find((m) => m.id === recordId);
+  if (!record) return;
+  const task = getTasks(record).find((t) => t.id === taskId);
+  if (!task) return;
+  const flow = taskFlow(task.type);
+  const current = task.remark || "";
+
+  showModal(
+    `
+    <h3>Remark</h3>
+    <p class="modal-desc">
+      <strong>${escapeHtml(flow.label)}</strong> · ${escapeHtml(record.vehicleNo)}
+    </p>
+    <div class="field full-width">
+      <label for="remarkText">Note</label>
+      <textarea id="remarkText" rows="3" placeholder="e.g. SIM not received yet, vendor pickup on 02 Jun, etc.">${escapeHtml(current)}</textarea>
+    </div>
+    <div class="modal-actions">
+      ${current ? `<button type="button" class="btn btn-outline modal-clear">Clear remark</button>` : ""}
+      <button type="button" class="btn btn-secondary modal-close">Cancel</button>
+      <button type="button" class="btn btn-primary modal-confirm">Save</button>
+    </div>
+    `,
+    async () => {
+      const text = document.getElementById("remarkText").value;
+      await setTaskRemark(recordId, taskId, text);
+      return true;
+    }
+  );
+
+  modal.querySelector(".modal-clear")?.addEventListener("click", async () => {
+    closeModal();
+    await setTaskRemark(recordId, taskId, "");
+  });
+
+  // Focus the textarea for quick entry.
+  setTimeout(() => document.getElementById("remarkText")?.focus(), 30);
+}
+
+/* ============================================================ */
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error(
+            `${label} timed out after ${Math.round(ms / 1000)}s — Server may be unreachable.`
+          )
+        ),
+      ms
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 async function refreshAllData() {
   isLoadingData = true;
+  updateLiveBadge();
   try {
-    installations = await fetchInstallations();
-    maintenanceRecords = await fetchMaintenanceRecords();
+    installations = await withTimeout(fetchInstallations(), 20000, "Fetch installations");
+    maintenanceRecords = await withTimeout(fetchMaintenanceRecords(), 20000, "Fetch repair records");
+    try {
+      sims = await withTimeout(fetchSims(), 20000, "Fetch SIMs");
+      simsTableReady = true;
+    } catch (err) {
+      if (err.code === SIMS_TABLE_MISSING) {
+        console.warn("sims table missing — features that depend on it will be limited until migration runs.");
+        sims = [];
+        simsTableReady = false;
+      } else {
+        throw err;
+      }
+    }
+    try {
+      stockItems = await withTimeout(fetchStockItems(), 20000, "Fetch stock items");
+      stockItemsTableReady = true;
+    } catch (err) {
+      if (err.code === STOCK_ITEMS_TABLE_MISSING) {
+        console.warn("stock_items table missing — Stock page will show migration prompt until migration runs.");
+        stockItems = [];
+        stockItemsTableReady = false;
+      } else {
+        throw err;
+      }
+    }
+    try {
+      stockTransactions = await withTimeout(fetchStockTransactions(), 20000, "Fetch stock transactions");
+      stockTxTableReady = true;
+    } catch (err) {
+      if (err.code === STOCK_TX_TABLE_MISSING) {
+        console.warn("stock_transactions table missing — stock usage history features disabled until migration runs.");
+        stockTransactions = [];
+        stockTxTableReady = false;
+      } else {
+        throw err;
+      }
+    }
+    try {
+      stockCategories = await withTimeout(fetchStockCategories(), 20000, "Fetch stock categories");
+      stockCategoriesTableReady = true;
+    } catch (err) {
+      if (err.code === STOCK_CATEGORIES_TABLE_MISSING) {
+        console.warn("stock_categories table missing — using preset list until migration runs.");
+        stockCategories = [];
+        stockCategoriesTableReady = false;
+      } else {
+        throw err;
+      }
+    }
+    try {
+      suppliers = await withTimeout(fetchSuppliers(), 20000, "Fetch suppliers");
+      suppliersTableReady = true;
+    } catch (err) {
+      if (err.code === SUPPLIERS_TABLE_MISSING) {
+        console.warn("suppliers table missing — Supplier dropdown will be empty until migration runs.");
+        suppliers = [];
+        suppliersTableReady = false;
+      } else {
+        throw err;
+      }
+    }
+    try {
+      deletionLog = await withTimeout(fetchDeletionLog(200), 20000, "Fetch deletion log");
+      deletionLogTableReady = true;
+    } catch (err) {
+      if (err.code === DELETION_LOG_TABLE_MISSING) {
+        console.warn("deletion_log table missing — deletions will not be audited until migration runs.");
+        deletionLog = [];
+        deletionLogTableReady = false;
+      } else {
+        throw err;
+      }
+    }
+    // Accounts module — soft-fail if migration hasn't been run yet
+    try {
+      accountsProjects = await withTimeout(fetchAccountsProjects(), 20000, "Fetch accounts projects");
+    } catch (err) {
+      console.warn("accounts_projects table missing or unreadable", err?.message || err);
+      accountsProjects = [];
+    }
+    try {
+      accountsTransactions = await withTimeout(fetchAccountsTransactions(), 20000, "Fetch accounts transactions");
+    } catch (err) {
+      console.warn("accounts_transactions table missing or unreadable", err?.message || err);
+      accountsTransactions = [];
+    }
+    // Renewals — soft-fail if migration not yet run
+    try {
+      renewals = await withTimeout(fetchRenewals(), 20000, "Fetch renewals");
+      renewalsTableReady = true;
+    } catch (err) {
+      console.warn("renewals table missing — run renewals-migration.sql", err?.message || err);
+      renewals = [];
+      renewalsTableReady = false;
+    }
+    // v3.9.0 — Accounts, Seller profile, Documents (soft-fail if migration not run)
+    try {
+      renewalAccounts = await withTimeout(fetchRenewalAccounts(), 15000, "Fetch renewal accounts");
+      renewalAccountsTableReady = true;
+    } catch (err) {
+      console.warn("renewal_accounts table missing", err?.message || err);
+      renewalAccounts = [];
+      renewalAccountsTableReady = false;
+    }
+    try {
+      sellerProfile = await withTimeout(fetchSellerProfile(), 15000, "Fetch seller profile");
+      sellerProfileTableReady = true;
+    } catch (err) {
+      console.warn("renewal_seller_profile table missing", err?.message || err);
+      sellerProfile = null;
+      sellerProfileTableReady = false;
+    }
+    try {
+      renewalDocuments = await withTimeout(fetchRenewalDocuments(500), 15000, "Fetch renewal documents");
+      renewalDocumentsTableReady = true;
+    } catch (err) {
+      console.warn("renewal_documents table missing", err?.message || err);
+      renewalDocuments = [];
+      renewalDocumentsTableReady = false;
+    }
+    // User permissions — soft-fail to default if migration not run
+    try {
+      const perms = await withTimeout(fetchUserPermissions(), 20000, "Fetch user permissions");
+      userPermissions = {};
+      perms.forEach((p) => { userPermissions[p.username] = p; });
+    } catch (err) {
+      console.warn("user_permissions table missing — using DEFAULT_PERMISSIONS", err?.message || err);
+      userPermissions = { ...DEFAULT_PERMISSIONS };
+    }
+    lastSyncedAt = new Date();
+    // After data refresh, detect any new installs/repairs and notify
+    if (currentUser) {
+      detectNewActivityAndNotify();
+    }
   } finally {
     isLoadingData = false;
+    updateLiveBadge();
   }
 }
 
@@ -40,14 +1195,1284 @@ function loadMaintenance() {
   return maintenanceRecords;
 }
 
+function loadSims() {
+  return sims;
+}
+
+function loadStockItems() {
+  return stockItems;
+}
+
+function loadStockTransactions() {
+  return stockTransactions;
+}
+
+function loadSuppliers() {
+  return suppliers;
+}
+
+function getSupplierOptions() {
+  const fromDb = suppliers.map((s) => s.name);
+  const fromItems = stockItems.map((i) => i.supplier).filter(Boolean);
+  return Array.from(new Set([...fromDb, ...fromItems])).sort();
+}
+
+// Return recent transactions for one stock item, newest first.
+function getStockItemTransactions(stockItemId) {
+  return stockTransactions
+    .filter((t) => t.stockItemId === stockItemId)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+// Return up to N recent vehicles where this item was used (delta < 0),
+// deduped, newest first.
+function getRecentVehiclesForItem(stockItemId, n = 3) {
+  const txs = getStockItemTransactions(stockItemId);
+  const seen = new Set();
+  const result = [];
+  for (const t of txs) {
+    if (t.delta >= 0) continue;
+    if (!t.vehicleNo) continue;
+    if (seen.has(t.vehicleNo)) continue;
+    seen.add(t.vehicleNo);
+    result.push({ vehicleNo: t.vehicleNo, delta: t.delta, at: t.createdAt });
+    if (result.length >= n) break;
+  }
+  return result;
+}
+
+// Find installations currently using a stock item's identifier (live cross-ref).
+// Useful so the Stock page shows "Used in VEHICLE-X" even if the item was
+// added to stock AFTER the installation happened (no transaction record).
+function getInstallationUsesForItem(item) {
+  if (!item || !item.metadata) return [];
+  const kind = categoryKind(item.category);
+  const m = item.metadata;
+  const out = [];
+
+  for (const inst of loadInstallations()) {
+    let matched = false;
+    if (kind === "gps" && m.imei) {
+      const v = String(m.imei).toLowerCase();
+      const curImei = (getCurrentImei(inst) || "").toLowerCase();
+      if (curImei === v) {
+        matched = true;
+      } else if (inst.imeiHistory.some((h) => (h.value || "").toLowerCase() === v)) {
+        matched = true;
+      }
+    } else if (kind === "sim" && (m.secondary || m.primary)) {
+      const sec = (m.secondary || "").toLowerCase();
+      const pri = (m.primary || "").toLowerCase();
+      for (const h of inst.simHistory) {
+        const v = (h.value || "").toLowerCase();
+        const sv = (h.secondaryValue || "").toLowerCase();
+        if ((sec && (v === sec || sv === sec)) || (pri && v === pri)) {
+          matched = true;
+          break;
+        }
+      }
+    } else if (kind === "sensor" && (m.sensorNo || m.macId)) {
+      const sn = (m.sensorNo || "").toLowerCase();
+      const mac = (m.macId || "").toLowerCase();
+      if (
+        (sn && (inst.sensorNo || "").toLowerCase() === sn) ||
+        (mac && (inst.macId || "").toLowerCase() === mac)
+      ) {
+        matched = true;
+      }
+    }
+    if (matched) out.push({ vehicleNo: inst.vehicleNo });
+  }
+  return out;
+}
+
+// Merge live installation uses + recent transaction uses, deduped.
+function getStockUses(item, n = 3) {
+  const seen = new Set();
+  const result = [];
+  for (const u of getInstallationUsesForItem(item)) {
+    if (seen.has(u.vehicleNo)) continue;
+    seen.add(u.vehicleNo);
+    result.push({ vehicleNo: u.vehicleNo, source: "install" });
+    if (result.length >= n) return result;
+  }
+  for (const u of getRecentVehiclesForItem(item.id, n)) {
+    if (seen.has(u.vehicleNo)) continue;
+    seen.add(u.vehicleNo);
+    result.push({ vehicleNo: u.vehicleNo, source: "tx", delta: u.delta, at: u.at });
+    if (result.length >= n) return result;
+  }
+  return result;
+}
+
+/* Find a SIM by either primary or secondary number. */
+function findSimByValue(value) {
+  if (!value) return null;
+  const v = String(value).trim().toLowerCase();
+  if (!v) return null;
+  return (
+    sims.find((s) => (s.secondaryNumber || "").toLowerCase() === v) ||
+    sims.find((s) => (s.primaryNumber || "").toLowerCase() === v) ||
+    null
+  );
+}
+
+function findSimBySecondary(secondary) {
+  if (!secondary) return null;
+  const v = String(secondary).trim().toLowerCase();
+  return sims.find((s) => (s.secondaryNumber || "").toLowerCase() === v) || null;
+}
+
+function findSimByPrimary(primary) {
+  if (!primary) return null;
+  const v = String(primary).trim().toLowerCase();
+  return sims.find((s) => (s.primaryNumber || "").toLowerCase() === v) || null;
+}
+
+/* ============================================================
+   SIM number validation & swap detection.
+   - Primary number: typically 10–13 digits
+   - Secondary / ICCID: 18–20 digits, usually starts with "89"
+   Used to warn / auto-fix when the two fields look swapped.
+   ============================================================ */
+
+function digitsOnly(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+
+function isLikelyIccid(s) {
+  const d = digitsOnly(s);
+  // ICCID starts with 89 (international SIM identifier per ITU-T E.118)
+  // Length typically 18-22, most commonly 19-20
+  if (d.length >= 18 && d.length <= 22 && d.startsWith("89")) return true;
+  // Fallback: just length match (for cases where prefix differs)
+  return d.length >= 18 && d.length <= 22;
+}
+
+function isLikelyPrimary(s) {
+  const d = digitsOnly(s);
+  // Primary mobile / MSISDN: 10-14 digits, NOT starting with 89
+  if (d.startsWith("89")) return false;
+  return d.length >= 10 && d.length <= 14;
+}
+
+/**
+ * IMEI: 14-17 digits, NOT starting with 89 (which would be ICCID).
+ * Standard IMEI is 15 digits; some bulk barcodes have 16 (extra check digit).
+ */
+function isLikelyImei(s) {
+  const d = digitsOnly(s);
+  if (d.startsWith("89")) return false;
+  return d.length >= 14 && d.length <= 17;
+}
+
+/**
+ * Definitively starts with "89" → must be ICCID/secondary
+ */
+function startsLikeIccid(s) {
+  return digitsOnly(s).startsWith("89");
+}
+
+/**
+ * Doesn't start with "89" and is in the mobile-number length range
+ * → must be a primary number
+ */
+function startsLikePrimary(s) {
+  const d = digitsOnly(s);
+  return !d.startsWith("89") && d.length >= 10 && d.length <= 14;
+}
+
+/**
+ * Returns true if (primary, secondary) appears to be entered in the
+ * wrong order. Uses both prefix (89...) and length checks for confidence.
+ */
+function pairLooksSwapped(primary, secondary) {
+  const p = digitsOnly(primary);
+  const s = digitsOnly(secondary);
+  if (!p || !s) return false;
+  // Confidence 1: primary starts with 89 (clearly ICCID)
+  if (startsLikeIccid(primary) && startsLikePrimary(secondary)) return true;
+  // Confidence 2: legacy length-based check
+  return isLikelyIccid(primary) && isLikelyPrimary(secondary);
+}
+
+function simLooksSwapped(sim) {
+  return pairLooksSwapped(sim.primaryNumber, sim.secondaryNumber);
+}
+
 function generateId() {
-  return crypto.randomUUID();
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+/* ---------------- Realtime ---------------- */
+
+function startRealtime() {
+  if (realtimeChannel) return;
+  realtimeStatus = "connecting";
+  updateLiveBadge();
+  realtimeChannel = subscribeRealtime((eventType, info) => {
+    if (eventType === "status") {
+      if (info.status === "SUBSCRIBED") realtimeStatus = "live";
+      else if (info.status === "CHANNEL_ERROR" || info.status === "TIMED_OUT")
+        realtimeStatus = "error";
+      else realtimeStatus = "connecting";
+      updateLiveBadge();
+      return;
+    }
+    scheduleRefresh();
+  });
+}
+
+async function stopRealtime() {
+  if (!realtimeChannel) return;
+  await unsubscribeRealtime(realtimeChannel);
+  realtimeChannel = null;
+  realtimeStatus = "idle";
+}
+
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(async () => {
+    try {
+      await refreshAllData();
+      render();
+    } catch (err) {
+      showToast(err.message || "Live sync failed.", true);
+    }
+  }, 450);
+}
+
+/* ---------------- Excel (xlsx) helpers ---------------- */
+// Uses SheetJS (loaded via CDN as window.XLSX in index.html).
+
+function downloadXlsx(filename, rows, sheetName = "Sheet1", textColumns = []) {
+  if (typeof XLSX === "undefined") {
+    showToast("Excel library not loaded. Refresh the page and try again.", true);
+    return;
+  }
+  if (!rows.length) {
+    showToast("Nothing to export.", true);
+    return;
+  }
+
+  // Identify which column indexes need to be Text-formatted (so 18+ digit
+  // numbers like SIM ICCIDs and IMEIs aren't truncated to scientific notation).
+  const header = rows[0];
+  const textColIdx = new Set();
+  if (textColumns.length) {
+    const lowerHeader = header.map((h) => String(h).toLowerCase().trim());
+    textColumns.forEach((c) => {
+      const idx = lowerHeader.indexOf(c.toLowerCase());
+      if (idx >= 0) textColIdx.add(idx);
+    });
+  }
+
+  // Force text-column values to strings (so SheetJS writes them as strings,
+  // not numbers).
+  const safeRows = rows.map((row, ri) =>
+    row.map((cell, ci) => {
+      if (ri === 0) return cell;
+      if (textColIdx.has(ci)) return String(cell ?? "");
+      return cell;
+    })
+  );
+
+  // Pre-fill 200 blank rows so the user has plenty of pre-formatted cells to
+  // paste into without Excel converting long numeric strings to scientific
+  // notation.
+  const BLANK_ROWS = 200;
+  for (let i = 0; i < BLANK_ROWS; i += 1) {
+    safeRows.push(header.map(() => ""));
+  }
+
+  const ws = XLSX.utils.aoa_to_sheet(safeRows);
+
+  // Apply "@" (Text) number-format and string type to every cell in text
+  // columns (data + blank rows).
+  for (let r = 1; r < safeRows.length; r += 1) {
+    for (const c of textColIdx) {
+      const addr = XLSX.utils.encode_cell({ r, c });
+      const existing = ws[addr];
+      const value = existing && existing.v != null ? String(existing.v) : "";
+      ws[addr] = { t: "s", v: value, w: value, z: "@" };
+    }
+  }
+
+  // Ensure the sheet range covers the blank rows so Excel keeps the format on
+  // them.
+  ws["!ref"] = XLSX.utils.encode_range({
+    s: { r: 0, c: 0 },
+    e: { r: safeRows.length - 1, c: header.length - 1 },
+  });
+
+  // Auto-size columns for readability (based on data rows only).
+  const dataRows = rows;
+  const colWidths = header.map((_, colIdx) => {
+    let max = 10;
+    for (const r of dataRows) {
+      const v = r[colIdx] == null ? "" : String(r[colIdx]);
+      if (v.length > max) max = v.length;
+    }
+    return { wch: Math.min(max + 2, 60) };
+  });
+  ws["!cols"] = colWidths;
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  XLSX.writeFile(wb, filename);
+}
+
+async function readXlsxFile(file) {
+  if (!file) return [];
+  if (typeof XLSX === "undefined") {
+    throw new Error("Excel library not loaded. Refresh the page and try again.");
+  }
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type: "array" });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  if (!sheet) return [];
+  const json = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
+  // Normalize header keys to lowercase trimmed.
+  return json.map((row) => {
+    const out = {};
+    for (const key of Object.keys(row)) {
+      out[String(key).toLowerCase().trim()] = String(row[key] ?? "").trim();
+    }
+    return out;
+  });
+}
+
+function normalizeBool(value) {
+  return ["yes", "y", "true", "1"].includes(String(value).trim().toLowerCase());
+}
+
+function normalizeDate(value) {
+  if (!value) return new Date().toISOString();
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+}
+
+function activeImeiMatches(inst, imei) {
+  return inst.imeiHistory.some((item) => item.value.toLowerCase() === imei.toLowerCase());
 }
 
 function escapeHtml(text) {
   const el = document.createElement("div");
   el.textContent = text ?? "";
   return el.innerHTML;
+}
+
+/* ============================================================
+   SVG CHART HELPERS — lightweight inline charts, no library.
+   ============================================================ */
+
+// Donut chart with center text. segments = [{value, color, label}].
+function donutChart({ size = 200, hole = 62, segments, centerLabel, centerSub }) {
+  const total = segments.reduce((s, x) => s + Number(x.value || 0), 0);
+  const cx = size / 2;
+  const cy = size / 2;
+  const r = (size - 14) / 2;
+
+  if (total === 0) {
+    return `
+      <svg viewBox="0 0 ${size} ${size}" class="donut-svg" preserveAspectRatio="xMidYMid meet">
+        <circle cx="${cx}" cy="${cy}" r="${(r + hole) / 2}" fill="none" stroke="#e5e7eb" stroke-width="${r - hole}"/>
+        <text x="${cx}" y="${cy + 6}" text-anchor="middle" font-size="14" fill="#9ca3af" font-family="Manrope, sans-serif">No data</text>
+      </svg>`;
+  }
+
+  let acc = 0;
+  const paths = segments
+    .map((seg) => {
+      const v = Number(seg.value || 0);
+      if (v === 0) return "";
+      const startAngle = (acc / total) * 2 * Math.PI;
+      acc += v;
+      const endAngle = (acc / total) * 2 * Math.PI;
+      if (v === total) {
+        // Full circle as a single segment — draw a stroked ring.
+        return `<circle cx="${cx}" cy="${cy}" r="${(r + hole) / 2}" fill="none" stroke="${seg.color}" stroke-width="${r - hole}"/>`;
+      }
+      const largeArc = endAngle - startAngle > Math.PI ? 1 : 0;
+      const x1 = cx + r * Math.sin(startAngle);
+      const y1 = cy - r * Math.cos(startAngle);
+      const x2 = cx + r * Math.sin(endAngle);
+      const y2 = cy - r * Math.cos(endAngle);
+      const ix1 = cx + hole * Math.sin(startAngle);
+      const iy1 = cy - hole * Math.cos(startAngle);
+      const ix2 = cx + hole * Math.sin(endAngle);
+      const iy2 = cy - hole * Math.cos(endAngle);
+      return `<path d="M ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} L ${ix2} ${iy2} A ${hole} ${hole} 0 ${largeArc} 0 ${ix1} ${iy1} Z" fill="${seg.color}"/>`;
+    })
+    .join("");
+
+  return `
+    <svg viewBox="0 0 ${size} ${size}" class="donut-svg" preserveAspectRatio="xMidYMid meet">
+      ${paths}
+      ${centerLabel != null ? `<text x="${cx}" y="${centerSub ? cy - 2 : cy + 10}" text-anchor="middle" font-size="34" font-weight="800" fill="#0f172a" font-family="Manrope, sans-serif" letter-spacing="-0.02em">${escapeHtml(String(centerLabel))}</text>` : ""}
+      ${centerSub ? `<text x="${cx}" y="${cy + 22}" text-anchor="middle" font-size="11" font-weight="700" fill="#64748b" font-family="Manrope, sans-serif" letter-spacing="0.06em">${escapeHtml(String(centerSub).toUpperCase())}</text>` : ""}
+    </svg>`;
+}
+
+// Donut chart with a legend.
+function donutWithLegend({ segments, centerLabel, centerSub, size = 200 }) {
+  const total = segments.reduce((s, x) => s + Number(x.value || 0), 0);
+  const legendHtml = segments
+    .map((seg) => {
+      const v = Number(seg.value || 0);
+      const pct = total ? Math.round((v / total) * 100) : 0;
+      return `
+        <div class="donut-legend-row">
+          <div class="donut-legend-main">
+            <span class="donut-legend-num">${v}</span>
+            <span class="donut-legend-pct">(${pct}%)</span>
+          </div>
+          <div class="donut-legend-label">
+            <span class="donut-legend-dot" style="background: ${seg.color}"></span>
+            ${escapeHtml(seg.label)}
+          </div>
+        </div>`;
+    })
+    .join("");
+  return `
+    <div class="donut-card-body">
+      <div class="donut-wrap">
+        ${donutChart({ size, segments, centerLabel, centerSub })}
+      </div>
+      <div class="donut-legend">${legendHtml}</div>
+    </div>`;
+}
+
+// Horizontal bar chart. items = [{label, value, color?}].
+function horizontalBarChart(items, opts = {}) {
+  const { showValue = true } = opts;
+  if (!items.length) return `<div class="empty-record">No Record Found</div>`;
+  const max = Math.max(1, ...items.map((i) => Number(i.value || 0)));
+  return `
+    <div class="hbar-chart">
+      ${items
+        .map((it) => {
+          const v = Number(it.value || 0);
+          const pct = Math.max(2, Math.round((v / max) * 100));
+          const clickable = it.bucket && v > 0;
+          const tag = clickable ? "button" : "div";
+          const cls = clickable ? "hbar-row hbar-row-clickable" : "hbar-row";
+          const dataAttr = clickable ? `data-bucket="${escapeHtml(it.bucket)}" type="button"` : "";
+          return `
+            <${tag} class="${cls}" ${dataAttr} ${clickable ? `aria-label="Show ${v} vehicles in ${escapeHtml(it.label)}"` : ""}>
+              <div class="hbar-label" title="${escapeHtml(it.label)}">${escapeHtml(it.label)}</div>
+              <div class="hbar-track-row">
+                <div class="hbar-track">
+                  <div class="hbar-fill" style="width: ${pct}%; background: ${it.color || "#a78bfa"};"></div>
+                </div>
+                ${showValue ? `<span class="hbar-value">${v}</span>` : ""}
+                ${clickable ? `<span class="hbar-chevron">›</span>` : ""}
+              </div>
+            </${tag}>`;
+        })
+        .join("")}
+    </div>`;
+}
+
+/* ============================================================
+   BARCODE / QR SCANNER — camera-based input for IMEI and ICCID.
+   Uses html5-qrcode (loaded via CDN in index.html). On detection
+   the callback is invoked with the raw decoded text.
+   ============================================================ */
+
+let _activeScanner = null;
+
+/**
+ * Pre-warm camera on Akash login — silently requests permission +
+ * starts a tiny hidden stream briefly so first scan opens instantly
+ * (vs 1-2s cold start). Closes stream immediately after.
+ */
+let _cameraPrewarmed = false;
+async function prewarmCamera() {
+  if (_cameraPrewarmed) return;
+  if (!navigator.mediaDevices?.getUserMedia) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false,
+    });
+    // Immediately stop — purpose was to warm camera + grant permission
+    setTimeout(() => {
+      try { stream.getTracks().forEach((t) => t.stop()); } catch {}
+    }, 300);
+    _cameraPrewarmed = true;
+  } catch (e) {
+    // Permission denied or no camera — silent fail, user will see normal prompt next time
+  }
+}
+
+async function openBarcodeScannerModal({ title = "📷 Scan Barcode", hint = "Point camera at the barcode or QR code.", onScan, codeType = "any", checkDuplicates = false, dupCheckScope = "all" }) {
+  // Use the SAME proven native BarcodeDetector setup as the bulk scanner
+  // (Abhinav's workflow). Now includes ALL Abhinav features:
+  // - Format restriction (5 critical), larger viewfinder
+  // - Smart code-type filter (IMEI/ICCID/Any) with visual rejection
+  // - Tap-to-focus with yellow ring
+  // - Success flash + green beep, fail flash + red buzz, vibration patterns
+  // - Duplicate detection (optional)
+  // - 89/57 prefix detection
+  const hasNativeDetector =
+    typeof window.BarcodeDetector !== "undefined" &&
+    window.isSecureContext;
+
+  const typeLabels = {
+    imei:  { label: "IMEI",   desc: "14-17 digit device serial",   icon: "📡" },
+    iccid: { label: "SIM NO", desc: "89… 18-22 digit ICCID",       icon: "📶" },
+    any:   { label: "Any",    desc: "any code type",               icon: "🌀" },
+  };
+  let activeType = codeType;
+  const initialInfo = typeLabels[activeType] || typeLabels.any;
+
+  modal.innerHTML = `
+    <h3>${escapeHtml(title)}</h3>
+    <p class="modal-desc">
+      Looking for: <strong id="singleScanBadge">${initialInfo.icon} ${escapeHtml(initialInfo.label)}</strong>
+      <span style="color:#94a3b8;">(${escapeHtml(initialInfo.desc)})</span>
+    </p>
+
+    <div class="seg-control" id="singleScanModeSwitcher" style="margin-bottom: 0.7rem;">
+      <button type="button" class="seg-btn ${activeType === 'any' ? 'active' : ''}" data-type="any">🌀 Any</button>
+      <button type="button" class="seg-btn ${activeType === 'imei' ? 'active' : ''}" data-type="imei">📡 IMEI</button>
+      <button type="button" class="seg-btn ${activeType === 'iccid' ? 'active' : ''}" data-type="iccid">📶 SIM NO</button>
+    </div>
+
+    <div class="qr-reader-wrap bulk-scan-viewfinder single-scan-large">
+      <video id="singleScanVideo" autoplay playsinline muted></video>
+      <div class="qr-scan-line"></div>
+      <div class="qr-focus-ring" id="singleFocusRing"></div>
+      <div class="qr-controls">
+        <button type="button" class="qr-icon-btn" id="singleTorchBtn" style="display:none;" aria-label="Torch">🔦</button>
+      </div>
+      <div class="qr-status" id="qrStatus">${escapeHtml(hint)}</div>
+    </div>
+
+    <div class="manual-entry-block" style="margin-top: 0.7rem;">
+      <label for="manualScanInput">Or type the number manually:</label>
+      <div class="input-with-scan" style="margin-top: 0.4rem;">
+        <input type="text" id="manualScanInput" autocomplete="off" inputmode="numeric" placeholder="Paste or type the number" />
+        <button type="button" class="btn btn-primary btn-sm" id="manualScanOk">OK</button>
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary btn-block" data-act="cancel">Close</button>
+    </div>
+  `;
+  modal.classList.add("modal-wide");
+  modalOverlay.classList.remove("hidden");
+
+  let scanActive = true;
+  let currentStream = null;
+  let lastRejectedCode = "";
+  let lastRejectedTime = 0;
+
+  const setStatus = (t) => {
+    const s = document.getElementById("qrStatus");
+    if (s) s.textContent = t;
+  };
+
+  const cleanup = () => {
+    scanActive = false;
+    if (currentStream) {
+      try { currentStream.getTracks().forEach((t) => t.stop()); } catch {}
+      currentStream = null;
+    }
+    closeModal();
+  };
+
+  // ===== Code-type validation =====
+  const validateType = (value) => {
+    if (activeType === "any") return { ok: true, value };
+    if (activeType === "imei") {
+      if (isLikelyImei(value)) return { ok: true, value };
+      // Special: starts with 89 → user scanned SIM but in IMEI mode
+      if (isLikelyIccid(value)) return { ok: false, reason: "✗ This is an ICCID (SIM no), not IMEI" };
+      return { ok: false, reason: "✗ Not an IMEI (must be 14-17 digits)" };
+    }
+    if (activeType === "iccid") {
+      if (isLikelyIccid(value)) return { ok: true, value };
+      if (isLikelyImei(value)) return { ok: false, reason: "✗ This is an IMEI, not SIM ICCID" };
+      return { ok: false, reason: "✗ Not a SIM ICCID (must start with 89, 18-22 digits)" };
+    }
+    return { ok: true, value };
+  };
+
+  const handleScan = (raw) => {
+    if (!scanActive) return;
+    const value = String(raw || "").trim();
+    if (!value) return;
+    const now = Date.now();
+
+    // Same code rejected within 2s → silently ignore
+    if (value === lastRejectedCode && now - lastRejectedTime < 2000) return;
+
+    // Type validation
+    const validation = validateType(value);
+    if (!validation.ok) {
+      lastRejectedCode = value;
+      lastRejectedTime = now;
+      try { playBeep(220, 0.18); } catch {}
+      try { navigator.vibrate && navigator.vibrate([60, 50, 60]); } catch {}
+      const tail = value.length > 8 ? "…" + value.slice(-6) : value;
+      setStatus(`${validation.reason} (${tail})`);
+      flashScanReject();
+      return;
+    }
+
+    // Duplicate check (optional, with scope)
+    if (checkDuplicates && typeof findExistingCode === "function") {
+      // dupCheckScope:
+      //   "all"     → check stock + installs (Abhinav stock add)
+      //   "install" → only check active installs, skip stock (Akash installing FROM stock)
+      const findOptions = dupCheckScope === "install"
+        ? { skipStock: true, skipInstallHistory: true }
+        : {};
+      const existing = findExistingCode(value, findOptions);
+      if (existing) {
+        lastRejectedCode = value;
+        lastRejectedTime = now;
+        try { playBeep(220, 0.25); } catch {}
+        try { navigator.vibrate && navigator.vibrate([80, 60, 80, 60, 80]); } catch {}
+        const tail = value.length > 12 ? value.slice(0, 6) + "…" + value.slice(-6) : value;
+        setStatus(`❌ Duplicate! "${tail}" — ${existing.label}`);
+        flashScanReject();
+        return;
+      }
+    }
+
+    // 89/57 prefix info (non-blocking, just informative)
+    if (activeType === "any") {
+      if (isLikelyIccid(value)) {
+        setStatus(`✓ Detected ICCID (89...) — saving`);
+      } else if (isLikelyImei(value)) {
+        setStatus(`✓ Detected IMEI — saving`);
+      } else {
+        setStatus(`✓ Scanned — saving`);
+      }
+    }
+
+    // Informational check — if scanned value is in stock, show that as a positive hint
+    // (only when stock dups are NOT being treated as duplicates)
+    if (dupCheckScope === "install" && typeof findStockByValue === "function") {
+      const stockMatched = findStockByValue(value);
+      if (stockMatched.length > 0) {
+        setStatus(`✓ Found in Stock: ${stockMatched[0].name} — will auto-link on save`);
+      }
+    }
+
+    // SUCCESS
+    scanActive = false;
+    try { playBeep(880, 0.08); setTimeout(() => playBeep(1100, 0.06), 70); } catch {}
+    try { navigator.vibrate && navigator.vibrate(60); } catch {}
+    flashScanSuccess();
+    setTimeout(() => {
+      cleanup();
+      try { onScan(value); } catch (e) { console.error("onScan handler failed:", e); }
+    }, 200);
+  };
+
+  // ===== Cancel + manual entry wiring =====
+  modal.querySelector('[data-act="cancel"]').onclick = cleanup;
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) cleanup(); };
+
+  const okBtn = document.getElementById("manualScanOk");
+  const manualInput = document.getElementById("manualScanInput");
+  okBtn?.addEventListener("click", () => {
+    const v = manualInput.value.trim();
+    if (v) handleScan(v);
+  });
+  manualInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      okBtn?.click();
+    }
+  });
+
+  // ===== Code-type switcher =====
+  modal.querySelectorAll("#singleScanModeSwitcher .seg-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      activeType = btn.dataset.type;
+      modal.querySelectorAll("#singleScanModeSwitcher .seg-btn").forEach((b) => {
+        b.classList.toggle("active", b.dataset.type === activeType);
+      });
+      const info = typeLabels[activeType];
+      const badge = document.getElementById("singleScanBadge");
+      if (badge) badge.textContent = `${info.icon} ${info.label}`;
+      setStatus(`Mode: ${info.icon} ${info.label} — ${info.desc}`);
+      lastRejectedCode = ""; // reset reject memory
+    });
+  });
+
+  if (hasNativeDetector) {
+    await initNativeSingleScanner(handleScan, setStatus, (s) => { currentStream = s; }, () => scanActive);
+  } else {
+    await initFallbackSingleScanner(handleScan, setStatus);
+  }
+}
+
+/* Native BarcodeDetector single-shot — uses same proven path as bulk scanner */
+async function initNativeSingleScanner(onDetect, setStatus, captureStream, isActive) {
+  try {
+    // Format restriction — 5 critical formats only (faster detection)
+    const desiredFormats = ["code_128", "code_39", "ean_13", "qr_code", "data_matrix"];
+    let formats = [];
+    try {
+      const supported = await window.BarcodeDetector.getSupportedFormats();
+      formats = desiredFormats.filter((f) => supported.includes(f));
+    } catch {}
+    const detector = formats.length
+      ? new window.BarcodeDetector({ formats })
+      : new window.BarcodeDetector();
+
+    const video = document.getElementById("singleScanVideo");
+    if (!video) { setStatus("Video element not found"); return; }
+
+    setStatus("Requesting camera permission…");
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+        audio: false,
+      });
+    } catch (err) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { exact: "environment" } },
+          audio: false,
+        });
+      } catch (err2) {
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const cams = devices.filter((d) => d.kind === "videoinput");
+          const back = cams.find((c) => /back|rear|environment|world|wide(?!.*front)/i.test(c.label || ""));
+          if (back) {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: { deviceId: { exact: back.deviceId } },
+              audio: false,
+            });
+          } else {
+            setStatus("❌ Back camera not found. Use manual entry.");
+            return;
+          }
+        } catch (err3) {
+          setStatus("❌ Camera permission denied or unavailable");
+          return;
+        }
+      }
+    }
+
+    captureStream(stream);
+    video.srcObject = stream;
+    video.muted = true;
+    video.setAttribute("playsinline", "");
+    try { await video.play(); } catch {}
+
+    setStatus("📷 Scanner ready — tap to focus, point at barcode");
+
+    const track = stream.getVideoTracks()[0];
+
+    // ===== Tap-to-focus (yellow ring) =====
+    const viewfinder = document.querySelector(".bulk-scan-viewfinder");
+    const focusRing = document.getElementById("singleFocusRing");
+    if (viewfinder && focusRing && track) {
+      viewfinder.addEventListener("click", async (e) => {
+        const rect = viewfinder.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        // Show ring
+        focusRing.style.left = x + "px";
+        focusRing.style.top = y + "px";
+        focusRing.classList.remove("show");
+        // force reflow
+        void focusRing.offsetWidth;
+        focusRing.classList.add("show");
+        // Try to refocus
+        try {
+          const caps = track.getCapabilities?.() || {};
+          if (caps.focusMode && caps.focusMode.includes("single-shot")) {
+            await track.applyConstraints({ advanced: [{ focusMode: "single-shot" }] });
+            setTimeout(async () => {
+              try { await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] }); } catch {}
+            }, 1000);
+          }
+        } catch {}
+      });
+    }
+    if (track) {
+      try {
+        const capabilities = track.getCapabilities?.() || {};
+        const advanced = [];
+        if (capabilities.focusMode && capabilities.focusMode.includes("continuous")) {
+          advanced.push({ focusMode: "continuous" });
+        }
+        if (capabilities.zoom) {
+          const z = Math.min(Math.max(1.5, capabilities.zoom.min || 1), capabilities.zoom.max || 1);
+          advanced.push({ zoom: z });
+        }
+        if (advanced.length) await track.applyConstraints({ advanced }).catch(() => {});
+
+        if (capabilities.torch) {
+          const torchBtn = document.getElementById("singleTorchBtn");
+          if (torchBtn) {
+            torchBtn.style.display = "flex";
+            let torchOn = false;
+            torchBtn.addEventListener("click", async () => {
+              torchOn = !torchOn;
+              try {
+                await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+                torchBtn.classList.toggle("active", torchOn);
+              } catch {}
+            });
+          }
+        }
+      } catch (e) { console.warn("Camera tweaks failed:", e); }
+    }
+
+    let scanErrCount = 0;
+    const scanLoop = async () => {
+      if (!isActive()) return;
+      try {
+        if (video.readyState >= 2 && video.videoWidth > 0) {
+          const barcodes = await detector.detect(video);
+          if (barcodes && barcodes.length > 0) {
+            const value = (barcodes[0].rawValue || "").trim();
+            if (value) {
+              onDetect(value);
+              return;
+            }
+          }
+        }
+        scanErrCount = 0;
+      } catch (e) {
+        scanErrCount++;
+        if (scanErrCount === 1) console.warn("Detector error:", e);
+        if (scanErrCount > 30) {
+          setStatus("Scanner having trouble — type manually below");
+          return;
+        }
+      }
+      requestAnimationFrame(scanLoop);
+    };
+    scanLoop();
+  } catch (err) {
+    console.error("Single scanner native setup failed:", err);
+    setStatus("❌ Camera unavailable — type manually below");
+  }
+}
+
+/* Fallback for browsers without BarcodeDetector */
+async function initFallbackSingleScanner(onDetect, setStatus) {
+  const HQR = window.Html5Qrcode;
+  if (!HQR) { setStatus("Scanner unavailable — type manually below."); return; }
+  const HQRFormats = window.Html5QrcodeSupportedFormats;
+  const allFormats = HQRFormats ? [
+    HQRFormats.CODE_128, HQRFormats.CODE_39, HQRFormats.CODE_93,
+    HQRFormats.EAN_13, HQRFormats.QR_CODE, HQRFormats.DATA_MATRIX,
+  ] : undefined;
+
+  const video = document.getElementById("singleScanVideo");
+  if (video) video.style.display = "none";
+  const wrap = document.querySelector(".bulk-scan-viewfinder");
+  if (wrap) {
+    const div = document.createElement("div");
+    div.id = "singleScanDiv";
+    div.style.width = "100%";
+    wrap.insertBefore(div, wrap.firstChild);
+  }
+
+  setTimeout(async () => {
+    try {
+      const scanner = new HQR("singleScanDiv", { verbose: false, formatsToSupport: allFormats });
+      await scanner.start(
+        { facingMode: "environment" },
+        { fps: 15, qrbox: { width: 280, height: 120 } },
+        async (decodedText) => {
+          try { await scanner.stop(); } catch {}
+          try { await scanner.clear(); } catch {}
+          onDetect(decodedText);
+        },
+        () => {}
+      );
+      setStatus("📷 Scanner ready (fallback) — point at barcode");
+    } catch (e) {
+      console.error("Fallback scanner failed:", e);
+      setStatus("❌ Scanner failed — type manually below");
+    }
+  }, 100);
+}
+
+async function _OLD_openBarcodeScannerModal_DISABLED({ title = "📷 Scan Barcode", hint = "Point camera at the barcode or QR code.", onScan }) {
+  // Use the low-level Html5Qrcode API directly so we can force the BACK
+  // camera (facingMode: "environment") instead of the front selfie cam.
+  const HQR = window.Html5Qrcode;
+  const libraryReady = typeof HQR !== "undefined";
+  const cameraReady = libraryReady && window.isSecureContext;
+
+  let currentFacing = "environment"; // start with back camera
+
+  const cameraSection = cameraReady
+    ? `
+      <div class="qr-reader-wrap">
+        <div id="qrReader"></div>
+        <div class="qr-controls">
+          <button type="button" class="qr-icon-btn" id="qrTorchBtn" aria-label="Toggle torch / flashlight" style="display: none;">🔦</button>
+          <button type="button" class="qr-icon-btn" id="qrFlipBtn" aria-label="Flip camera">🔄</button>
+        </div>
+        <div class="qr-status" id="qrStatus">Starting back camera…</div>
+      </div>
+      <div class="scan-divider"><span>OR</span></div>
+    `
+    : `
+      <div class="hint hint-warn" style="margin-bottom: 0.7rem;">
+        ${!libraryReady ? "📷 Camera scanner unavailable — type manually below." : "Camera needs HTTPS — type manually below."}
+      </div>
+    `;
+
+  modal.innerHTML = `
+    <h3>${escapeHtml(title)}</h3>
+    <p class="modal-desc">${escapeHtml(hint)}</p>
+    ${cameraSection}
+    <div class="manual-entry-block">
+      <label for="manualScanInput">Type the number manually:</label>
+      <div class="input-with-scan" style="margin-top: 0.4rem;">
+        <input type="text" id="manualScanInput" autocomplete="off" inputmode="numeric" placeholder="Paste or type the number" />
+        <button type="button" class="btn btn-primary btn-sm" id="manualScanOk">OK</button>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary btn-block" data-act="cancel">Close</button>
+    </div>
+  `;
+  modal.classList.add("modal-wide");
+  modalOverlay.classList.remove("hidden");
+
+  const setStatus = (text) => {
+    const s = document.getElementById("qrStatus");
+    if (s) s.textContent = text;
+  };
+
+  const cleanup = async () => {
+    try {
+      if (_activeScanner) {
+        await _activeScanner.stop().catch(() => {});
+        await _activeScanner.clear().catch(() => {});
+      }
+    } catch {}
+    _activeScanner = null;
+    modal.classList.remove("modal-wide");
+    closeModal();
+  };
+
+  // Manual entry — always available
+  document.getElementById("manualScanOk")?.addEventListener("click", async () => {
+    const val = document.getElementById("manualScanInput")?.value.trim();
+    if (!val) return;
+    await cleanup();
+    try { onScan(val); } catch {}
+  });
+  document.getElementById("manualScanInput")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      document.getElementById("manualScanOk")?.click();
+    }
+  });
+
+  modal.querySelector('[data-act="cancel"]').onclick = cleanup;
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) cleanup(); };
+
+  if (!cameraReady) {
+    setTimeout(() => document.getElementById("manualScanInput")?.focus(), 100);
+    return;
+  }
+
+  // ----- Camera start logic with forced back-camera -----
+  // Wide qrbox optimised for Code 128 barcodes (IMEI / ICCID).
+  // These barcodes are long horizontal strips, so qrbox needs width.
+  const HQRFormats = window.Html5QrcodeSupportedFormats;
+  const allFormats = HQRFormats
+    ? [
+        HQRFormats.CODE_128,    // most common for IMEI / ICCID
+        HQRFormats.CODE_39,
+        HQRFormats.CODE_93,
+        HQRFormats.EAN_13,
+        HQRFormats.EAN_8,
+        HQRFormats.UPC_A,
+        HQRFormats.UPC_E,
+        HQRFormats.ITF,
+        HQRFormats.QR_CODE,
+        HQRFormats.DATA_MATRIX,
+        HQRFormats.PDF_417,
+      ]
+    : undefined;
+
+  const config = {
+    fps: 15,                                // higher framerate for snappier detection
+    qrbox: (vw, vh) => {
+      // For long Code 128 barcodes, we want a WIDE / SHORT scan box
+      const w = Math.min(vw * 0.92, 360);
+      const h = Math.min(vh * 0.45, 140);
+      return { width: Math.floor(w), height: Math.floor(h) };
+    },
+    aspectRatio: 1.5,
+    disableFlip: false,
+    rememberLastUsedCamera: false,
+    formatsToSupport: allFormats,
+    experimentalFeatures: {
+      // Use the native BarcodeDetector API on supported devices for much
+      // better detection performance and accuracy.
+      useBarCodeDetectorIfSupported: true,
+    },
+    videoConstraints: {
+      // Request higher resolution for clearer barcode lines
+      facingMode: "environment",
+      width: { ideal: 1920, min: 640 },
+      height: { ideal: 1080, min: 480 },
+      focusMode: "continuous",
+      advanced: [{ focusMode: "continuous" }],
+    },
+  };
+
+  const startCamera = async (facing) => {
+    setStatus(`Starting ${facing === "environment" ? "back" : "front"} camera…`);
+    try {
+      if (_activeScanner) {
+        try { await _activeScanner.stop(); } catch {}
+        try { await _activeScanner.clear(); } catch {}
+        _activeScanner = null;
+      }
+      _activeScanner = new HQR("qrReader", { verbose: false, formatsToSupport: allFormats });
+      await _activeScanner.start(
+        { facingMode: facing },
+        config,
+        async (decodedText) => {
+          await cleanup();
+          try { onScan(String(decodedText).trim()); } catch {}
+        },
+        () => {} // per-frame decode misses
+      );
+      currentFacing = facing;
+      setStatus("📷 Hold steady, fill the bar in the frame");
+
+      // Show torch button if device supports it
+      try {
+        const settings = _activeScanner.getRunningTrackCameraCapabilities?.();
+        const torchBtn = document.getElementById("qrTorchBtn");
+        if (settings?.torchFeature?.()?.isSupported?.() && torchBtn) {
+          torchBtn.style.display = "flex";
+        }
+      } catch {}
+    } catch (err) {
+      console.warn("Camera start failed for", facing, err);
+      if (facing === "environment") {
+        try {
+          const cams = await HQR.getCameras();
+          // STRICT: only pick a camera that explicitly identifies as back/rear.
+          // Never fall through to last camera (could be front-facing).
+          const back = cams.find((c) => /back|rear|environment|world|wide(?!.*front)/i.test(c.label || ""));
+          if (back) {
+            _activeScanner = new HQR("qrReader", { verbose: false, formatsToSupport: allFormats });
+            await _activeScanner.start(
+              back.id,
+              config,
+              async (decodedText) => {
+                await cleanup();
+                try { onScan(String(decodedText).trim()); } catch {}
+              },
+              () => {}
+            );
+            setStatus("📷 Hold steady, fill the bar in the frame");
+            return;
+          }
+          // No back camera at all → show error, don't fall back to front
+          setStatus("❌ Back camera not found. Use manual entry below.");
+          return;
+        } catch (innerErr) {
+          console.error("Camera enumeration fallback failed:", innerErr);
+        }
+      }
+      setStatus("Camera unavailable — please type manually below.");
+    }
+  };
+
+  // Defer slightly so the qrReader div is laid out before camera init
+  setTimeout(() => startCamera("environment"), 100);
+
+  document.getElementById("qrFlipBtn")?.addEventListener("click", () => {
+    const newFacing = currentFacing === "environment" ? "user" : "environment";
+    startCamera(newFacing);
+  });
+
+  // Torch / flashlight toggle (back camera with LED)
+  let torchOn = false;
+  document.getElementById("qrTorchBtn")?.addEventListener("click", async () => {
+    if (!_activeScanner) return;
+    try {
+      torchOn = !torchOn;
+      const cap = _activeScanner.getRunningTrackCameraCapabilities?.();
+      if (cap?.torchFeature) {
+        await cap.torchFeature().apply(torchOn);
+        const btn = document.getElementById("qrTorchBtn");
+        if (btn) btn.classList.toggle("active", torchOn);
+      }
+    } catch (err) {
+      console.warn("Torch toggle failed:", err);
+    }
+  });
+}
+
+/* ============================================================
+   EXCEL EXPORT — uses SheetJS (XLSX) loaded via CDN.
+   Generates a downloadable .xlsx file for the chosen data.
+   ============================================================ */
+
+function todayFileStamp() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function downloadAsExcel(sheets, baseName) {
+  // sheets = [{ name, rows: array-of-objects }]
+  if (typeof XLSX === "undefined") {
+    showToast("Excel library not loaded. Refresh and try again.", true);
+    return;
+  }
+  const wb = XLSX.utils.book_new();
+  for (const s of sheets) {
+    const rows = s.rows && s.rows.length ? s.rows : [{ "(empty)": "No data" }];
+    const ws = XLSX.utils.json_to_sheet(rows);
+    // Auto-size columns roughly based on header length + content
+    const cols = Object.keys(rows[0]).map((k) => {
+      const maxLen = Math.max(
+        k.length,
+        ...rows.map((r) => String(r[k] ?? "").length)
+      );
+      return { wch: Math.min(40, Math.max(10, maxLen + 2)) };
+    });
+    ws["!cols"] = cols;
+    XLSX.utils.book_append_sheet(wb, ws, s.name.slice(0, 30));
+  }
+  XLSX.writeFile(wb, `${baseName}-${todayFileStamp()}.xlsx`);
+}
+
+function exportInstallationsToExcel() {
+  const installs = loadInstallations();
+  const rows = installs.map((i) => ({
+    "Vehicle No": i.vehicleNo || "",
+    "GPS Model": i.gpsModel || "",
+    "Current IMEI": getCurrentImei(i),
+    "Current SIM (Primary)": resolvePrimarySim(getCurrentSim(i)) || "",
+    "SIM ICCID (Secondary)": i.secondarySim || (i.simHistory[0]?.secondaryValue) || "",
+    "MAC ID": i.macId || "",
+    "Sensor No": i.sensorNo || "",
+    "IMEI History": (i.imeiHistory || []).map((h) => h.value).join(" → "),
+    "SIM History": (i.simHistory || []).map((h) => h.value).join(" → "),
+    "Created By": i.createdBy || "",
+    "Created At": formatDateTime(i.createdAt),
+    "Tasks Complete": Object.values(i.tasks || {}).filter((t) => t?.completedAt).length,
+    "Tasks Pending": INSTALL_TASK_TYPES.filter((t) => !(i.tasks?.[t]?.completedAt)).length,
+  }));
+  downloadAsExcel([{ name: "Installations", rows }], "installations");
+  showToast(`Exported ${rows.length} installations.`);
+}
+
+function exportSimsToExcel() {
+  const allSims = loadSims();
+  const allInstalls = loadInstallations();
+  const inUseMap = new Map();
+  for (const inst of allInstalls) {
+    for (const h of inst.simHistory) {
+      if (h.active && h.value) inUseMap.set(h.value.toLowerCase(), inst.vehicleNo);
+    }
+  }
+  const rows = allSims.map((s) => {
+    const pri = (s.primaryNumber || "").toLowerCase();
+    const sec = (s.secondaryNumber || "").toLowerCase();
+    const linkedVehicle = inUseMap.get(pri) || inUseMap.get(sec) || "";
+    let status = "Available";
+    if (!s.primaryNumber) status = "Pending Primary";
+    else if (linkedVehicle) status = "In Use";
+    return {
+      "Primary Number": s.primaryNumber || "",
+      "Secondary Number (ICCID)": s.secondaryNumber || "",
+      "Status": status,
+      "Linked Vehicle": linkedVehicle,
+      "Notes": s.notes || "",
+      "Added At": s.createdAt ? formatDateTime(s.createdAt) : "",
+    };
+  });
+  downloadAsExcel([{ name: "SIM Database", rows }], "sim-database");
+  showToast(`Exported ${rows.length} SIMs.`);
+}
+
+function exportStockToExcel() {
+  const items = loadStockItems();
+  const tx = loadStockTransactions();
+  const itemRows = items.map((it) => ({
+    "Item Name": it.name || "",
+    "Category": it.category || "",
+    "Quantity": it.quantity ?? 0,
+    "Unit": it.unit || "pcs",
+    "IMEI": it.metadata?.imei || "",
+    "MAC": it.metadata?.mac || "",
+    "SIM Primary": it.metadata?.primary || "",
+    "SIM Secondary (ICCID)": it.metadata?.secondary || "",
+    "Sensor No": it.metadata?.sensorNo || "",
+    "Supplier": it.supplier || "",
+    "Low-stock Threshold": it.lowStockThreshold ?? "",
+    "Notes": it.notes || "",
+    "Added": it.createdAt ? formatDateTime(it.createdAt) : "",
+  }));
+  const txRows = tx.slice(0, 1000).map((t) => ({
+    "Date": formatDateTime(t.createdAt),
+    "Item": t.itemName || "",
+    "Type": t.type || "",
+    "Change": t.delta ?? 0,
+    "Vehicle": t.vehicleNo || "",
+    "Note": t.note || "",
+    "By": t.createdBy || "",
+  }));
+  downloadAsExcel(
+    [
+      { name: "Stock Items", rows: itemRows },
+      { name: "Recent Transactions", rows: txRows },
+    ],
+    "stock"
+  );
+  showToast(`Exported ${itemRows.length} stock items.`);
+}
+
+function exportRepairsToExcel() {
+  const records = loadMaintenance();
+  const rows = records.map((r) => ({
+    "Vehicle No": r.vehicleNo || "",
+    "Old IMEI": r.oldImei || "",
+    "Old SIM": r.oldSimNo || "",
+    "SIM Changed": r.simChange ? "Yes" : "",
+    "New SIM (ICCID)": r.newSimNo || "",
+    "Device Changed": r.deviceChange ? "Yes" : "",
+    "New IMEI": r.newImei || "",
+    "Device Out for Repair": r.deviceOutForRepair ? "Yes" : "",
+    "Sensor Out for Repair": r.sensorOutForRepair ? "Yes" : "",
+    "Other Work": r.otherWorkText || "",
+    "Remarks": r.remarks || "",
+    "Created By": r.createdBy || "",
+    "Created At": formatDateTime(r.createdAt),
+    "Tasks Complete": getTasks(r).filter(isTaskDone).length,
+    "Tasks Pending": getTasks(r).filter((t) => !isTaskDone(t)).length,
+  }));
+  downloadAsExcel([{ name: "Repair Records", rows }], "repair-records");
+  showToast(`Exported ${rows.length} repair records.`);
 }
 
 function formatDateTime(iso) {
@@ -60,6 +2485,249 @@ function formatDateTime(iso) {
   });
 }
 
+/**
+ * Wraps an async action so that a click handler:
+ *  - Disables the button while the action runs
+ *  - Shows a spinner + custom busy label
+ *  - Ignores extra clicks (prevents duplicate submits)
+ *  - Restores button state on success or error
+ *
+ * Usage:
+ *   button.addEventListener("click", withBusyButton(async () => {
+ *     await saveStuff();
+ *   }, { busyText: "Saving…" }));
+ *
+ *  OR (called from inside a click handler):
+ *   await runWithBusyButton(button, async () => { await doStuff(); }, "Saving…");
+ */
+/**
+ * Global top-of-page loading bar for long async ops.
+ * Reference-counted so nested ops work correctly.
+ */
+let _busyCount = 0;
+function showGlobalBusy() {
+  _busyCount++;
+  if (_busyCount === 1) {
+    let bar = document.getElementById("globalBusyBar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.id = "globalBusyBar";
+      bar.className = "global-busy-bar";
+      document.body.appendChild(bar);
+    }
+    bar.classList.add("show");
+  }
+}
+function hideGlobalBusy() {
+  _busyCount = Math.max(0, _busyCount - 1);
+  if (_busyCount === 0) {
+    const bar = document.getElementById("globalBusyBar");
+    if (bar) bar.classList.remove("show");
+  }
+}
+
+async function runWithBusyButton(btn, fn, busyText = "Saving…") {
+  if (!btn || btn.dataset.busy === "1") return; // already busy → ignore
+  btn.dataset.busy = "1";
+  const originalLabel = btn.innerHTML;
+  const originalDisabled = btn.disabled;
+  btn.disabled = true;
+  btn.classList.add("is-busy");
+  btn.innerHTML = `<span class="btn-spinner"></span> <span class="btn-busy-text">${escapeHtml(busyText)}</span>`;
+  showGlobalBusy();
+  try {
+    await fn();
+  } finally {
+    hideGlobalBusy();
+    btn.disabled = originalDisabled;
+    btn.classList.remove("is-busy");
+    btn.innerHTML = originalLabel;
+    delete btn.dataset.busy;
+  }
+}
+
+function withBusyButton(fn, { busyText = "Saving…" } = {}) {
+  return async function(e) {
+    const btn = e?.currentTarget || e?.target;
+    if (!btn) { await fn.call(this, e); return; }
+    await runWithBusyButton(btn, () => fn.call(this, e), busyText);
+  };
+}
+
+/**
+ * v3.7.0 — Grouped pending tasks section for Installations page.
+ * Shows a collapsible card per task type, listing all installs with that
+ * task still pending. Admin can act on the task directly from here.
+ */
+let _pendingTasksExpanded = {}; // taskType -> bool
+
+function renderPendingTasksGroups(allInstalls) {
+  // Build map: taskType -> array of installs that have this task pending
+  const groups = {};
+  for (const inst of allInstalls) {
+    for (const type of INSTALL_TASK_TYPES) {
+      const t = inst.tasks?.[type];
+      if (!t || !t.completedAt) {
+        if (!groups[type]) groups[type] = [];
+        groups[type].push(inst);
+      }
+    }
+  }
+
+  const typesWithPending = INSTALL_TASK_TYPES.filter((t) => (groups[t] || []).length > 0);
+  if (typesWithPending.length === 0) {
+    return `
+      <section class="card pending-tasks-card">
+        <div class="all-done-banner">
+          <span class="all-done-icon">✅</span>
+          <div>
+            <h3>All installation tasks completed!</h3>
+            <p>Har vehicle ke saare portal / vehicle-number tasks done ho gaye.</p>
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="card pending-tasks-card">
+      <div class="section-heading">
+        <div>
+          <h2>📋 Pending Tasks by Type</h2>
+          <p class="section-subtitle">Har type ke pending tasks group me. Click karke expand karo aur ek jagah se sab handle karo.</p>
+        </div>
+      </div>
+      <div class="pending-groups">
+        ${typesWithPending.map((type) => {
+          const meta = TASK_TYPES[type];
+          const list = groups[type];
+          const isExpanded = _pendingTasksExpanded[type];
+          return `
+            <div class="pending-group ${isExpanded ? 'expanded' : ''}">
+              <button type="button" class="pending-group-header" data-toggle-task="${escapeHtml(type)}">
+                <span class="pg-icon">${meta.icon}</span>
+                <span class="pg-label">${escapeHtml(meta.label)}</span>
+                <span class="pg-count">${list.length}</span>
+                <span class="pg-arrow">${isExpanded ? '▼' : '▶'}</span>
+              </button>
+              ${isExpanded ? `
+                <div class="pending-group-body">
+                  <div class="pending-list">
+                    ${list.slice(0, 50).map((inst) => `
+                      <div class="pending-row">
+                        <div class="pending-row-main">
+                          <span class="pr-vehicle">${escapeHtml(inst.vehicleNo)}</span>
+                          <span class="pr-imei mono">IMEI: ${escapeHtml(getCurrentImei(inst) || '—')}</span>
+                        </div>
+                        <div class="pending-row-actions">
+                          <button type="button" class="btn btn-primary btn-xs pending-mark-done" data-install-id="${escapeHtml(inst.id)}" data-task-type="${escapeHtml(type)}">✓ Done</button>
+                        </div>
+                      </div>
+                    `).join('')}
+                    ${list.length > 50 ? `<div class="pending-more">...and ${list.length - 50} more (showing first 50)</div>` : ''}
+                  </div>
+                </div>
+              ` : ''}
+            </div>
+          `;
+        }).join('')}
+      </div>
+    </section>
+  `;
+}
+
+function bindPendingTaskHandlers() {
+  document.querySelectorAll('[data-toggle-task]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const type = btn.dataset.toggleTask;
+      _pendingTasksExpanded[type] = !_pendingTasksExpanded[type];
+      render();
+    });
+  });
+  document.querySelectorAll('.pending-mark-done').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      await runWithBusyButton(btn, async () => {
+        const installId = btn.dataset.installId;
+        const taskType = btn.dataset.taskType;
+        const inst = installations.find((i) => i.id === installId);
+        if (!inst) { showToast("Installation not found.", true); return; }
+        const now = new Date().toISOString();
+        const newTasks = { ...(inst.tasks || {}) };
+        newTasks[taskType] = { completedAt: now, completedBy: currentUser?.username || "admin" };
+        try {
+          const updated = { ...inst, tasks: newTasks };
+          await updateInstallation(updated);
+          const idx = installations.findIndex((i) => i.id === installId);
+          if (idx >= 0) installations[idx] = updated;
+          showToast(`✓ Task marked complete for ${inst.vehicleNo}`);
+          render();
+        } catch (err) {
+          showToast(err.message || "Failed to mark task complete.", true);
+        }
+      }, "Marking…");
+    });
+  });
+}
+
+function renderPendingTasksGroups_bindHelper() { bindPendingTaskHandlers(); }
+
+/* ============================================================
+   Universal sortable table system (v3.7.0)
+   Usage:
+     1. In your <th>: renderSortHeader("Vehicle", "vehicleNo", "installsTable")
+     2. Before mapping rows: sortRows(rows, "installsTable", accessors)
+   accessors = { vehicleNo: r => r.vehicleNo, imei: r => getCurrentImei(r), ... }
+   ============================================================ */
+const tableSortState = {}; // { tableKey: { column, direction: "asc"|"desc" } }
+
+function renderSortHeader(label, columnKey, tableKey) {
+  const st = tableSortState[tableKey];
+  const isActive = st && st.column === columnKey;
+  const arrow = isActive ? (st.direction === "asc" ? " ▲" : " ▼") : "";
+  const activeClass = isActive ? " sortable-th-active" : "";
+  return `<th class="sortable-th${activeClass}" data-sort-table="${escapeHtml(tableKey)}" data-sort-column="${escapeHtml(columnKey)}">${label}${arrow}</th>`;
+}
+
+function sortRows(rows, tableKey, accessors) {
+  const st = tableSortState[tableKey];
+  if (!st || !st.column || !accessors[st.column]) return rows;
+  const fn = accessors[st.column];
+  const sorted = [...rows].sort((a, b) => {
+    const va = fn(a);
+    const vb = fn(b);
+    // Handle null/undefined
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    // Number vs string
+    if (typeof va === "number" && typeof vb === "number") return va - vb;
+    if (va instanceof Date && vb instanceof Date) return va.getTime() - vb.getTime();
+    return String(va).localeCompare(String(vb), undefined, { numeric: true, sensitivity: "base" });
+  });
+  if (st.direction === "desc") sorted.reverse();
+  return sorted;
+}
+
+// Global click handler for sort headers (delegated)
+document.addEventListener("click", (e) => {
+  const th = e.target.closest && e.target.closest(".sortable-th");
+  if (!th) return;
+  const tableKey = th.dataset.sortTable;
+  const column = th.dataset.sortColumn;
+  if (!tableKey || !column) return;
+  const st = tableSortState[tableKey] || {};
+  if (st.column === column) {
+    // Same column — toggle direction, or clear if desc
+    if (st.direction === "asc") st.direction = "desc";
+    else { tableSortState[tableKey] = {}; render(); return; }
+  } else {
+    st.column = column;
+    st.direction = "asc";
+  }
+  tableSortState[tableKey] = st;
+  render();
+});
+
 function showToast(message, isError = false) {
   toast.textContent = message;
   toast.classList.toggle("error", isError);
@@ -68,31 +2736,68 @@ function showToast(message, isError = false) {
   showToast._timer = setTimeout(() => toast.classList.add("hidden"), 3000);
 }
 
+/* ---------------- Modal helpers ---------------- */
+
+function closeModal() {
+  modalOverlay.classList.add("hidden");
+  modal.innerHTML = "";
+  modalOverlay.onclick = null;
+}
+
 function showModal(html, onConfirm) {
   modal.innerHTML = html;
   modalOverlay.classList.remove("hidden");
 
-  const close = () => {
-    modalOverlay.classList.add("hidden");
-    modal.innerHTML = "";
-  };
-
-  modal.querySelector(".modal-close")?.addEventListener("click", close);
+  modal.querySelector(".modal-close")?.addEventListener("click", closeModal);
   modalOverlay.onclick = (e) => {
-    if (e.target === modalOverlay) close();
+    if (e.target === modalOverlay) closeModal();
   };
 
-  modal.querySelector(".modal-confirm")?.addEventListener("click", async () => {
-    try {
-      const result = await onConfirm?.();
-      if (result !== false) close();
-    } catch (err) {
-      showToast(err.message || "Something went wrong.", true);
-    }
-  });
+  const confirmBtn = modal.querySelector(".modal-confirm");
+  if (confirmBtn) {
+    confirmBtn.addEventListener("click", async () => {
+      if (confirmBtn.dataset.busy === "1") return; // double-click guard
+      await runWithBusyButton(confirmBtn, async () => {
+        try {
+          const result = await onConfirm?.();
+          if (result !== false) closeModal();
+        } catch (err) {
+          showToast(err.message || "Something went wrong.", true);
+        }
+      }, "Saving…");
+    });
+  }
 
-  return { modalEl: modal, close };
+  return { modalEl: modal, close: closeModal };
 }
+
+function showConfirm({ title, message, confirmLabel = "Confirm", cancelLabel = "Cancel", danger = false }) {
+  return new Promise((resolve) => {
+    modal.innerHTML = `
+      <div class="modal-icon ${danger ? "danger" : ""}">${danger ? "⚠️" : "❓"}</div>
+      <h3>${escapeHtml(title)}</h3>
+      <p class="modal-desc">${escapeHtml(message)}</p>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" data-action="cancel">${escapeHtml(cancelLabel)}</button>
+        <button type="button" class="btn ${danger ? "btn-danger" : "btn-primary"}" data-action="confirm">${escapeHtml(confirmLabel)}</button>
+      </div>
+    `;
+    modalOverlay.classList.remove("hidden");
+
+    const done = (value) => {
+      closeModal();
+      resolve(value);
+    };
+
+    modal.querySelector('[data-action="cancel"]').onclick = () => done(false);
+    modal.querySelector('[data-action="confirm"]').onclick = () => done(true);
+    modalOverlay.onclick = (e) => {
+      if (e.target === modalOverlay) done(false);
+    };
+  });
+}
+
+/* ---------------- Domain helpers ---------------- */
 
 function getCurrentImei(inst) {
   const active = [...inst.imeiHistory].reverse().find((i) => i.active);
@@ -101,7 +2806,13 @@ function getCurrentImei(inst) {
 
 function getCurrentSim(inst) {
   const active = [...inst.simHistory].reverse().find((s) => s.active);
-  return active?.value || inst.simHistory.at(-1)?.value || "";
+  const val = active?.value || inst.simHistory.at(-1)?.value || "";
+  // Defensive: simHistory.value should ONLY hold a Primary number (mobile no).
+  // If old data has an ICCID here (bug from v3.6.7 and earlier), don't return it
+  // as "current primary SIM" — return empty so it shows as "Missing" instead of
+  // polluting the Primary column of the unified SIM database.
+  if (val && isLikelyIccid(val)) return "";
+  return val;
 }
 
 function findInstallationByImei(imei) {
@@ -112,19 +2823,33 @@ function findInstallationByImei(imei) {
   );
 }
 
+function findInstallationByVehicle(vehicleNo) {
+  const q = vehicleNo.trim().toLowerCase();
+  if (!q) return null;
+  return loadInstallations().find((inst) => inst.vehicleNo.toLowerCase() === q);
+}
+
 function historyList(items) {
   if (!items.length) return '<span class="muted">—</span>';
   return items
     .map((item) => {
       let badge = '<span class="badge badge-muted">Inactive</span>';
       if (item.active && item.pendingDeactivation) {
-        badge = '<span class="badge badge-warn">Active — deactivate pending</span>';
+        badge = '<span class="badge badge-warn">Active · deactivate pending</span>';
       } else if (item.active) {
         badge = '<span class="badge badge-ok">Active</span>';
       }
-      return '<div class="history-item">' + escapeHtml(item.value) + ' ' + badge + '</div>';
+      return '<div class="history-item"><span class="mono">' + escapeHtml(item.value) + "</span> " + badge + "</div>";
     })
     .join("");
+}
+
+function simHistoryCell(inst) {
+  let html = historyList(inst.simHistory);
+  if (inst.secondarySim) {
+    html += `<div class="history-item secondary-sim"><span class="badge badge-secondary">Secondary No</span> <span class="mono">${escapeHtml(inst.secondarySim)}</span></div>`;
+  }
+  return html;
 }
 
 function workLabels(record) {
@@ -132,34 +2857,113 @@ function workLabels(record) {
   if (record.wiringConnection) parts.push("Wiring connection");
   if (record.simChange) parts.push(`SIM change → ${record.newSimNo}`);
   if (record.deviceChange) parts.push(`Device change → ${record.newImei}`);
+  if (record.sensorOutForRepair) parts.push("Sensor out for repair");
+  if (record.sensorChanged) parts.push("Sensor changed");
+  if (record.deviceOutForRepair) parts.push("Device out for repair");
+  if (record.otherWorkText) parts.push(`Other → ${record.otherWorkText}`);
   return parts.join(", ") || "—";
 }
 
 function getMaintenanceStatus(record) {
-  const parts = [];
-  if (record.simChange) {
-    parts.push(
-      record.simDeactivated
-        ? '<span class="badge badge-ok">Old SIM deactivated</span>'
-        : '<span class="badge badge-warn">Awaiting SIM deactivation</span>'
-    );
-  }
-  if (record.deviceChange) {
-    parts.push('<span class="badge badge-repair">Send for repair</span>');
-  }
-  return parts.length ? parts.join(" ") : "—";
+  const tasks = getTasks(record);
+  if (!tasks.length) return '<span class="badge badge-ok">Done</span>';
+  const pending = tasks.filter((t) => !isTaskDone(t));
+  if (!pending.length) return '<span class="badge badge-ok">All actions done</span>';
+  return `<span class="badge badge-warn">${pending.length} action${pending.length === 1 ? "" : "s"} pending</span>`;
 }
 
-function setView(next) {
+function setView(next, skipHistory = false) {
   view = next;
+  if (!skipHistory) {
+    try {
+      history.pushState({ view: next, modalOpen: false }, "", "#" + encodeURIComponent(next));
+    } catch (e) {}
+  }
   render();
 }
 
-function logout() {
+/**
+ * Browser back button handler — closes modal first, else navigates back.
+ * Lets Android hardware back / browser back behave naturally.
+ */
+function handlePopState(e) {
+  // If modal is open, close it instead of navigating
+  if (modalOverlay && !modalOverlay.classList.contains("hidden")) {
+    closeModal();
+    // Push state again to maintain history at current view
+    try {
+      history.pushState({ view, modalOpen: false }, "", "#" + encodeURIComponent(view));
+    } catch (er) {}
+    return;
+  }
+  // Else navigate to previous view (or logout if none)
+  const targetView = (e.state && e.state.view) || null;
+  if (targetView && targetView !== view) {
+    view = targetView;
+    render();
+  } else if (!targetView && currentUser) {
+    // No state — go to default landing
+    view = (typeof userCanAccessPage === "function" && currentUser !== "admin" && currentUser !== "akash")
+      ? null
+      : (currentUser === "akash" ? "akash-home" : "dashboard");
+    if (view) {
+      try { history.replaceState({ view }, "", "#" + encodeURIComponent(view)); } catch {}
+      render();
+    }
+  }
+}
+
+async function logout() {
+  await stopRealtime();
   currentUser = null;
   view = "login";
   searchQuery = "";
+  lastSyncedAt = null;
+  _scrollMemo = {};
+  _lastRenderedView = null;
+  try { history.replaceState({ view: "login" }, "", "#login"); } catch {}
   render();
+}
+
+/* ---------------- Live badge ---------------- */
+
+function liveBadgeMarkup() {
+  let cls = "synced";
+  let label = "Live";
+  let dotPulse = true;
+
+  if (isLoadingData) {
+    cls = "syncing";
+    label = "Syncing";
+  } else if (realtimeStatus === "live") {
+    cls = "synced";
+    label = lastSyncedAt
+      ? `Live · ${lastSyncedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+      : "Live";
+  } else if (realtimeStatus === "connecting") {
+    cls = "syncing";
+    label = "Connecting";
+  } else if (realtimeStatus === "error") {
+    cls = "offline";
+    label = "Reconnecting";
+  } else {
+    cls = "offline";
+    label = "Offline";
+    dotPulse = false;
+  }
+
+  return `<span class="live-badge ${cls}" id="liveBadge">
+      <span class="live-dot ${dotPulse ? "" : "static"}"></span>
+      ${escapeHtml(label)}
+    </span>`;
+}
+
+function updateLiveBadge() {
+  const existing = document.getElementById("liveBadge");
+  if (!existing) return;
+  const wrap = document.createElement("div");
+  wrap.innerHTML = liveBadgeMarkup();
+  existing.replaceWith(wrap.firstElementChild);
 }
 
 function renderHeader(title, subtitle) {
@@ -167,16 +2971,28 @@ function renderHeader(title, subtitle) {
     <header class="header">
       <div class="header-content">
         <div class="logo">
-          <span class="logo-icon">📡</span>
+          <span class="logo-icon">
+            <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="var(--primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 21s-6-5.3-6-10a6 6 0 1 1 12 0c0 4.7-6 10-6 10z"/>
+              <circle cx="12" cy="11" r="2.4"/>
+            </svg>
+          </span>
           <div>
-            <h1>${escapeHtml(title)}</h1>
+            <h1>${escapeHtml(title)} <span class="app-version" title="App version">v${APP_VERSION}</span></h1>
             <p>${escapeHtml(subtitle)}</p>
           </div>
         </div>
         ${
           currentUser
             ? `<div class="header-actions">
-                <span class="user-badge">${currentUser === "akash" ? "👷 Akash" : "🛡️ Admin"}</span>
+                ${liveBadgeMarkup()}
+                <span class="user-badge">${(() => {
+                  if (currentUser === "akash") return "👷 Akash";
+                  if (currentUser === "admin") return "🛡️ Admin";
+                  if (currentUser === "abhinav") return "📦 Abhinav";
+                  return `👤 ${escapeHtml(currentUser || "User")}`;
+                })()}</span>
+                ${renderNotifBell()}
                 <button type="button" class="btn btn-outline btn-sm" id="logoutBtn">Logout</button>
               </div>`
             : ""
@@ -191,14 +3007,8 @@ function renderConfigMissing() {
     ${renderHeader("GPS Maintenance Tracker", "Setup required")}
     <main class="main centered">
       <section class="card login-card">
-        <h2>Supabase not configured</h2>
-        <p class="login-desc">Copy <code>config.example.js</code> to <code>config.js</code> and add your Supabase URL and anon key.</p>
-        <ol class="setup-steps">
-          <li>Create a project at <a href="https://supabase.com" target="_blank" rel="noopener">supabase.com</a></li>
-          <li>Run <code>supabase/schema.sql</code> in SQL Editor</li>
-          <li>Copy API keys from Project Settings → API</li>
-          <li>Paste into <code>config.js</code></li>
-        </ol>
+        <h2>Setup required</h2>
+        <p class="login-desc">Server configuration is missing. Please contact the administrator.</p>
       </section>
     </main>
   `;
@@ -208,7 +3018,8 @@ function renderLoading(message = "Loading data...") {
   app.innerHTML = `
     ${renderHeader("GPS Maintenance Tracker", message)}
     <main class="main centered">
-      <section class="card login-card">
+      <section class="card login-card loading-card">
+        <div class="spinner"></div>
         <p class="login-desc">${escapeHtml(message)}</p>
       </section>
     </main>
@@ -217,34 +3028,35 @@ function renderLoading(message = "Loading data...") {
 
 function bindLogout() {
   document.getElementById("logoutBtn")?.addEventListener("click", logout);
+  bindNotifBell();
 }
 
 function renderLogin() {
   app.innerHTML = `
-    ${renderHeader("GPS Maintenance Tracker", "Login to continue")}
-    <main class="main centered">
-      <section class="card login-card">
-        <h2>Login</h2>
-        <p class="login-desc">Enter username and password</p>
-        <form id="loginForm" class="login-form">
+    <div class="login-screen">
+      <div class="login-card">
+        <div class="login-logo">📍</div>
+        <h1>GPS Tracker</h1>
+        <p class="login-subtitle">TASR Fleet · Sign in to continue</p>
+        <form id="loginForm">
           <div class="field">
             <label for="loginUser">Username</label>
-            <input type="text" id="loginUser" required placeholder="akash or admin" autocomplete="username" />
+            <input type="text" id="loginUser" required placeholder="akash, admin, abhinav, or collector" autocomplete="username" />
           </div>
           <div class="field">
             <label for="loginPass">Password</label>
             <input type="password" id="loginPass" required placeholder="Password" autocomplete="current-password" />
           </div>
-          <p class="login-hint">Users: <strong>akash</strong> / <strong>admin</strong> (password same as username)</p>
-          <button type="submit" class="btn btn-primary login-submit">Login</button>
+          <button type="submit" class="btn btn-primary login-submit">Sign in</button>
         </form>
-      </section>
-    </main>
+        <p class="login-footer">v${APP_VERSION} · TASR BharatNext</p>
+      </div>
+    </div>
   `;
 
   document.getElementById("loginForm")?.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const username = document.getElementById("loginUser").value;
+    const username = document.getElementById("loginUser").value.toLowerCase().trim();
     const password = document.getElementById("loginPass").value;
     const role = validateLogin(username, password);
 
@@ -254,25 +3066,192 @@ function renderLogin() {
       return;
     }
 
-    currentUser = role;
-    view = role === "akash" ? "akash-home" : "admin";
-    renderLoading("Loading data from Supabase...");
+    currentUser = username; // Store actual username not role (so multiple users with same role still differ)
+    view = landingPageFor(username);
+    renderLoading("Loading data...");
     try {
       await refreshAllData();
+      startRealtime();
       render();
     } catch (err) {
-      showToast(err.message || "Failed to load data.", true);
-      currentUser = null;
-      view = "login";
-      render();
+      console.error("Data load failed:", err);
+      renderConnectionError(err.message || "Failed to load data.");
     }
   });
 }
 
-function renderAkashHome() {
+function renderConnectionError(message) {
   app.innerHTML = `
-    ${renderHeader("Akash Portal", "Select work type")}
+    ${renderHeader("Connection error", "Could not reach server")}
     <main class="main centered">
+      <section class="card login-card">
+        <h2>⚠️ Could not load data</h2>
+        <p class="login-desc"><strong>${escapeHtml(message)}</strong></p>
+        <p class="login-desc">Please check your internet connection and try again. If the issue persists, contact the administrator.</p>
+        <div class="form-actions" style="margin-top: 1.25rem;">
+          <button type="button" class="btn btn-primary" id="retryConnect">↻ Retry connection</button>
+          <button type="button" class="btn btn-secondary" id="backToLogin">Back to login</button>
+        </div>
+      </section>
+    </main>
+  `;
+  document.getElementById("retryConnect")?.addEventListener("click", async () => {
+    renderLoading("Retrying connection...");
+    try {
+      await refreshAllData();
+      startRealtime();
+      render();
+    } catch (err) {
+      console.error("Retry failed:", err);
+      renderConnectionError(err.message || "Still cannot reach server.");
+    }
+  });
+  document.getElementById("backToLogin")?.addEventListener("click", () => {
+    currentUser = null;
+    view = "login";
+    render();
+  });
+}
+
+function renderAkashDeleted() {
+  const myDeletions = deletionLog.filter(
+    (d) =>
+      d.deletedBy === "akash" &&
+      (d.entityType === "installation" || d.entityType === "maintenance")
+  );
+  const entries = myDeletions.map((d) => {
+    const snap = d.snapshot || {};
+    const isInstall = d.entityType === "installation";
+    return {
+      id: d.id,
+      kind: isInstall ? "install" : "repair",
+      date: d.deletedAt,
+      vehicle: snap.vehicleNo || (d.entityLabel || "").split(" ")[0] || "—",
+      imei: isInstall
+        ? (snap.imeiHistory?.find?.((h) => h.active)?.value || snap.imeiHistory?.[0]?.value || "")
+        : (snap.imeiNo || ""),
+      model: snap.gpsModel || "",
+      sim: snap.simIccid || (snap.iccidHistory?.find?.((h) => h.active)?.value || ""),
+      mac: snap.macId || "",
+      sensor: snap.sensorNo || "",
+      work: isInstall ? "" : [
+        snap.simChange ? "SIM" : null,
+        snap.deviceChange ? "Device" : null,
+        snap.deviceOutForRepair ? "Device→Service" : null,
+        snap.sensorOutForRepair ? "Sensor→Service" : null,
+      ].filter(Boolean).join(" · ") || snap.otherWorkText || "Repair",
+      reason: d.reason || "",
+      originalDate: snap.createdAt || null,
+    };
+  });
+  entries.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+  const tail = (s, n = 6) => {
+    const v = String(s || "");
+    return v.length > n ? "…" + v.slice(-n) : v || "—";
+  };
+
+  app.innerHTML = `
+    ${renderHeader("My Deleted Entries", "History of entries you deleted")}
+    <main class="main">
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>🗑 Deleted Entries</h2>
+            <p class="section-subtitle">Entries you deleted from Akash login. Stock already restored when each was deleted.</p>
+          </div>
+          <button type="button" class="btn btn-secondary btn-sm" id="backToHome">← Back</button>
+        </div>
+
+        <div class="summary-grid" style="margin-top: 0.8rem;">
+          <div class="summary-box" style="border-left-color: #ef4444;">
+            <strong>${entries.length}</strong>
+            <span>Total deleted</span>
+          </div>
+          <div class="summary-box" style="border-left-color: #f59e0b;">
+            <strong>${entries.filter(e => e.kind === "install").length}</strong>
+            <span>Installations</span>
+          </div>
+          <div class="summary-box" style="border-left-color: #8b5cf6;">
+            <strong>${entries.filter(e => e.kind === "repair").length}</strong>
+            <span>Repairs</span>
+          </div>
+        </div>
+
+        <div class="entry-list" style="margin-top: 1rem;">
+          ${entries.length === 0 ? `
+            <div class="entry-empty">
+              <div class="entry-empty-icon">🗑</div>
+              <h3>No deleted entries</h3>
+              <p>When you delete an installation or repair, it'll appear here.</p>
+            </div>
+          ` : entries.map((entry) => `
+            <article class="tk-card tk-deleted">
+              <div class="tk-card-head">
+                <span class="tk-pill tk-pill-deleted">${escapeHtml(entry.vehicle)}</span>
+                <span class="tk-chip tk-chip-deleted">🗑 DELETED · ${entry.kind === "install" ? "INSTALL" : "REPAIR"}</span>
+              </div>
+              ${entry.kind === "install" ? `
+                <div class="tk-flow">
+                  <div class="tk-flow-box">
+                    <div class="tk-flow-value">${escapeHtml(tail(entry.imei))}</div>
+                    <div class="tk-flow-label">IMEI</div>
+                  </div>
+                  <div class="tk-flow-connector">
+                    <div class="tk-flow-icon">📡</div>
+                    <div class="tk-flow-icon-label">${escapeHtml(entry.model || "—")}</div>
+                  </div>
+                  <div class="tk-flow-box tk-flow-end">
+                    <div class="tk-flow-value">${escapeHtml(tail(entry.sim))}</div>
+                    <div class="tk-flow-label">SIM</div>
+                  </div>
+                </div>
+                <div class="tk-stats">
+                  ${entry.mac ? `<div class="tk-stat"><span class="tk-stat-icon">🔗</span><span class="tk-stat-label">MAC:</span><span class="tk-stat-value mono">${escapeHtml(entry.mac)}</span></div>` : ""}
+                  ${entry.sensor ? `<div class="tk-stat"><span class="tk-stat-icon">📊</span><span class="tk-stat-label">Sensor:</span><span class="tk-stat-value mono">${escapeHtml(entry.sensor)}</span></div>` : ""}
+                </div>
+              ` : `
+                <div class="tk-stats" style="margin-bottom: 0.4rem;">
+                  <div class="tk-stat tk-stat-full">
+                    <span class="tk-stat-icon">🛠️</span>
+                    <span class="tk-stat-label">Work:</span>
+                    <span class="tk-stat-value" style="white-space:normal;">${escapeHtml(entry.work)}</span>
+                  </div>
+                </div>
+              `}
+              <div class="tk-footer">
+                ${entry.originalDate ? `
+                  <div class="tk-footer-row">
+                    <span class="tk-footer-icon">📅</span>
+                    <span class="tk-footer-label">Created on:</span>
+                    <span class="tk-footer-value">${escapeHtml(formatDateTime(entry.originalDate))}</span>
+                  </div>
+                ` : ""}
+                <div class="tk-footer-row">
+                  <span class="tk-footer-icon">🗑️</span>
+                  <span class="tk-footer-label">Deleted on:</span>
+                  <span class="tk-footer-value">${escapeHtml(formatDateTime(entry.date))}</span>
+                </div>
+              </div>
+              ${entry.reason ? `<div class="tk-reason">⚠️ Reason: ${escapeHtml(entry.reason)}</div>` : ""}
+            </article>
+          `).join("")}
+        </div>
+      </section>
+    </main>
+  `;
+  bindLogout();
+  document.getElementById("backToHome")?.addEventListener("click", () => setView("akash-home"));
+}
+
+function renderAkashHome() {
+  // Pre-warm camera in background — first scan opens instantly later
+  prewarmCamera();
+  const myInstallations = loadInstallations().filter((inst) => inst.createdBy === "akash");
+  const myMaintenance = loadMaintenance().filter((record) => record.createdBy === "akash");
+  app.innerHTML = `
+    ${renderHeader("Akash Portal", "Field work — installations & repairs")}
+    <main class="main">
       <section class="card">
         <h2>What work are you doing?</h2>
         <div class="choice-grid">
@@ -288,50 +3267,581 @@ function renderAkashHome() {
           </button>
         </div>
       </section>
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>My Entries</h2>
+            <p class="section-subtitle">Entries saved from Akash login.</p>
+          </div>
+          <div style="display:flex; gap:0.45rem; flex-wrap:wrap;">
+            <button type="button" class="btn btn-outline btn-sm" id="goDeletedEntries">🗑 My Deleted</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="refreshMine">↻ Refresh</button>
+          </div>
+        </div>
+        <div class="summary-grid">
+          <div class="summary-box summary-info">
+            <strong>${myInstallations.length}</strong>
+            <span>Installations</span>
+          </div>
+          <div class="summary-box summary-purple">
+            <strong>${myMaintenance.length}</strong>
+            <span>Repair work</span>
+          </div>
+          <div class="summary-box summary-ok">
+            <strong>${(() => {
+              const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+              const i = myInstallations.filter((x) => new Date(x.createdAt).getTime() >= weekAgo).length;
+              const r = myMaintenance.filter((x) => new Date(x.createdAt).getTime() >= weekAgo).length;
+              return i + r;
+            })()}</strong>
+            <span>This week</span>
+          </div>
+          <div class="summary-box summary-warn">
+            <strong>${(() => {
+              const today = new Date();
+              const month = today.getMonth();
+              const year = today.getFullYear();
+              const i = myInstallations.filter((x) => {
+                const d = new Date(x.createdAt);
+                return d.getMonth() === month && d.getFullYear() === year;
+              }).length;
+              const r = myMaintenance.filter((x) => {
+                const d = new Date(x.createdAt);
+                return d.getMonth() === month && d.getFullYear() === year;
+              }).length;
+              return i + r;
+            })()}</strong>
+            <span>This month</span>
+          </div>
+        </div>
+        <div class="entry-list">
+          ${(() => {
+            // Deleted entries now have their own dedicated page (akash-deleted).
+            // My Entries shows ONLY live (non-deleted) installations + repairs.
+            const entries = [
+              ...myInstallations.map((inst) => ({
+                id: inst.id,
+                kind: "install",
+                deleted: false,
+                date: inst.createdAt,
+                vehicle: inst.vehicleNo,
+                imei: getCurrentImei(inst),
+                model: inst.gpsModel,
+                sim: inst.simIccid || (inst.iccidHistory?.find?.((h) => h.active)?.value || ""),
+                mac: inst.macId,
+                sensor: inst.sensorNo,
+              })),
+              ...myMaintenance.map((record) => ({
+                id: record.id,
+                kind: "repair",
+                deleted: false,
+                date: record.createdAt,
+                vehicle: record.vehicleNo,
+                imei: record.imeiNo || "",
+                work: workLabels(record),
+                simChange: record.simChange,
+                deviceChange: record.deviceChange,
+                deviceOutForRepair: record.deviceOutForRepair,
+                sensorOutForRepair: record.sensorOutForRepair,
+                otherWorkText: record.otherWorkText || "",
+              })),
+            ];
+            entries.sort((a, b) => new Date(b.date) - new Date(a.date));
+            const sliced = entries.slice(0, 15);
+            if (!sliced.length) return `
+              <div class="entry-empty">
+                <div class="entry-empty-icon">📋</div>
+                <h3>No entries yet</h3>
+                <p>Tap "New Installation" to start.</p>
+              </div>
+            `;
+
+            // Helper: last 6 digits for compact display
+            const tail = (s, n = 6) => {
+              const v = String(s || "");
+              return v.length > n ? "…" + v.slice(-n) : v || "—";
+            };
+
+            return sliced
+              .map((entry) => {
+                const dateDisp = formatDateTime(entry.originalDate || entry.date);
+                if (entry.deleted) {
+                  return `
+                    <article class="tk-card tk-deleted">
+                      <div class="tk-card-head">
+                        <span class="tk-pill tk-pill-deleted">${escapeHtml(entry.vehicle)}</span>
+                        <span class="tk-chip tk-chip-deleted">🗑 DELETED · ${entry.kind === "install" ? "INSTALL" : "REPAIR"}</span>
+                      </div>
+                      ${entry.kind === "install" ? `
+                        <div class="tk-flow">
+                          <div class="tk-flow-box">
+                            <div class="tk-flow-value">${escapeHtml(tail(entry.imei))}</div>
+                            <div class="tk-flow-label">IMEI</div>
+                          </div>
+                          <div class="tk-flow-connector">
+                            <div class="tk-flow-icon">📡</div>
+                            <div class="tk-flow-icon-label">${escapeHtml(entry.model || "—")}</div>
+                          </div>
+                          <div class="tk-flow-box tk-flow-end">
+                            <div class="tk-flow-value">${escapeHtml(tail(entry.sim))}</div>
+                            <div class="tk-flow-label">SIM</div>
+                          </div>
+                        </div>
+                      ` : `
+                        <div class="tk-stats" style="margin-bottom: 0.4rem;">
+                          <div class="tk-stat tk-stat-full">
+                            <span class="tk-stat-icon">🛠️</span>
+                            <span class="tk-stat-label">Work:</span>
+                            <span class="tk-stat-value" style="white-space:normal;">${escapeHtml(entry.work)}</span>
+                          </div>
+                        </div>
+                      `}
+                      <div class="tk-footer">
+                        <div class="tk-footer-row">
+                          <span class="tk-footer-icon">📅</span>
+                          <span class="tk-footer-label">Created on:</span>
+                          <span class="tk-footer-value">${escapeHtml(dateDisp)}</span>
+                        </div>
+                        <div class="tk-footer-row">
+                          <span class="tk-footer-icon">🗑️</span>
+                          <span class="tk-footer-label">Deleted on:</span>
+                          <span class="tk-footer-value">${escapeHtml(formatDateTime(entry.date))}</span>
+                        </div>
+                      </div>
+                      ${entry.reason ? `<div class="tk-reason">⚠️ Reason: ${escapeHtml(entry.reason)}</div>` : ""}
+                    </article>
+                  `;
+                }
+                if (entry.kind === "install") {
+                  const showMacSensor = (entry.mac || entry.sensor) && entry.model !== "Normal";
+                  return `
+                    <article class="tk-card">
+                      <div class="tk-card-head">
+                        <span class="tk-pill tk-pill-install">${escapeHtml(entry.vehicle)}</span>
+                        <span class="tk-chip tk-chip-install">🆕 Install</span>
+                      </div>
+                      <div class="tk-flow">
+                        <div class="tk-flow-box">
+                          <div class="tk-flow-value">${escapeHtml(tail(entry.imei))}</div>
+                          <div class="tk-flow-label">IMEI</div>
+                        </div>
+                        <div class="tk-flow-connector">
+                          <div class="tk-flow-icon">📡</div>
+                          <div class="tk-flow-icon-label">${escapeHtml(entry.model || "—")}</div>
+                        </div>
+                        <div class="tk-flow-box tk-flow-end">
+                          <div class="tk-flow-value">${escapeHtml(tail(entry.sim))}</div>
+                          <div class="tk-flow-label">SIM</div>
+                        </div>
+                      </div>
+                      ${showMacSensor ? `
+                        <div class="tk-divider"></div>
+                        <div class="tk-stats">
+                          ${entry.mac ? `
+                            <div class="tk-stat">
+                              <span class="tk-stat-icon">📱</span>
+                              <span class="tk-stat-label">MAC:</span>
+                              <span class="tk-stat-value">${escapeHtml(tail(entry.mac, 8))}</span>
+                            </div>
+                          ` : ""}
+                          ${entry.sensor ? `
+                            <div class="tk-stat">
+                              <span class="tk-stat-icon">📊</span>
+                              <span class="tk-stat-label">Sensor:</span>
+                              <span class="tk-stat-value">${escapeHtml(entry.sensor)}</span>
+                            </div>
+                          ` : ""}
+                        </div>
+                      ` : ""}
+                      <div class="tk-footer">
+                        <div class="tk-footer-row">
+                          <span class="tk-footer-icon">📅</span>
+                          <span class="tk-footer-label">Created on:</span>
+                          <span class="tk-footer-value">${escapeHtml(dateDisp)}</span>
+                        </div>
+                      </div>
+                      <div class="tk-actions">
+                        <button type="button" class="btn btn-outline btn-sm akash-edit" data-kind="install" data-id="${escapeHtml(entry.id)}">✎ Edit</button>
+                        <button type="button" class="btn btn-danger btn-sm akash-delete" data-kind="install" data-id="${escapeHtml(entry.id)}">🗑 Delete</button>
+                      </div>
+                    </article>
+                  `;
+                }
+                // repair
+                return `
+                  <article class="tk-card">
+                    <div class="tk-card-head">
+                      <span class="tk-pill tk-pill-repair">${escapeHtml(entry.vehicle)}</span>
+                      <span class="tk-chip tk-chip-repair">🛠 Repair</span>
+                    </div>
+                    <div class="tk-stats">
+                      <div class="tk-stat tk-stat-full">
+                        <span class="tk-stat-icon">🔧</span>
+                        <span class="tk-stat-label">Work:</span>
+                        <span class="tk-stat-value" style="white-space: normal; line-height: 1.4;">${escapeHtml(entry.work)}</span>
+                      </div>
+                      ${entry.imei ? `
+                        <div class="tk-stat tk-stat-full">
+                          <span class="tk-stat-icon">📡</span>
+                          <span class="tk-stat-label">IMEI:</span>
+                          <span class="tk-stat-value">${escapeHtml(tail(entry.imei))}</span>
+                        </div>
+                      ` : ""}
+                    </div>
+                    <div class="tk-footer">
+                      <div class="tk-footer-row">
+                        <span class="tk-footer-icon">📅</span>
+                        <span class="tk-footer-label">Reported on:</span>
+                        <span class="tk-footer-value">${escapeHtml(dateDisp)}</span>
+                      </div>
+                    </div>
+                    <div class="tk-actions">
+                      <button type="button" class="btn btn-outline btn-sm akash-edit" data-kind="repair" data-id="${escapeHtml(entry.id)}">✎ Edit</button>
+                      <button type="button" class="btn btn-danger btn-sm akash-delete" data-kind="repair" data-id="${escapeHtml(entry.id)}">🗑 Delete</button>
+                    </div>
+                  </article>
+                `;
+              })
+              .join("");
+          })()}
+        </div>
+      </section>
     </main>
+
+    <!-- Floating action button — quick access to New Installation from anywhere -->
+    <div class="fab-container">
+      <button type="button" class="fab fab-mini" id="fabRepair" aria-label="Report Repair">
+        <span class="fab-icon">🛠️</span>
+      </button>
+      <button type="button" class="fab fab-main" id="fabInstall" aria-label="New Installation">
+        <span class="fab-icon">+</span>
+      </button>
+    </div>
   `;
 
   bindLogout();
   document.getElementById("goInstall")?.addEventListener("click", () => setView("install"));
   document.getElementById("goRepair")?.addEventListener("click", () => setView("repair"));
+  document.getElementById("goDeletedEntries")?.addEventListener("click", () => setView("akash-deleted"));
+  document.getElementById("fabInstall")?.addEventListener("click", () => setView("install"));
+  document.getElementById("fabRepair")?.addEventListener("click", () => setView("repair"));
+  document.getElementById("refreshMine")?.addEventListener("click", async () => {
+    renderLoading("Refreshing data...");
+    await refreshAllData();
+    setView("akash-home");
+  });
+  app.querySelectorAll(".akash-edit").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.dataset.kind === "install") openAkashEditInstallation(btn.dataset.id);
+      else openAkashEditRepair(btn.dataset.id);
+    });
+  });
+  app.querySelectorAll(".akash-delete").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.dataset.kind === "install") deleteAkashInstallation(btn.dataset.id);
+      else deleteAkashMaintenance(btn.dataset.id);
+    });
+  });
+}
+
+/* ---------------- Akash: edit + delete handlers ---------------- */
+
+function openAkashEditInstallation(installId) {
+  const inst = loadInstallations().find((i) => i.id === installId);
+  if (!inst) return;
+  modal.innerHTML = `
+    <h3>✎ Edit installation</h3>
+    <p class="modal-desc">You can fix typos in vehicle no, GPS model, MAC ID and sensor number. <strong>IMEI and SIM cannot be edited here</strong> — if you typed the wrong device or SIM, delete this entry and create a new one so stock is corrected automatically.</p>
+    <div class="field">
+      <label for="aiVehicle">Vehicle number</label>
+      <input type="text" id="aiVehicle" value="${escapeHtml(inst.vehicleNo)}" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="aiModel">GPS model</label>
+      <input type="text" id="aiModel" value="${escapeHtml(inst.gpsModel)}" autocomplete="off" />
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="aiMac">MAC ID</label>
+        <input type="text" id="aiMac" value="${escapeHtml(inst.macId || "")}" autocomplete="off" class="mono" />
+      </div>
+      <div class="field">
+        <label for="aiSensor">Sensor number</label>
+        <input type="text" id="aiSensor" value="${escapeHtml(inst.sensorNo || "")}" autocomplete="off" class="mono" />
+      </div>
+    </div>
+    <div class="field">
+      <label>IMEI (read-only)</label>
+      <input type="text" value="${escapeHtml(getCurrentImei(inst) || "")}" readonly class="mono" />
+    </div>
+    <div class="field">
+      <label>SIM (read-only)</label>
+      <input type="text" value="${escapeHtml(getCurrentSim(inst) || "")}" readonly class="mono" />
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" data-act="save">Save changes</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modalOverlay.onclick = (e) => {
+    if (e.target === modalOverlay) closeModal();
+  };
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modal.querySelector('[data-act="save"]').onclick = async () => {
+    const vehicleNo = modal.querySelector("#aiVehicle").value.trim();
+    const gpsModel = modal.querySelector("#aiModel").value.trim();
+    const macId = modal.querySelector("#aiMac").value.trim();
+    const sensorNo = modal.querySelector("#aiSensor").value.trim();
+    if (!vehicleNo) {
+      showToast("Vehicle number cannot be empty.", true);
+      return;
+    }
+    closeModal();
+    renderLoading("Saving changes...");
+    try {
+      await updateInstallation({ ...inst, vehicleNo, gpsModel, macId, sensorNo });
+      await refreshAllData();
+      render();
+      showToast("Installation updated.");
+    } catch (err) {
+      await refreshAllData();
+      render();
+      showToast(err.message || "Save failed.", true);
+    }
+  };
+}
+
+function openAkashEditRepair(recordId) {
+  const record = loadMaintenance().find((r) => r.id === recordId);
+  if (!record) return;
+  modal.innerHTML = `
+    <h3>✎ Edit repair entry</h3>
+    <p class="modal-desc">You can update the "other work" comment only. Identifier changes (SIM / IMEI) require deleting this entry and creating a new repair so stock is corrected.</p>
+    <div class="field">
+      <label>Vehicle (read-only)</label>
+      <input type="text" value="${escapeHtml(record.vehicleNo)}" readonly />
+    </div>
+    <div class="field">
+      <label>Work done (read-only)</label>
+      <input type="text" value="${escapeHtml(workLabels(record))}" readonly />
+    </div>
+    <div class="field">
+      <label for="arOther">Other work / comment</label>
+      <input type="text" id="arOther" value="${escapeHtml(record.otherWorkText || "")}" placeholder="e.g. bracket changed, wiring re-done..." />
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" data-act="save">Save changes</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modalOverlay.onclick = (e) => {
+    if (e.target === modalOverlay) closeModal();
+  };
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modal.querySelector('[data-act="save"]').onclick = async () => {
+    const otherWorkText = modal.querySelector("#arOther").value.trim() || null;
+    closeModal();
+    renderLoading("Saving changes...");
+    try {
+      await updateMaintenanceRecord({ ...record, otherWorkText });
+      await refreshAllData();
+      render();
+      showToast("Repair entry updated.");
+    } catch (err) {
+      await refreshAllData();
+      render();
+      showToast(err.message || "Save failed.", true);
+    }
+  };
+}
+
+async function deleteAkashInstallation(installId) {
+  const inst = loadInstallations().find((i) => i.id === installId);
+  if (!inst) return;
+  const linkedRepairs = loadMaintenance().filter((r) => r.installationId === installId);
+  const reason = await promptForReason({
+    title: "Delete this installation?",
+    message: `Removing installation for <strong>${escapeHtml(inst.vehicleNo)}</strong>. ${linkedRepairs.length ? `This will also remove <strong>${linkedRepairs.length}</strong> repair record${linkedRepairs.length === 1 ? "" : "s"} linked to it. ` : ""}Stock consumed (IMEI / SIM / sensor) will be automatically restored.`,
+    confirmLabel: "Delete installation",
+    placeholder: "e.g. wrong vehicle number, duplicate entry, install cancelled",
+  });
+  if (!reason) return;
+  renderLoading("Deleting installation & restoring stock...");
+  try {
+    // Audit linked repairs first
+    for (const r of linkedRepairs) {
+      await auditDeletion({
+        entityType: "maintenance",
+        entityId: r.id,
+        entityLabel: `${r.vehicleNo} · ${workLabels(r)}`,
+        reason: `Cascade-deleted with parent installation. Parent reason: ${reason}`,
+        snapshot: r,
+      });
+      await restoreStockFor({
+        maintenanceRecordId: r.id,
+        reason: `Restored — installation for ${inst.vehicleNo} deleted`,
+      });
+      await deleteMaintenanceRecord(r.id);
+    }
+    // Audit + delete the installation itself
+    await auditDeletion({
+      entityType: "installation",
+      entityId: installId,
+      entityLabel: `${inst.vehicleNo} · IMEI ${getCurrentImei(inst) || "?"}`,
+      reason,
+      snapshot: inst,
+    });
+    await restoreStockFor({
+      installationId: installId,
+      reason: `Restored — installation for ${inst.vehicleNo} deleted`,
+    });
+    await deleteInstallation(installId);
+    await refreshAllData();
+    render();
+    showToast("Installation deleted, stock restored.");
+  } catch (err) {
+    await refreshAllData();
+    render();
+    showToast(err.message || "Delete failed.", true);
+  }
+}
+
+async function deleteAkashMaintenance(recordId) {
+  const record = loadMaintenance().find((r) => r.id === recordId);
+  if (!record) return;
+  const reason = await promptForReason({
+    title: "Delete this repair entry?",
+    message: `Removing repair on <strong>${escapeHtml(record.vehicleNo)}</strong> (${escapeHtml(workLabels(record))}). Stock consumed will be restored, and any SIM/device history added by this repair will be reverted.`,
+    confirmLabel: "Delete repair",
+    placeholder: "e.g. wrong vehicle, accidental save, repair cancelled",
+  });
+  if (!reason) return;
+  renderLoading("Deleting repair & restoring state...");
+  try {
+    // 1) Audit
+    await auditDeletion({
+      entityType: "maintenance",
+      entityId: recordId,
+      entityLabel: `${record.vehicleNo} · ${workLabels(record)}`,
+      reason,
+      snapshot: record,
+    });
+    // 2) Reverse stock consumption for this repair.
+    await restoreStockFor({
+      maintenanceRecordId: recordId,
+      reason: `Restored — repair on ${record.vehicleNo} deleted`,
+    });
+    // 3) Revert simHistory / imeiHistory on the linked installation.
+    const inst = loadInstallations().find((i) => i.id === record.installationId);
+    if (inst) {
+      let touched = false;
+      if (record.simChange && record.newSimNo) {
+        const idx = inst.simHistory.findIndex(
+          (h) => h.value === record.newSimNo && h.active
+        );
+        if (idx >= 0) {
+          inst.simHistory.splice(idx, 1);
+          for (let i = inst.simHistory.length - 1; i >= 0; i -= 1) {
+            if (inst.simHistory[i].pendingDeactivation) {
+              inst.simHistory[i].pendingDeactivation = false;
+              inst.simHistory[i].active = true;
+              break;
+            }
+            if (inst.simHistory[i].value === record.oldSimNo) {
+              inst.simHistory[i].active = true;
+              inst.simHistory[i].pendingDeactivation = false;
+              break;
+            }
+          }
+          touched = true;
+        }
+      }
+      if (record.deviceChange && record.newImei) {
+        const idx = inst.imeiHistory.findIndex(
+          (h) => h.value === record.newImei && h.active
+        );
+        if (idx >= 0) {
+          inst.imeiHistory.splice(idx, 1);
+          for (let i = inst.imeiHistory.length - 1; i >= 0; i -= 1) {
+            inst.imeiHistory[i].active = true;
+            break;
+          }
+          touched = true;
+        }
+      }
+      if (touched) {
+        await updateInstallation(inst);
+      }
+    }
+    // 4) Delete the maintenance record.
+    await deleteMaintenanceRecord(recordId);
+    await refreshAllData();
+    render();
+    showToast("Repair deleted, state restored.");
+  } catch (err) {
+    await refreshAllData();
+    render();
+    showToast(err.message || "Delete failed.", true);
+  }
 }
 
 function renderInstallForm() {
   app.innerHTML = `
-    ${renderHeader("Installing New GPS", "All 6 fields are mandatory")}
+    ${renderHeader("Installing New GPS", "Fill the fields below to register a new install")}
     <main class="main">
-      <section class="card">
+      <section class="card accent-cyan">
         <div class="form-nav">
           <button type="button" class="btn btn-secondary btn-sm" id="backBtn">← Back</button>
         </div>
         <h2>New GPS Installation</h2>
+
         <form id="installForm" class="form-grid">
+
+          <!-- GPS Model — also controls whether MAC + Sensor are required -->
+          <div class="field full-width">
+            <label>GPS Model <span class="required">*</span></label>
+            <div class="seg-control" id="gpsTypeSeg">
+              <button type="button" class="seg-btn" data-type="Normal">📱 Normal</button>
+              <button type="button" class="seg-btn active" data-type="FMB">📡 FMB</button>
+              <button type="button" class="seg-btn" data-type="FMC">📡 FMC</button>
+            </div>
+            <p class="hint" id="gpsTypeHint">FMB / FMC devices ko MAC ID aur Sensor No bharna zaroori hai. Normal devices ko nahi.</p>
+          </div>
+
           <div class="field">
             <label for="instImei">IMEI No <span class="required">*</span></label>
-            <input type="text" id="instImei" required placeholder="e.g. 867530012345678" autocomplete="off" />
+            <div class="input-with-scan autocomplete-wrap">
+              <input type="text" id="instImei" required placeholder="Type last 4-5 digits or full IMEI" autocomplete="off" inputmode="numeric" />
+              <button type="button" class="scan-btn" id="scanImei" aria-label="Scan IMEI barcode">📷</button>
+              <div class="autocomplete-dropdown" id="instImeiDropdown"></div>
+            </div>
+            <p class="hint" id="instImeiHint"></p>
           </div>
           <div class="field">
             <label for="instVehicle">Vehicle No <span class="required">*</span></label>
             <input type="text" id="instVehicle" required placeholder="e.g. MH12AB1234" autocomplete="off" />
           </div>
-          <div class="field">
-            <label for="instModel">GPS Model <span class="required">*</span></label>
-            <input type="text" id="instModel" required placeholder="e.g. GT06N" autocomplete="off" />
+          <div class="field full-width">
+            <label for="instSim">SIM ICCID (20-digit, printed on the SIM card) <span class="required">*</span></label>
+            <div class="input-with-scan autocomplete-wrap">
+              <input type="text" id="instSim" required placeholder="Type last 4-5 digits or full ICCID" autocomplete="off" inputmode="numeric" />
+              <button type="button" class="scan-btn" id="scanSim" aria-label="Scan SIM ICCID barcode">📷</button>
+              <div class="autocomplete-dropdown" id="instSimDropdown"></div>
+            </div>
+            <p class="hint" id="instSimHint">Wahi number daalo jo SIM card pe printed hai (long 20-digit number). Primary number admin ke SIM database se automatic link ho jaayega.</p>
           </div>
-          <div class="field">
-            <label for="instSim">SIM No <span class="required">*</span></label>
-            <input type="text" id="instSim" required placeholder="e.g. 9876543210" autocomplete="off" />
-          </div>
-          <div class="field">
+          <div class="field field-mac" id="fieldMac">
             <label for="instMac">MAC ID <span class="required">*</span></label>
             <input type="text" id="instMac" required placeholder="e.g. AA:BB:CC:DD:EE:FF" autocomplete="off" />
           </div>
-          <div class="field">
+          <div class="field field-sensor" id="fieldSensor">
             <label for="instSensor">Sensor No <span class="required">*</span></label>
             <input type="text" id="instSensor" required placeholder="e.g. SN-12345" autocomplete="off" />
           </div>
           <div class="form-actions full-width">
-            <button type="submit" class="btn btn-primary">Submit Installation</button>
+            <button type="submit" class="btn btn-primary">Continue to Confirm</button>
           </div>
         </form>
       </section>
@@ -340,21 +3850,320 @@ function renderInstallForm() {
 
   bindLogout();
   document.getElementById("backBtn")?.addEventListener("click", () => setView("akash-home"));
-  document.getElementById("installForm")?.addEventListener("submit", (e) => {
+
+  // GPS Model segmented control — toggle MAC + Sensor visibility
+  let _gpsType = "FMB";
+  const seg = document.getElementById("gpsTypeSeg");
+  const fieldMac = document.getElementById("fieldMac");
+  const fieldSensor = document.getElementById("fieldSensor");
+  const macInput = document.getElementById("instMac");
+  const sensorInput = document.getElementById("instSensor");
+  const typeHint = document.getElementById("gpsTypeHint");
+
+  function applyGpsType(type) {
+    _gpsType = type;
+    seg?.querySelectorAll(".seg-btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.type === type);
+    });
+    if (type === "Normal") {
+      fieldMac.style.display = "none";
+      fieldSensor.style.display = "none";
+      macInput.required = false;
+      sensorInput.required = false;
+      macInput.value = "";
+      sensorInput.value = "";
+      if (typeHint) typeHint.textContent = "Normal GPS — MAC ID aur Sensor No ki zaroorat nahi.";
+    } else {
+      fieldMac.style.display = "";
+      fieldSensor.style.display = "";
+      macInput.required = true;
+      sensorInput.required = true;
+      if (typeHint) typeHint.textContent = `${type} GPS — MAC ID aur Sensor No bharna zaroori hai.`;
+    }
+  }
+
+  seg?.querySelectorAll(".seg-btn").forEach((btn) => {
+    btn.addEventListener("click", () => applyGpsType(btn.dataset.type));
+  });
+  applyGpsType("FMB"); // default
+
+  document.getElementById("installForm")?.addEventListener("submit", async (e) => {
     e.preventDefault();
-    handleInstallSubmit();
+    const submitBtn = e.target.querySelector('button[type="submit"]') || document.getElementById("submitInstall");
+    if (!submitBtn) { handleInstallSubmit(_gpsType); return; }
+    if (submitBtn.dataset.busy === "1") return; // double-click guard
+    await runWithBusyButton(submitBtn, async () => {
+      await handleInstallSubmit(_gpsType);
+    }, "Saving installation…");
+  });
+
+  // Barcode scan handlers — fill IMEI/SIM by scanning the device/card.
+  document.getElementById("scanImei")?.addEventListener("click", () => {
+    openBarcodeScannerModal({
+      title: "📷 Scan IMEI",
+      hint: "GPS device pe printed barcode ya QR code pe camera point karo.",
+      codeType: "imei",
+      checkDuplicates: true,
+      dupCheckScope: "install", // Akash installing — stock match is EXPECTED, not duplicate
+      onScan: (val) => {
+        const cleaned = val.replace(/\D/g, "") || val.trim();
+        const imeiInput = document.getElementById("instImei");
+        imeiInput.value = cleaned;
+        imeiInput.dispatchEvent(new Event("input"));
+        showToast(`IMEI scanned: ${cleaned}`);
+      },
+    });
+  });
+  document.getElementById("scanSim")?.addEventListener("click", () => {
+    openBarcodeScannerModal({
+      title: "📷 Scan SIM Barcode",
+      hint: "SIM card pe printed long number ya barcode pe camera point karo.",
+      codeType: "iccid",
+      checkDuplicates: true,
+      dupCheckScope: "install", // Akash installing — stock match is EXPECTED
+      onScan: (val) => {
+        const cleaned = val.replace(/\D/g, "") || val.trim();
+        const input = document.getElementById("instSim");
+        input.value = cleaned;
+        input.dispatchEvent(new Event("input"));
+        showToast(`ICCID scanned: ${cleaned}`);
+      },
+    });
+  });
+
+  // Close autocomplete dropdowns on outside click
+  document.addEventListener("click", function _closeAcDropdowns(e) {
+    if (!e.target.closest(".autocomplete-wrap")) {
+      document.getElementById("instImeiDropdown")?.classList.remove("show");
+      document.getElementById("instSimDropdown")?.classList.remove("show");
+    }
+  });
+
+  // ===== IMEI input — autocomplete dropdown + auto-detect from stock =====
+  function showImeiSuggestions(query) {
+    const dropdown = document.getElementById("instImeiDropdown");
+    if (!dropdown) return;
+    const q = String(query || "").trim().toLowerCase();
+    if (q.length < 3) {
+      dropdown.classList.remove("show");
+      dropdown.innerHTML = "";
+      return;
+    }
+    // Search stock items where IMEI ends-with OR contains the query
+    const matches = stockItems.filter((it) => {
+      if (categoryKind(it.category) !== "gps") return false;
+      if (it.quantity <= 0) return false; // only in-stock items
+      const imei = (it.metadata?.imei || "").toLowerCase();
+      return imei && (imei.endsWith(q) || imei.includes(q));
+    }).slice(0, 8); // cap at 8 suggestions
+    if (matches.length === 0) {
+      dropdown.classList.remove("show");
+      dropdown.innerHTML = "";
+      return;
+    }
+    const rows = matches.map((it) => {
+      const imei = it.metadata?.imei || "";
+      const idx = imei.toLowerCase().lastIndexOf(q);
+      const before = escapeHtml(imei.slice(0, idx));
+      const match = escapeHtml(imei.slice(idx, idx + q.length));
+      const after = escapeHtml(imei.slice(idx + q.length));
+      return `
+        <div class="autocomplete-item" data-value="${escapeHtml(imei)}" data-name="${escapeHtml(it.name || '')}">
+          <div class="ac-main">
+            <span class="ac-value mono">${before}<strong>${match}</strong>${after}</span>
+            <span class="ac-name">${escapeHtml(it.name || it.category || "GPS")}</span>
+          </div>
+          <div class="ac-meta">📦 Stock: ${it.quantity}</div>
+        </div>
+      `;
+    }).join("");
+    dropdown.innerHTML = rows;
+    dropdown.classList.add("show");
+    // Wire click to fill
+    dropdown.querySelectorAll(".autocomplete-item").forEach((row) => {
+      row.addEventListener("click", () => {
+        const fullImei = row.dataset.value;
+        const itemName = row.dataset.name;
+        const imeiInput = document.getElementById("instImei");
+        imeiInput.value = fullImei;
+        dropdown.classList.remove("show");
+        // Trigger input event for auto-detect hint to update
+        imeiInput.dispatchEvent(new Event("input"));
+        showToast(`✓ Selected from stock: ${itemName}`);
+      });
+    });
+  }
+
+  // ===== Auto-detect IMEI from stock database =====
+  document.getElementById("instImei")?.addEventListener("input", (e) => {
+    const v = e.target.value.trim();
+    const h = document.getElementById("instImeiHint");
+    if (!h) return;
+
+    // Show autocomplete dropdown for partial matches (3+ digits)
+    showImeiSuggestions(v);
+
+    if (!v || v.length < 8) {
+      h.textContent = "";
+      h.className = "hint";
+      return;
+    }
+    const matched = findStockByValue(v);
+    const gpsMatch = matched.find((it) => categoryKind(it.category) === "gps");
+    if (gpsMatch) {
+      const nameUpper = (gpsMatch.name + " " + (gpsMatch.category || "")).toUpperCase();
+      let detectedType = "FMB";
+      if (nameUpper.includes("NORMAL")) detectedType = "Normal";
+      else if (nameUpper.includes("FMC")) detectedType = "FMC";
+      else if (nameUpper.includes("FMB")) detectedType = "FMB";
+      if (typeof applyGpsType === "function") applyGpsType(detectedType);
+      h.innerHTML = `<span class="hint-found">✓ Found in database — Auto-selected: <strong>${escapeHtml(detectedType)}</strong> (${escapeHtml(gpsMatch.name)})</span>`;
+      h.className = "hint hint-ok";
+    } else if (matched.length > 0) {
+      h.innerHTML = `<span class="hint-found">✓ Found in database — ${escapeHtml(matched[0].name)}</span>`;
+      h.className = "hint hint-ok";
+    } else {
+      h.textContent = "ℹ️ Not in stock database. Select GPS model above.";
+      h.className = "hint hint-info";
+    }
+  });
+
+  // ===== SIM input — autocomplete dropdown =====
+  function showSimSuggestions(query) {
+    const dropdown = document.getElementById("instSimDropdown");
+    if (!dropdown) return;
+    const q = String(query || "").trim().toLowerCase();
+    if (q.length < 3) {
+      dropdown.classList.remove("show");
+      dropdown.innerHTML = "";
+      return;
+    }
+    // Search SIM-category stock + sims DB
+    const stockMatches = stockItems.filter((it) => {
+      if (categoryKind(it.category) !== "sim") return false;
+      if (it.quantity <= 0) return false;
+      const m = it.metadata || {};
+      const fields = [m.imei || "", m.secondary || "", m.primary || ""];
+      return fields.some((f) => f && (f.toLowerCase().endsWith(q) || f.toLowerCase().includes(q)));
+    }).slice(0, 5);
+    const simDbMatches = sims.filter((s) => {
+      const sec = (s.secondaryNumber || "").toLowerCase();
+      const pri = (s.primaryNumber || "").toLowerCase();
+      return (sec && sec.endsWith(q)) || (pri && pri.endsWith(q));
+    }).slice(0, 5);
+    const allRows = [];
+    // Stock items first
+    for (const it of stockMatches) {
+      const m = it.metadata || {};
+      const iccid = m.secondary || m.imei || "";
+      if (!iccid) continue;
+      const idx = iccid.toLowerCase().lastIndexOf(q);
+      const before = escapeHtml(iccid.slice(0, idx));
+      const match = escapeHtml(iccid.slice(idx, idx + q.length));
+      const after = escapeHtml(iccid.slice(idx + q.length));
+      allRows.push(`
+        <div class="autocomplete-item" data-value="${escapeHtml(iccid)}" data-name="${escapeHtml(it.name || '')}">
+          <div class="ac-main">
+            <span class="ac-value mono">${before}<strong>${match}</strong>${after}</span>
+            <span class="ac-name">${escapeHtml(it.name || "SIM")}</span>
+          </div>
+          <div class="ac-meta">📦 Stock: ${it.quantity}</div>
+        </div>
+      `);
+    }
+    // SIM DB matches (if not already shown)
+    for (const s of simDbMatches) {
+      const sec = s.secondaryNumber || "";
+      const pri = s.primaryNumber || "";
+      const display = sec || pri;
+      if (!display) continue;
+      if (allRows.some((r) => r.includes(`data-value="${escapeHtml(display)}"`))) continue;
+      const idx = display.toLowerCase().lastIndexOf(q);
+      const before = escapeHtml(display.slice(0, idx));
+      const match = escapeHtml(display.slice(idx, idx + q.length));
+      const after = escapeHtml(display.slice(idx + q.length));
+      allRows.push(`
+        <div class="autocomplete-item" data-value="${escapeHtml(display)}" data-name="SIM DB">
+          <div class="ac-main">
+            <span class="ac-value mono">${before}<strong>${match}</strong>${after}</span>
+            <span class="ac-name">${pri ? `Primary: ${escapeHtml(pri)}` : "SIM Database"}</span>
+          </div>
+          <div class="ac-meta">📝 DB</div>
+        </div>
+      `);
+    }
+    if (allRows.length === 0) {
+      dropdown.classList.remove("show");
+      dropdown.innerHTML = "";
+      return;
+    }
+    dropdown.innerHTML = allRows.join("");
+    dropdown.classList.add("show");
+    dropdown.querySelectorAll(".autocomplete-item").forEach((row) => {
+      row.addEventListener("click", () => {
+        const fullVal = row.dataset.value;
+        const simInput = document.getElementById("instSim");
+        simInput.value = fullVal;
+        dropdown.classList.remove("show");
+        simInput.dispatchEvent(new Event("input"));
+        showToast(`✓ Selected: ${row.dataset.name}`);
+      });
+    });
+  }
+
+  // Live SIM lookup as Akash types the ICCID — shows whether the primary
+  // is already known so he doesn't worry about the long number.
+  document.getElementById("instSim")?.addEventListener("input", (e) => {
+    const v = e.target.value.trim();
+    const h = document.getElementById("instSimHint");
+    if (!h) return;
+
+    // Show autocomplete dropdown for partial matches
+    showSimSuggestions(v);
+
+    if (!v) {
+      h.textContent = "Wahi number daalo jo SIM card pe printed hai (long 20-digit number). Primary number admin ke SIM database se automatic link ho jaayega.";
+      h.className = "hint";
+      return;
+    }
+    const sim = findSimBySecondary(v);
+    // ALSO check stock database for this SIM
+    const stockMatched = findStockByValue(v);
+    const simStock = stockMatched.find((it) => categoryKind(it.category) === "sim");
+
+    if (sim && sim.primaryNumber) {
+      let msg = `✓ SIM matched in database — Primary: <strong>${escapeHtml(sim.primaryNumber)}</strong>`;
+      if (simStock) msg += ` · Stock: ${escapeHtml(simStock.name)}`;
+      h.innerHTML = msg;
+      h.className = "hint hint-ok";
+    } else if (sim && !sim.primaryNumber) {
+      let msg = "⚠️ ICCID is in SIM database but primary not yet known — admin will fill it in Repair Progress.";
+      if (simStock) msg += ` · Found in Stock: ${escapeHtml(simStock.name)}`;
+      h.innerHTML = msg;
+      h.className = "hint hint-warn";
+    } else if (simStock) {
+      h.innerHTML = `✓ Found in Stock database — <strong>${escapeHtml(simStock.name)}</strong>. Will auto-link on save.`;
+      h.className = "hint hint-ok";
+    } else {
+      h.textContent = "ℹ️ New ICCID — will be auto-added to SIM database. Admin can fill the primary number later.";
+      h.className = "hint hint-info";
+    }
   });
 }
 
-function handleInstallSubmit() {
+function handleInstallSubmit(gpsType = "FMB") {
+  const isNormal = gpsType === "Normal";
+  // gpsType IS the GPS Model — no separate model input field anymore
   const fields = {
     imei: document.getElementById("instImei"),
     vehicle: document.getElementById("instVehicle"),
-    model: document.getElementById("instModel"),
     sim: document.getElementById("instSim"),
-    mac: document.getElementById("instMac"),
-    sensor: document.getElementById("instSensor"),
   };
+  // MAC + Sensor only required for FMB / FMC
+  if (!isNormal) {
+    fields.mac = document.getElementById("instMac");
+    fields.sensor = document.getElementById("instSensor");
+  }
 
   let valid = true;
   Object.values(fields).forEach((el) => {
@@ -362,45 +4171,37 @@ function handleInstallSubmit() {
     if (!el.value.trim()) valid = false;
   });
   if (!valid) {
-    showToast("Please fill all 6 fields.", true);
+    showToast(`Please fill all ${Object.keys(fields).length} fields.`, true);
     return;
   }
 
-  const data = Object.fromEntries(
-    Object.entries(fields).map(([k, el]) => [k, el.value.trim()])
-  );
+  const data = Object.fromEntries(Object.entries(fields).map(([k, el]) => [k, el.value.trim()]));
+  data.model = gpsType; // Normal / FMB / FMC
+  if (isNormal) {
+    data.mac = "";
+    data.sensor = "";
+  }
+  data.gpsType = gpsType;
+
+  const macQuestion = isNormal
+    ? "" // Normal GPS — no MAC question
+    : `
+      <div class="confirm-q">
+        <span>MAC ID daal diya?</span>
+        <div class="yes-no-group">
+          <label class="yn-option"><input type="radio" name="macEntered" value="yes" /><span>Yes</span></label>
+          <label class="yn-option"><input type="radio" name="macEntered" value="no" /><span>No</span></label>
+        </div>
+      </div>`;
 
   showModal(
     `
     <h3>Confirm Before Submit</h3>
-    <p class="modal-desc">Both answers must be <strong>Yes</strong> to submit.</p>
+    <p class="modal-desc">${isNormal
+      ? "Sab details check kar lo, fir Submit karo. Vehicle live hai ya nahi — admin baad me set karenge."
+      : "MAC ID confirm karke Submit karo."}</p>
     <div class="confirm-questions">
-      <div class="confirm-q">
-        <span>Vehicle live hai?</span>
-        <div class="yes-no-group">
-          <label class="yn-option">
-            <input type="radio" name="vehicleLive" value="yes" />
-            <span>Yes</span>
-          </label>
-          <label class="yn-option">
-            <input type="radio" name="vehicleLive" value="no" />
-            <span>No</span>
-          </label>
-        </div>
-      </div>
-      <div class="confirm-q">
-        <span>MAC ID daal diya?</span>
-        <div class="yes-no-group">
-          <label class="yn-option">
-            <input type="radio" name="macEntered" value="yes" />
-            <span>Yes</span>
-          </label>
-          <label class="yn-option">
-            <input type="radio" name="macEntered" value="no" />
-            <span>No</span>
-          </label>
-        </div>
-      </div>
+      ${macQuestion}
     </div>
     <div class="modal-actions">
       <button type="button" class="btn btn-secondary modal-close">Cancel</button>
@@ -408,44 +4209,136 @@ function handleInstallSubmit() {
     </div>
     `,
     async () => {
-      const vehicleLive = modal.querySelector('input[name="vehicleLive"]:checked')?.value;
-      const macEntered = modal.querySelector('input[name="macEntered"]:checked')?.value;
+      // Vehicle live status is now admin's responsibility (set via 🟢/🔴 button
+      // on the Installations page). We no longer ask Akash about it.
+      const macEntered = isNormal ? "yes" : modal.querySelector('input[name="macEntered"]:checked')?.value;
 
-      if (vehicleLive !== "yes" || macEntered !== "yes") {
-        showToast("Both answers must be Yes to submit.", true);
+      if (!isNormal && macEntered !== "yes") {
+        showToast("MAC ID confirm karna zaroori hai.", true);
         return false;
       }
+
+      // Refresh data first so we never block on stale state (e.g., a row
+      // that was deleted moments ago but still in local cache).
+      try { await refreshAllData(); } catch {}
 
       const allInstalls = loadInstallations();
-      if (allInstalls.some((i) => i.vehicleNo.toLowerCase() === data.vehicle.toLowerCase())) {
-        showToast("Vehicle already exists in installation database.", true);
-        return false;
+      const dupVehicle = allInstalls.find(
+        (i) => i.vehicleNo.toLowerCase() === data.vehicle.toLowerCase()
+      );
+      const dupImei = allInstalls.find((i) =>
+        i.imeiHistory.some((h) => h.value.toLowerCase() === data.imei.toLowerCase())
+      );
+
+      if (dupVehicle) {
+        const proceed = await showConfirm({
+          title: "Vehicle already has an install",
+          message: `<strong>${escapeHtml(dupVehicle.vehicleNo)}</strong> already has an active installation:<br><br>
+            • IMEI: <strong class="mono">${escapeHtml(getCurrentImei(dupVehicle) || "—")}</strong><br>
+            • Created: ${escapeHtml(formatDateTime(dupVehicle.createdAt))} by ${escapeHtml(dupVehicle.createdBy || "—")}<br><br>
+            Add another install for the same vehicle?`,
+          confirmLabel: "Yes, add anyway",
+          cancelLabel: "Cancel",
+          danger: true,
+        });
+        if (!proceed) return false;
       }
-      if (
-        allInstalls.some((i) =>
-          i.imeiHistory.some((h) => h.value.toLowerCase() === data.imei.toLowerCase())
-        )
-      ) {
-        showToast("IMEI already exists in installation database.", true);
-        return false;
+      if (dupImei && (!dupVehicle || dupImei.id !== dupVehicle.id)) {
+        const proceed = await showConfirm({
+          title: "IMEI already in use",
+          message: `IMEI <strong class="mono">${escapeHtml(data.imei)}</strong> is already in use on vehicle <strong>${escapeHtml(dupImei.vehicleNo)}</strong>.<br><br>
+            Same device on multiple vehicles can confuse stock + portal reconciliation. Sure?`,
+          confirmLabel: "Yes, add anyway",
+          cancelLabel: "Cancel",
+          danger: true,
+        });
+        if (!proceed) return false;
       }
 
       const now = new Date().toISOString();
+
+      // The SIM input is now the SECONDARY (ICCID). Look up the primary from
+      // the sims DB. If found, store the primary as simHistory.value (so
+      // existing display code stays consistent). If unknown, store the ICCID
+      // as a placeholder + secondaryValue, and queue an update_sim_primary
+      // task for admin so they can fill the primary later.
+      const enteredIccid = String(data.sim).trim();
+      const knownSim = sims.find(
+        (s) => (s.secondaryNumber || "").toLowerCase() === enteredIccid.toLowerCase()
+      );
+      const primaryValue = knownSim?.primaryNumber || null;
+      const simHistEntry = {
+        // CRITICAL: value = Primary number ONLY. Never store ICCID here.
+        // If primary is unknown, leave empty. Admin fills later via task.
+        value: primaryValue || "",
+        secondaryValue: enteredIccid,
+        addedAt: now,
+        active: true,
+        pendingDeactivation: false,
+      };
+
+      const installTasks = defaultInstallTasks();
+      // If the SIM was unknown OR known but missing primary, also queue
+      // an update_sim_primary install-task so admin sets it from the portal.
+      if (!primaryValue) {
+        installTasks.update_sim_primary = {
+          completedAt: null,
+          completedBy: null,
+          simSecondary: enteredIccid,
+        };
+      }
+
       const newInstall = {
         id: generateId(),
         vehicleNo: data.vehicle,
         gpsModel: data.model,
         macId: data.mac,
         sensorNo: data.sensor,
+        secondarySim: enteredIccid,
         imeiHistory: [{ value: data.imei, addedAt: now, active: true }],
-        simHistory: [{ value: data.sim, addedAt: now, active: true, pendingDeactivation: false }],
+        simHistory: [simHistEntry],
+        tasks: installTasks,
         createdAt: now,
         createdBy: "akash",
       };
 
-      await insertInstallation(newInstall);
+      // Auto-register the SIM in the sims DB if it wasn't there (primary may
+      // be null — admin fills later via the pending task).
+      if (!knownSim) {
+        try {
+          await upsertSim({
+            primaryNumber: null,
+            secondaryNumber: enteredIccid,
+            notes: `Auto-added from install — ${data.vehicle}`,
+          });
+        } catch (simErr) {
+          console.warn("Auto-register SIM failed:", simErr);
+        }
+      }
+
+      const saved = await insertInstallation(newInstall);
+      // Auto-consume matching stock entries.
+      const consumeResult = await consumeStockFor(
+        {
+          imei: data.imei,
+          simPrimary: data.sim,
+          simSecondary: enteredIccid,
+          sensorNo: data.sensor,
+          macId: data.mac,
+        },
+        {
+          installationId: saved?.id || newInstall.id,
+          vehicleNo: data.vehicle,
+          note: "Used on new installation",
+        }
+      );
       await refreshAllData();
-      showToast("Installation saved successfully!");
+      const consumedCount = consumeResult?.consumed?.length || 0;
+      if (consumedCount > 0) {
+        showToast(`✓ Installation saved! Auto-linked ${consumedCount} stock item${consumedCount > 1 ? "s" : ""}.`);
+      } else {
+        showToast("Installation saved successfully!");
+      }
       setView("akash-home");
       return true;
     }
@@ -464,37 +4357,51 @@ function renderRepairForm() {
         <form id="repairForm">
           <div class="form-grid">
             <div class="field">
-              <label for="repairImei">IMEI No <span class="required">*</span></label>
-              <input type="text" id="repairImei" required placeholder="Enter IMEI to lookup" autocomplete="off" />
-              <p class="field-hint" id="imeiHint">Enter IMEI from installation database</p>
+              <label for="repairImei">IMEI No</label>
+              <input type="text" id="repairImei" placeholder="Enter IMEI to lookup" autocomplete="off" inputmode="numeric" />
+              <p class="field-hint" id="imeiHint">Enter IMEI or select vehicle from database</p>
             </div>
             <div class="field">
-              <label for="repairVehicle">Vehicle No</label>
-              <input type="text" id="repairVehicle" readonly placeholder="Auto-filled from database" />
+              <label for="repairVehicle">Vehicle No / Name</label>
+              <input type="text" id="repairVehicle" list="installedVehicles" placeholder="Search installed vehicle" autocomplete="off" />
+              <datalist id="installedVehicles">
+                ${loadInstallations()
+                  .map((inst) => `<option value="${escapeHtml(inst.vehicleNo)}">${escapeHtml(getCurrentImei(inst))}</option>`)
+                  .join("")}
+              </datalist>
             </div>
           </div>
 
           <div class="work-section">
             <h3>What work is required?</h3>
-            <label class="check-option">
-              <input type="checkbox" id="workWiring" />
-              <span>Wiring connection</span>
-            </label>
-            <label class="check-option">
-              <input type="checkbox" id="workSimChange" />
-              <span>SIM change</span>
-            </label>
+            <label class="check-option"><input type="checkbox" id="workWiring" /><span>Wiring connection</span></label>
+            <label class="check-option"><input type="checkbox" id="workSimChange" /><span>SIM change</span></label>
             <div class="conditional-field hidden" id="newSimBox">
-              <label for="newSimNo">New SIM No <span class="required">*</span></label>
-              <input type="text" id="newSimNo" placeholder="Enter new SIM number" autocomplete="off" />
+              <label for="newSimNo">New SIM ICCID (Secondary number — 20-digit printed on card) <span class="required">*</span></label>
+              <div class="input-with-scan autocomplete-wrap">
+                <input type="text" id="newSimNo" placeholder="Type last 4-5 digits or full ICCID" autocomplete="off" inputmode="numeric" />
+                <button type="button" class="scan-btn" id="scanNewSim" aria-label="Scan new SIM barcode">📷</button>
+                <div class="autocomplete-dropdown" id="newSimDropdown"></div>
+              </div>
+              <p class="hint" id="newSimHint">Enter the 20-digit ICCID. System auto-checks Stock + SIM Database.</p>
             </div>
-            <label class="check-option">
-              <input type="checkbox" id="workDeviceChange" />
-              <span>Device change</span>
-            </label>
+            <label class="check-option"><input type="checkbox" id="workDeviceChange" /><span>Device change</span></label>
             <div class="conditional-field hidden" id="newImeiBox">
               <label for="newImeiNo">New IMEI No <span class="required">*</span></label>
-              <input type="text" id="newImeiNo" placeholder="Enter new IMEI number" autocomplete="off" />
+              <div class="input-with-scan autocomplete-wrap">
+                <input type="text" id="newImeiNo" placeholder="Type last 4-5 digits or full IMEI" autocomplete="off" inputmode="numeric" />
+                <button type="button" class="scan-btn" id="scanNewImei" aria-label="Scan new IMEI barcode">📷</button>
+                <div class="autocomplete-dropdown" id="newImeiDropdown"></div>
+              </div>
+              <p class="hint" id="newImeiHint"></p>
+            </div>
+            <label class="check-option"><input type="checkbox" id="workSensorOut" /><span>Sensor out for repair in office</span></label>
+            <label class="check-option"><input type="checkbox" id="workSensorChanged" /><span>Sensor changed</span></label>
+            <label class="check-option"><input type="checkbox" id="workDeviceOut" /><span>Device out for repair in office</span></label>
+            <label class="check-option"><input type="checkbox" id="workOther" /><span>Other</span></label>
+            <div class="conditional-field hidden" id="otherWorkBox">
+              <label for="otherWorkText">Other repair detail <span class="required">*</span></label>
+              <input type="text" id="otherWorkText" placeholder="Enter repair detail" autocomplete="off" />
             </div>
           </div>
 
@@ -514,16 +4421,28 @@ function renderRepairForm() {
   const hint = document.getElementById("imeiHint");
   const simCheck = document.getElementById("workSimChange");
   const deviceCheck = document.getElementById("workDeviceChange");
+  const otherCheck = document.getElementById("workOther");
   const newSimBox = document.getElementById("newSimBox");
   const newImeiBox = document.getElementById("newImeiBox");
+  const otherWorkBox = document.getElementById("otherWorkBox");
 
-  imeiInput.addEventListener("input", () => {
-    const inst = findInstallationByImei(imeiInput.value);
+  const applyInstallation = (inst) => {
     if (inst) {
+      imeiInput.value = getCurrentImei(inst);
       vehicleInput.value = inst.vehicleNo;
       hint.textContent = `Found: ${inst.gpsModel} | Current SIM: ${getCurrentSim(inst)}`;
       hint.classList.add("hint-ok");
       imeiInput.classList.remove("invalid");
+      vehicleInput.classList.remove("invalid");
+    } else {
+      hint.classList.remove("hint-ok");
+    }
+  };
+
+  imeiInput.addEventListener("input", () => {
+    const inst = findInstallationByImei(imeiInput.value);
+    if (inst) {
+      applyInstallation(inst);
     } else if (imeiInput.value.trim()) {
       vehicleInput.value = "";
       hint.textContent = "IMEI not found in installation database";
@@ -535,82 +4454,363 @@ function renderRepairForm() {
     }
   });
 
-  simCheck.addEventListener("change", () => {
-    newSimBox.classList.toggle("hidden", !simCheck.checked);
-    if (!simCheck.checked) document.getElementById("newSimNo").value = "";
+  vehicleInput.addEventListener("input", () => {
+    const inst = findInstallationByVehicle(vehicleInput.value);
+    if (inst) {
+      applyInstallation(inst);
+    } else if (vehicleInput.value.trim()) {
+      imeiInput.value = "";
+      hint.textContent = "Vehicle not found in installation database";
+      hint.classList.remove("hint-ok");
+    } else {
+      imeiInput.value = "";
+      hint.textContent = "Enter IMEI or select vehicle from database";
+      hint.classList.remove("hint-ok");
+    }
   });
 
+  simCheck.addEventListener("change", () => {
+    newSimBox.classList.toggle("hidden", !simCheck.checked);
+    if (!simCheck.checked) {
+      document.getElementById("newSimNo").value = "";
+      const h = document.getElementById("newSimHint");
+      if (h) {
+        h.textContent = "Enter the 20-digit ICCID. The system will look up the primary number from the SIM database automatically.";
+        h.className = "hint";
+      }
+    }
+  });
+
+  // Live SIM lookup as Akash types the ICCID.
+  // ===== newSimNo — stock-aware lookup + autocomplete dropdown =====
+  function showRepairSimSuggestions(query) {
+    const dropdown = document.getElementById("newSimDropdown");
+    if (!dropdown) return;
+    const q = String(query || "").trim().toLowerCase();
+    if (q.length < 3) {
+      dropdown.classList.remove("show");
+      dropdown.innerHTML = "";
+      return;
+    }
+    const stockMatches = stockItems.filter((it) => {
+      if (categoryKind(it.category) !== "sim") return false;
+      if (it.quantity <= 0) return false;
+      const m = it.metadata || {};
+      const fields = [m.imei || "", m.secondary || "", m.primary || ""];
+      return fields.some((f) => f && (f.toLowerCase().endsWith(q) || f.toLowerCase().includes(q)));
+    }).slice(0, 5);
+    const simDbMatches = sims.filter((s) => {
+      const sec = (s.secondaryNumber || "").toLowerCase();
+      return sec && (sec.endsWith(q) || sec.includes(q));
+    }).slice(0, 5);
+    const rows = [];
+    for (const it of stockMatches) {
+      const m = it.metadata || {};
+      const iccid = m.secondary || m.imei || "";
+      if (!iccid) continue;
+      const idx = iccid.toLowerCase().lastIndexOf(q);
+      const before = escapeHtml(iccid.slice(0, idx));
+      const match = escapeHtml(iccid.slice(idx, idx + q.length));
+      const after = escapeHtml(iccid.slice(idx + q.length));
+      rows.push(`
+        <div class="autocomplete-item" data-value="${escapeHtml(iccid)}" data-name="${escapeHtml(it.name || '')}">
+          <div class="ac-main">
+            <span class="ac-value mono">${before}<strong>${match}</strong>${after}</span>
+            <span class="ac-name">${escapeHtml(it.name || "SIM")}</span>
+          </div>
+          <div class="ac-meta">📦 Stock: ${it.quantity}</div>
+        </div>
+      `);
+    }
+    for (const s of simDbMatches) {
+      const sec = s.secondaryNumber || "";
+      if (!sec) continue;
+      if (rows.some((r) => r.includes(`data-value="${escapeHtml(sec)}"`))) continue;
+      const idx = sec.toLowerCase().lastIndexOf(q);
+      const before = escapeHtml(sec.slice(0, idx));
+      const match = escapeHtml(sec.slice(idx, idx + q.length));
+      const after = escapeHtml(sec.slice(idx + q.length));
+      rows.push(`
+        <div class="autocomplete-item" data-value="${escapeHtml(sec)}" data-name="SIM DB">
+          <div class="ac-main">
+            <span class="ac-value mono">${before}<strong>${match}</strong>${after}</span>
+            <span class="ac-name">${s.primaryNumber ? `Primary: ${escapeHtml(s.primaryNumber)}` : "SIM Database"}</span>
+          </div>
+          <div class="ac-meta">📝 DB</div>
+        </div>
+      `);
+    }
+    if (rows.length === 0) {
+      dropdown.classList.remove("show");
+      dropdown.innerHTML = "";
+      return;
+    }
+    dropdown.innerHTML = rows.join("");
+    dropdown.classList.add("show");
+    dropdown.querySelectorAll(".autocomplete-item").forEach((row) => {
+      row.addEventListener("click", () => {
+        const fullVal = row.dataset.value;
+        const input = document.getElementById("newSimNo");
+        input.value = fullVal;
+        dropdown.classList.remove("show");
+        input.dispatchEvent(new Event("input"));
+        showToast(`✓ Selected: ${row.dataset.name}`);
+      });
+    });
+  }
+
+  function showRepairImeiSuggestions(query) {
+    const dropdown = document.getElementById("newImeiDropdown");
+    if (!dropdown) return;
+    const q = String(query || "").trim().toLowerCase();
+    if (q.length < 3) {
+      dropdown.classList.remove("show");
+      dropdown.innerHTML = "";
+      return;
+    }
+    const matches = stockItems.filter((it) => {
+      if (categoryKind(it.category) !== "gps") return false;
+      if (it.quantity <= 0) return false;
+      const imei = (it.metadata?.imei || "").toLowerCase();
+      return imei && (imei.endsWith(q) || imei.includes(q));
+    }).slice(0, 8);
+    if (matches.length === 0) {
+      dropdown.classList.remove("show");
+      dropdown.innerHTML = "";
+      return;
+    }
+    const rows = matches.map((it) => {
+      const imei = it.metadata?.imei || "";
+      const idx = imei.toLowerCase().lastIndexOf(q);
+      const before = escapeHtml(imei.slice(0, idx));
+      const match = escapeHtml(imei.slice(idx, idx + q.length));
+      const after = escapeHtml(imei.slice(idx + q.length));
+      return `
+        <div class="autocomplete-item" data-value="${escapeHtml(imei)}" data-name="${escapeHtml(it.name || '')}">
+          <div class="ac-main">
+            <span class="ac-value mono">${before}<strong>${match}</strong>${after}</span>
+            <span class="ac-name">${escapeHtml(it.name || "GPS")}</span>
+          </div>
+          <div class="ac-meta">📦 Stock: ${it.quantity}</div>
+        </div>
+      `;
+    }).join("");
+    dropdown.innerHTML = rows;
+    dropdown.classList.add("show");
+    dropdown.querySelectorAll(".autocomplete-item").forEach((row) => {
+      row.addEventListener("click", () => {
+        const input = document.getElementById("newImeiNo");
+        input.value = row.dataset.value;
+        dropdown.classList.remove("show");
+        input.dispatchEvent(new Event("input"));
+        showToast(`✓ Selected: ${row.dataset.name}`);
+      });
+    });
+  }
+
+  document.getElementById("newSimNo")?.addEventListener("input", (e) => {
+    const v = e.target.value.trim();
+    const h = document.getElementById("newSimHint");
+    if (!h) return;
+    showRepairSimSuggestions(v);
+    if (!v) {
+      h.textContent = "Enter the 20-digit ICCID. System auto-checks Stock + SIM Database.";
+      h.className = "hint";
+      return;
+    }
+    const sim = findSimBySecondary(v);
+    const stockMatched = findStockByValue(v);
+    const simStock = stockMatched.find((it) => categoryKind(it.category) === "sim");
+
+    if (simStock && sim && sim.primaryNumber) {
+      h.innerHTML = `✓ Found in <strong>Stock</strong> (${escapeHtml(simStock.name)}) + <strong>SIM DB</strong> — Primary: ${escapeHtml(sim.primaryNumber)}`;
+      h.className = "hint hint-ok";
+    } else if (simStock) {
+      h.innerHTML = `✓ Found in <strong>Stock</strong>: ${escapeHtml(simStock.name)}. Will auto-link on save.`;
+      h.className = "hint hint-ok";
+    } else if (sim && sim.primaryNumber) {
+      h.innerHTML = `✓ SIM matched in database — Primary: <strong>${escapeHtml(sim.primaryNumber)}</strong>`;
+      h.className = "hint hint-ok";
+    } else if (sim && !sim.primaryNumber) {
+      h.textContent = "⚠️ ICCID known but primary number pending — admin will fill.";
+      h.className = "hint hint-warn";
+    } else {
+      h.textContent = "ℹ️ New ICCID — will auto-add to SIM database. Admin will fill primary later.";
+      h.className = "hint hint-info";
+    }
+  });
+
+  document.getElementById("newImeiNo")?.addEventListener("input", (e) => {
+    const v = e.target.value.trim();
+    const h = document.getElementById("newImeiHint");
+    if (!h) return;
+    showRepairImeiSuggestions(v);
+    if (!v || v.length < 8) {
+      h.textContent = "";
+      h.className = "hint";
+      return;
+    }
+    const matched = findStockByValue(v);
+    const gpsMatch = matched.find((it) => categoryKind(it.category) === "gps");
+    if (gpsMatch) {
+      h.innerHTML = `<span class="hint-found">✓ Found in Stock: <strong>${escapeHtml(gpsMatch.name)}</strong> — will auto-link on save.</span>`;
+      h.className = "hint hint-ok";
+    } else if (matched.length > 0) {
+      h.innerHTML = `<span class="hint-found">✓ Found in Stock: ${escapeHtml(matched[0].name)}</span>`;
+      h.className = "hint hint-ok";
+    } else {
+      h.textContent = "ℹ️ Not in stock database.";
+      h.className = "hint hint-info";
+    }
+  });
+
+  // Scan buttons for repair form
+  document.getElementById("scanNewSim")?.addEventListener("click", () => {
+    openBarcodeScannerModal({
+      title: "📷 Scan New SIM Barcode",
+      hint: "SIM card pe printed barcode ya QR code pe camera point karo.",
+      codeType: "iccid",
+      checkDuplicates: true,
+      dupCheckScope: "install", // repairing — stock match is EXPECTED
+      onScan: (val) => {
+        const cleaned = val.replace(/\D/g, "") || val.trim();
+        const input = document.getElementById("newSimNo");
+        input.value = cleaned;
+        input.dispatchEvent(new Event("input"));
+        showToast(`ICCID scanned: ${cleaned}`);
+      },
+    });
+  });
+  document.getElementById("scanNewImei")?.addEventListener("click", () => {
+    openBarcodeScannerModal({
+      title: "📷 Scan New IMEI",
+      hint: "GPS device pe printed barcode ya QR code pe camera point karo.",
+      codeType: "imei",
+      checkDuplicates: true,
+      dupCheckScope: "install",
+      onScan: (val) => {
+        const cleaned = val.replace(/\D/g, "") || val.trim();
+        const input = document.getElementById("newImeiNo");
+        input.value = cleaned;
+        input.dispatchEvent(new Event("input"));
+        showToast(`IMEI scanned: ${cleaned}`);
+      },
+    });
+  });
+
+  // Close autocomplete dropdowns on outside click
+  document.addEventListener("click", function _closeRepairAcDropdowns(e) {
+    if (!e.target.closest(".autocomplete-wrap")) {
+      document.getElementById("newSimDropdown")?.classList.remove("show");
+      document.getElementById("newImeiDropdown")?.classList.remove("show");
+    }
+  });
   deviceCheck.addEventListener("change", () => {
     newImeiBox.classList.toggle("hidden", !deviceCheck.checked);
     if (!deviceCheck.checked) document.getElementById("newImeiNo").value = "";
   });
+  otherCheck.addEventListener("change", () => {
+    otherWorkBox.classList.toggle("hidden", !otherCheck.checked);
+    if (!otherCheck.checked) document.getElementById("otherWorkText").value = "";
+  });
 
   document.getElementById("repairForm").addEventListener("submit", async (e) => {
     e.preventDefault();
+    const submitBtn = e.target.querySelector('button[type="submit"]');
+    if (submitBtn && submitBtn.dataset.busy === "1") return; // double-click guard
 
-    const imei = imeiInput.value.trim();
-    const inst = findInstallationByImei(imei);
-    const wiring = document.getElementById("workWiring").checked;
-    const simChange = simCheck.checked;
-    const deviceChange = deviceCheck.checked;
-    const newSim = document.getElementById("newSimNo").value.trim();
-    const newImei = document.getElementById("newImeiNo").value.trim();
+    const _doRepairSubmit = async () => {
+      const imei = imeiInput.value.trim();
+      const inst = findInstallationByImei(imei) || findInstallationByVehicle(vehicleInput.value);
+      const wiring = document.getElementById("workWiring").checked;
+      const simChange = simCheck.checked;
+      const deviceChange = deviceCheck.checked;
+      const sensorOutForRepair = document.getElementById("workSensorOut").checked;
+      const sensorChanged = document.getElementById("workSensorChanged").checked;
+      const deviceOutForRepair = document.getElementById("workDeviceOut").checked;
+      const otherWork = otherCheck.checked;
+      const newSim = document.getElementById("newSimNo").value.trim();
+      const newImei = document.getElementById("newImeiNo").value.trim();
+      const otherWorkText = document.getElementById("otherWorkText").value.trim();
 
-    if (!inst) {
-      imeiInput.classList.add("invalid");
-      showToast("IMEI not found in installation database.", true);
+      if (!inst) {
+        imeiInput.classList.add("invalid");
+        vehicleInput.classList.add("invalid");
+      showToast("IMEI or vehicle not found in installation database.", true);
       return;
     }
-
-    if (!wiring && !simChange && !deviceChange) {
+    if (!wiring && !simChange && !deviceChange && !sensorOutForRepair && !sensorChanged && !deviceOutForRepair && !otherWork) {
       showToast("Select at least one work type.", true);
       return;
     }
-
     if (simChange && !newSim) {
       document.getElementById("newSimNo").classList.add("invalid");
       showToast("Enter new SIM number for SIM change.", true);
       return;
     }
-
     if (deviceChange && !newImei) {
       document.getElementById("newImeiNo").classList.add("invalid");
       showToast("Enter new IMEI for device change.", true);
       return;
     }
+    if (otherWork && !otherWorkText) {
+      document.getElementById("otherWorkText").classList.add("invalid");
+      showToast("Enter details for Other repair work.", true);
+      return;
+    }
 
-    const updatedInst = { ...inst };
+    const updatedInst = {
+      ...inst,
+      imeiHistory: inst.imeiHistory.map((item) => ({ ...item })),
+      simHistory: inst.simHistory.map((item) => ({ ...item })),
+    };
     const now = new Date().toISOString();
     const currentSim = getCurrentSim(updatedInst);
     const currentImei = getCurrentImei(updatedInst);
     let simDeactivationPending = false;
     let oldSimNo = null;
     let oldImei = null;
+    let unknownSimSecondary = null;
+    let newSimStored = newSim; // What we actually store in simHistory.value
 
     if (simChange) {
       oldSimNo = currentSim;
+      // Akash entered the secondary (ICCID). Look up the primary from the SIM
+      // database. If found, store the primary as the active SIM value. If
+      // not, store the secondary as a placeholder and queue a pending task
+      // for the admin to update the primary number.
+      const sim = findSimBySecondary(newSim);
+      if (sim && sim.primaryNumber) {
+        newSimStored = sim.primaryNumber;
+      } else {
+        newSimStored = newSim; // placeholder = secondary
+        unknownSimSecondary = newSim;
+        // Pre-register the SIM in the inventory so admin can find it later.
+        try {
+          await upsertSim({ primaryNumber: null, secondaryNumber: newSim });
+        } catch (err) {
+          // Non-fatal: continue even if the sims table isn't ready.
+          console.warn("Could not pre-register SIM in sims table:", err);
+        }
+      }
       updatedInst.simHistory.forEach((s) => {
         if (s.active) s.pendingDeactivation = true;
       });
       updatedInst.simHistory.push({
-        value: newSim,
+        value: newSimStored,
+        secondaryValue: newSim,
         addedAt: now,
         active: true,
         pendingDeactivation: false,
       });
       simDeactivationPending = true;
     }
-
     if (deviceChange) {
       oldImei = currentImei;
       updatedInst.imeiHistory.forEach((i) => {
         i.active = false;
       });
-      updatedInst.imeiHistory.push({
-        value: newImei,
-        addedAt: now,
-        active: true,
-      });
+      updatedInst.imeiHistory.push({ value: newImei, addedAt: now, active: true });
     }
 
     const newRecord = {
@@ -620,262 +4820,5670 @@ function renderRepairForm() {
       vehicleNo: inst.vehicleNo,
       wiringConnection: wiring,
       simChange,
-      newSimNo: simChange ? newSim : null,
+      newSimNo: simChange ? newSimStored : null,
       deviceChange,
       newImei: deviceChange ? newImei : null,
+      sensorOutForRepair,
+      sensorChanged,
+      deviceOutForRepair,
+      otherWorkText: otherWork ? otherWorkText : null,
       oldSimNo,
       oldImei,
       simDeactivationPending,
       simDeactivated: false,
       simDeactivatedAt: null,
+      tasks: buildTasksForRepair({
+        simChange,
+        deviceChange,
+        deviceOutForRepair,
+        sensorOutForRepair,
+        unknownSimSecondary,
+      }),
       createdAt: now,
       createdBy: "akash",
     };
 
     try {
       await updateInstallation(updatedInst);
-      await insertMaintenanceRecord(newRecord);
+      const savedRecord = await insertMaintenanceRecord(newRecord);
+      // Auto-consume newly-used stock entries.
+      const consumeResult = await consumeStockFor(
+        {
+          imei: deviceChange ? newImei : null,
+          simPrimary: simChange ? newSim : null,
+          simSecondary: simChange ? newSim : null,
+        },
+        {
+          installationId: inst.id,
+          maintenanceRecordId: savedRecord?.id || newRecord.id,
+          vehicleNo: inst.vehicleNo,
+          note: "Used during repair",
+        }
+      );
       await refreshAllData();
-      showToast("Repair work saved successfully!");
+      const consumedCount = consumeResult?.consumed?.length || 0;
+      if (consumedCount > 0) {
+        showToast(`✓ Repair saved! Auto-linked ${consumedCount} stock item${consumedCount > 1 ? "s" : ""}.`);
+      } else {
+        showToast("Repair work saved successfully!");
+      }
       setView("akash-home");
     } catch (err) {
       showToast(err.message || "Failed to save repair work.", true);
     }
+    }; // end _doRepairSubmit
+    if (submitBtn) {
+      await runWithBusyButton(submitBtn, _doRepairSubmit, "Saving repair…");
+    } else {
+      await _doRepairSubmit();
+    }
   });
 }
 
-function getPendingSimDeactivations() {
-  return loadMaintenance().filter((m) => m.simDeactivationPending && !m.simDeactivated);
+function downloadInstallationSample() {
+  downloadXlsx(
+    "installation-upload-sample.xlsx",
+    [
+      ["imei", "vehicle_no", "gps_model", "sim_no", "mac_id", "sensor_no", "created_at", "created_by"],
+      ["867530012345678", "MH12AB1234", "GT06N", "9876543210", "AA:BB:CC:DD:EE:FF", "SN-12345", "2026-05-25 10:30", "akash"],
+    ],
+    "Sheet1",
+    ["imei", "sim_no", "mac_id", "sensor_no"]
+  );
 }
 
-function renderAdmin() {
-  const installations = loadInstallations();
-  const maintenance = loadMaintenance();
-  const pending = getPendingSimDeactivations();
-  const q = searchQuery.toLowerCase().trim();
+function downloadRepairSample() {
+  downloadXlsx(
+    "repair-upload-sample.xlsx",
+    [
+      ["imei", "wiring_connection", "sim_change", "new_sim_no", "device_change", "new_imei", "sensor_out_for_repair", "sensor_changed", "device_out_for_repair", "other_work_text", "created_at", "created_by"],
+      ["867530012345678", "yes", "yes", "9876500000", "no", "", "no", "no", "no", "", "2026-05-25 11:00", "akash"],
+      ["867530012345678", "no", "no", "", "yes", "867530012345679", "yes", "no", "yes", "Bracket broken", "2026-05-25 12:00", "akash"],
+    ],
+    "Sheet1",
+    ["imei", "new_sim_no", "new_imei"]
+  );
+}
 
-  const filteredInstalls = installations.filter((i) => {
+function downloadSimSample() {
+  downloadXlsx(
+    "sim-database-sample.xlsx",
+    [
+      ["primary_number", "secondary_number", "notes"],
+      ["5753200309565", "89918720507069157022", ""],
+      ["5753200309623", "89918720507069156917", ""],
+      ["", "89918720507069158640", "Primary not yet known"],
+    ],
+    "Sheet1",
+    ["primary_number", "secondary_number"]
+  );
+}
+
+async function importSimsFromExcel(file) {
+  const rows = await readXlsxFile(file);
+  if (!rows.length) {
+    showToast("Upload file is empty.", true);
+    return;
+  }
+  // Pre-scan to detect swap candidates so we can ask the admin once
+  // upfront rather than row-by-row.
+  let swapCandidates = 0;
+  const parsed = rows.map((row) => {
+    const secondary = String(
+      row.secondary_number || row.secondary || row.iccid || row.secondary_sim || ""
+    ).trim();
+    const primary = String(
+      row.primary_number || row.primary || row.primary_sim || ""
+    ).trim();
+    if (pairLooksSwapped(primary, secondary)) swapCandidates += 1;
+    return { primary, secondary, notes: String(row.notes || "").trim() || null };
+  });
+  let autoSwap = false;
+  if (swapCandidates > 0) {
+    autoSwap = await showConfirm({
+      title: "Some rows look swapped",
+      message: `${swapCandidates} of ${rows.length} Excel rows have a 20-digit ICCID in the <strong>primary_number</strong> column and a short number in the <strong>secondary_number</strong> column. Auto-swap them before saving?`,
+      confirmLabel: "Yes, swap & save",
+    });
+  }
+  let saved = 0;
+  const errors = [];
+  for (const [index, row] of parsed.entries()) {
+    const rowNo = index + 2;
+    let { primary, secondary, notes } = row;
+    if (autoSwap && pairLooksSwapped(primary, secondary)) {
+      const tmp = primary;
+      primary = secondary;
+      secondary = tmp;
+    }
+    if (!secondary) {
+      errors.push(`Row ${rowNo}: secondary_number is required`);
+      continue;
+    }
+    try {
+      await upsertSim({
+        primaryNumber: primary || null,
+        secondaryNumber: secondary,
+        notes,
+      });
+      saved += 1;
+    } catch (err) {
+      if (err.code === SIMS_TABLE_MISSING) {
+        errors.push(`Row ${rowNo}: sims table missing — run sims-table-migration.sql first`);
+      } else {
+        errors.push(`Row ${rowNo}: ${err.message}`);
+      }
+    }
+  }
+  await refreshAllData();
+  render();
+  showToast(
+    `${saved} SIM${saved === 1 ? "" : "s"} saved.${errors.length ? ` ${errors.length} skipped.` : ""}`,
+    saved === 0
+  );
+  if (errors.length) showImportReport(errors);
+}
+
+async function importInstallations(file) {
+  const rows = await readXlsxFile(file);
+  if (!rows.length) {
+    showToast("Upload file is empty.", true);
+    return;
+  }
+
+  let imported = 0;
+  const errors = [];
+  const allInstalls = [...loadInstallations()];
+
+  for (const [index, row] of rows.entries()) {
+    const rowNo = index + 2;
+    const imei = row.imei;
+    const vehicleNo = row.vehicle_no || row.vehicle;
+    const gpsModel = row.gps_model || row.model;
+    const simNo = row.sim_no || row.sim;
+    const macId = row.mac_id || row.mac;
+    const sensorNo = row.sensor_no || row.sensor;
+
+    if (!imei || !vehicleNo || !gpsModel || !simNo || !macId || !sensorNo) {
+      errors.push(`Row ${rowNo}: missing required installation fields`);
+      continue;
+    }
+    if (allInstalls.some((inst) => inst.vehicleNo.toLowerCase() === vehicleNo.toLowerCase())) {
+      errors.push(`Row ${rowNo}: duplicate vehicle ${vehicleNo}`);
+      continue;
+    }
+    if (allInstalls.some((inst) => activeImeiMatches(inst, imei))) {
+      errors.push(`Row ${rowNo}: duplicate IMEI ${imei}`);
+      continue;
+    }
+
+    const createdAt = normalizeDate(row.created_at);
+    const newInstall = {
+      id: generateId(),
+      vehicleNo,
+      gpsModel,
+      macId,
+      sensorNo,
+      secondarySim: row.secondary_sim || null,
+      imeiHistory: [{ value: imei, addedAt: createdAt, active: true }],
+      simHistory: [{ value: simNo, addedAt: createdAt, active: true, pendingDeactivation: false }],
+      tasks: defaultInstallTasks(),
+      createdAt,
+      createdBy: row.created_by || "admin",
+    };
+
+    try {
+      const saved = await insertInstallation(newInstall);
+      allInstalls.push(saved);
+      imported += 1;
+    } catch (err) {
+      errors.push(`Row ${rowNo}: ${err.message}`);
+    }
+  }
+
+  await refreshAllData();
+  render();
+  showToast(`${imported} installation${imported === 1 ? "" : "s"} uploaded.${errors.length ? ` ${errors.length} skipped.` : ""}`, imported === 0);
+  if (errors.length) showImportReport(errors);
+}
+
+async function importRepairs(file) {
+  const rows = await readXlsxFile(file);
+  if (!rows.length) {
+    showToast("Upload file is empty.", true);
+    return;
+  }
+
+  let imported = 0;
+  const errors = [];
+  const localInstalls = loadInstallations().map((inst) => ({
+    ...inst,
+    imeiHistory: inst.imeiHistory.map((item) => ({ ...item })),
+    simHistory: inst.simHistory.map((item) => ({ ...item })),
+  }));
+  const findLocalByImei = (imei) => {
+    const q = imei.trim().toLowerCase();
+    return localInstalls.find((inst) => inst.imeiHistory.some((i) => i.value.toLowerCase() === q));
+  };
+
+  for (const [index, row] of rows.entries()) {
+    const rowNo = index + 2;
+    const imei = row.imei;
+    const wiringConnection = normalizeBool(row.wiring_connection || row.wiring);
+    const simChange = normalizeBool(row.sim_change);
+    const deviceChange = normalizeBool(row.device_change);
+    const sensorOutForRepair = normalizeBool(row.sensor_out_for_repair);
+    const sensorChanged = normalizeBool(row.sensor_changed);
+    const deviceOutForRepair = normalizeBool(row.device_out_for_repair);
+    const otherWorkText = row.other_work_text || row.other || "";
+    const newSimNo = row.new_sim_no || row.new_sim || "";
+    const newImei = row.new_imei || "";
+
+    if (!imei) {
+      errors.push(`Row ${rowNo}: IMEI is required`);
+      continue;
+    }
+    if (!wiringConnection && !simChange && !deviceChange && !sensorOutForRepair && !sensorChanged && !deviceOutForRepair && !otherWorkText) {
+      errors.push(`Row ${rowNo}: select at least one repair work type`);
+      continue;
+    }
+    if (simChange && !newSimNo) {
+      errors.push(`Row ${rowNo}: new_sim_no is required for SIM change`);
+      continue;
+    }
+    if (deviceChange && !newImei) {
+      errors.push(`Row ${rowNo}: new_imei is required for device change`);
+      continue;
+    }
+
+    const inst = findLocalByImei(imei);
+    if (!inst) {
+      errors.push(`Row ${rowNo}: IMEI ${imei} not found in installations`);
+      continue;
+    }
+
+    const createdAt = normalizeDate(row.created_at);
+    const currentSim = getCurrentSim(inst);
+    const currentImei = getCurrentImei(inst);
+    let oldSimNo = null;
+    let oldImei = null;
+    let simDeactivationPending = false;
+
+    if (simChange) {
+      oldSimNo = currentSim;
+      // Look up primary number from SIM database — SAME as install form.
+      // Akash only enters ICCID, so we MUST resolve primary from DB or leave empty.
+      // Never store ICCID in simHistory.value.
+      const knownSimForChange = sims.find(
+        (s) => (s.secondaryNumber || "").toLowerCase() === newSimNo.toLowerCase()
+      );
+      const changePrimaryValue = knownSimForChange?.primaryNumber || null;
+
+      inst.simHistory.forEach((item) => {
+        if (item.active) item.pendingDeactivation = true;
+      });
+      inst.simHistory.push({
+        value: changePrimaryValue || "",     // Primary ONLY, never ICCID
+        secondaryValue: newSimNo,            // ICCID goes here
+        addedAt: createdAt,
+        active: true,
+        pendingDeactivation: false,
+      });
+      // Also update the installation's top-level secondarySim field
+      inst.secondarySim = newSimNo;
+      simDeactivationPending = true;
+
+      // Auto-register the SIM in the sims table if not already there
+      if (!knownSimForChange) {
+        try {
+          await upsertSim({
+            primaryNumber: null,
+            secondaryNumber: newSimNo,
+            notes: `Auto-added from repair — ${inst.vehicleNo}`,
+          });
+        } catch (simErr) {
+          console.warn("Auto-register SIM (repair) failed:", simErr);
+        }
+      }
+    }
+    if (deviceChange) {
+      oldImei = currentImei;
+      inst.imeiHistory.forEach((item) => {
+        item.active = false;
+      });
+      inst.imeiHistory.push({ value: newImei, addedAt: createdAt, active: true });
+    }
+
+    const newRecord = {
+      id: generateId(),
+      installationId: inst.id,
+      imei: currentImei,
+      vehicleNo: inst.vehicleNo,
+      wiringConnection,
+      simChange,
+      newSimNo: simChange ? newSimNo : null,
+      deviceChange,
+      newImei: deviceChange ? newImei : null,
+      sensorOutForRepair,
+      sensorChanged,
+      deviceOutForRepair,
+      otherWorkText: otherWorkText || null,
+      oldSimNo,
+      oldImei,
+      simDeactivationPending,
+      simDeactivated: false,
+      simDeactivatedAt: null,
+      tasks: buildTasksForRepair({ simChange, deviceChange, deviceOutForRepair, sensorOutForRepair }),
+      createdAt,
+      createdBy: row.created_by || "admin",
+    };
+
+    try {
+      await updateInstallation(inst);
+      await insertMaintenanceRecord(newRecord);
+      imported += 1;
+    } catch (err) {
+      errors.push(`Row ${rowNo}: ${err.message}`);
+    }
+  }
+
+  await refreshAllData();
+  render();
+  showToast(`${imported} repair record${imported === 1 ? "" : "s"} uploaded.${errors.length ? ` ${errors.length} skipped.` : ""}`, imported === 0);
+  if (errors.length) showImportReport(errors);
+}
+
+function showImportReport(errors) {
+  showModal(`
+    <h3>Upload report</h3>
+    <p class="modal-desc">Some rows were skipped. Please fix these rows and upload again.</p>
+    <div class="import-errors">${errors.map((error) => `<div>${escapeHtml(error)}</div>`).join("")}</div>
+    <div class="modal-actions"><button type="button" class="btn btn-primary modal-close">OK</button></div>
+  `);
+}
+
+/* ---------------- Installation editing (admin) ---------------- */
+
+/* ============================================================
+   STOCK RESTORE / CONSUME by value (for admin edit flow)
+   ============================================================ */
+function findStockByValue(value) {
+  const norm = String(value || "").trim().toLowerCase();
+  if (!norm) return [];
+  return stockItems.filter((it) => {
+    const m = it.metadata || {};
+    return (
+      (m.imei || "").toLowerCase() === norm ||
+      (m.primary || "").toLowerCase() === norm ||
+      (m.secondary || "").toLowerCase() === norm ||
+      (m.macId || "").toLowerCase() === norm ||
+      (m.sensorNo || "").toLowerCase() === norm
+    );
+  });
+}
+
+async function restoreStockByValue(value, vehicleNo) {
+  if (!stockItemsTableReady) return 0;
+  const matched = findStockByValue(value);
+  let count = 0;
+  for (const item of matched) {
+    try {
+      const newMeta = { ...(item.metadata || {}) };
+      delete newMeta.usedInVehicle;
+      delete newMeta.usedAt;
+      delete newMeta.usedInInstallation;
+      const newQty = item.quantity + 1;
+      await updateStockItem({ ...item, quantity: newQty, metadata: newMeta });
+      if (stockTxTableReady) {
+        try {
+          await insertStockTransaction({
+            stockItemId: item.id,
+            vehicleNo: vehicleNo || null,
+            delta: +1,
+            resultingQuantity: newQty,
+            note: `Returned from ${vehicleNo || "?"} — admin edit`,
+            createdBy: currentUser || "admin",
+            itemNameSnapshot: item.name + (item.category ? ` (${item.category})` : ""),
+          });
+        } catch {}
+      }
+      count++;
+    } catch (e) {
+      console.warn("Stock restore by value failed:", e);
+    }
+  }
+  return count;
+}
+
+async function consumeStockByValue(value, installationId, vehicleNo) {
+  if (!stockItemsTableReady) return 0;
+  const matched = findStockByValue(value);
+  let count = 0;
+  for (const item of matched) {
+    if (item.quantity <= 0) continue; // already out of stock
+    try {
+      const newMeta = {
+        ...(item.metadata || {}),
+        usedInVehicle: vehicleNo || null,
+        usedAt: new Date().toISOString(),
+        usedInInstallation: installationId || null,
+      };
+      const newQty = item.quantity - 1;
+      await updateStockItem({ ...item, quantity: newQty, metadata: newMeta });
+      if (stockTxTableReady) {
+        try {
+          await insertStockTransaction({
+            stockItemId: item.id,
+            installationId: installationId || null,
+            vehicleNo: vehicleNo || null,
+            delta: -1,
+            resultingQuantity: newQty,
+            note: `Used in ${vehicleNo || "?"} — admin edit`,
+            createdBy: currentUser || "admin",
+            itemNameSnapshot: item.name + (item.category ? ` (${item.category})` : ""),
+          });
+        } catch {}
+      }
+      count++;
+    } catch (e) {
+      console.warn("Stock consume by value failed:", e);
+    }
+  }
+  return count;
+}
+
+function openLiveStatusModal(installId) {
+  const inst = installations.find((i) => i.id === installId);
+  if (!inst) return;
+  const currentStatus = getInstallLiveStatus(inst);
+  const meta = getInstallLiveMeta(inst);
+  const lastUpdate = meta.updatedAt
+    ? `<p class="modal-desc">Last updated: ${escapeHtml(formatDateTime(meta.updatedAt))} by ${escapeHtml(meta.updatedBy || "?")}</p>`
+    : `<p class="modal-desc">Status has never been set for this vehicle.</p>`;
+
+  modal.innerHTML = `
+    <h3>📡 Vehicle Live Status — ${escapeHtml(inst.vehicleNo)}</h3>
+    ${lastUpdate}
+    <div class="live-status-choices">
+      <button type="button" class="live-status-choice live-choice-live ${currentStatus === "live" ? "active" : ""}" data-set="live">
+        <div class="live-choice-icon">🟢</div>
+        <div class="live-choice-label">Live</div>
+        <div class="live-choice-desc">Vehicle online & sending data</div>
+      </button>
+      <button type="button" class="live-status-choice live-choice-offline ${currentStatus === "offline" ? "active" : ""}" data-set="offline">
+        <div class="live-choice-icon">🔴</div>
+        <div class="live-choice-label">Offline</div>
+        <div class="live-choice-desc">Device not transmitting</div>
+      </button>
+      <button type="button" class="live-status-choice live-choice-unknown ${currentStatus === "unknown" ? "active" : ""}" data-set="unknown">
+        <div class="live-choice-icon">⚪</div>
+        <div class="live-choice-label">Unknown</div>
+        <div class="live-choice-desc">Not verified yet</div>
+      </button>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modal.querySelectorAll(".live-status-choice").forEach((btn) => {
+    btn.onclick = async () => {
+      const choice = btn.dataset.set;
+      let newVal;
+      if (choice === "live") newVal = true;
+      else if (choice === "offline") newVal = false;
+      else newVal = null;
+      closeModal();
+      await updateInstallLiveStatus(installId, newVal);
+    };
+  });
+}
+
+function openEditInstallation(id) {
+  const inst = loadInstallations().find((i) => i.id === id);
+  if (!inst) return;
+
+  // Extract current values from history arrays
+  const activeImeiEntry = (inst.imeiHistory || []).find((h) => h.active) || (inst.imeiHistory || [])[inst.imeiHistory?.length - 1];
+  const currentImei = activeImeiEntry?.value || "";
+  const activeSimEntry = (inst.simHistory || []).find((h) => h.active) || (inst.simHistory || [])[inst.simHistory?.length - 1];
+  const currentPrimary = activeSimEntry?.value || "";
+  const currentSecondary = inst.secondarySim || activeSimEntry?.secondaryValue || "";
+
+  showModal(
+    `
+    <h3>Edit Installation — ${escapeHtml(inst.vehicleNo)}</h3>
+    <p class="modal-desc">Admin can edit any field. Changes update the active record; history is preserved.</p>
+    <div class="edit-grid">
+      <div class="field"><label for="editImei">IMEI</label><input type="text" id="editImei" value="${escapeHtml(currentImei)}" inputmode="numeric" autocomplete="off" /></div>
+      <div class="field"><label for="editModel">GPS Model</label><input type="text" id="editModel" value="${escapeHtml(inst.gpsModel || "")}" autocomplete="off" /></div>
+      <div class="field"><label for="editVehicle">Vehicle No</label><input type="text" id="editVehicle" value="${escapeHtml(inst.vehicleNo)}" autocomplete="off" /></div>
+      <div class="field"><label for="editSecondarySim">Secondary No (ICCID)</label><input type="text" id="editSecondarySim" value="${escapeHtml(currentSecondary)}" placeholder="e.g. 8991872050707450776" inputmode="numeric" autocomplete="off" /></div>
+      <div class="field"><label for="editPrimarySim">Primary No (Mobile)</label><input type="text" id="editPrimarySim" value="${escapeHtml(currentPrimary)}" placeholder="e.g. 5753201219905" inputmode="numeric" autocomplete="off" /></div>
+      <div class="field"><label for="editSensor">Sensor No</label><input type="text" id="editSensor" value="${escapeHtml(inst.sensorNo || "")}" autocomplete="off" /></div>
+      <div class="field"><label for="editMac">MAC ID</label><input type="text" id="editMac" value="${escapeHtml(inst.macId || "")}" autocomplete="off" /></div>
+    </div>
+    <label class="stock-restore-toggle">
+      <input type="checkbox" id="editRestoreStock" />
+      <span class="stock-restore-text">
+        <strong>↻ Restore old + consume new stock</strong>
+        <small>If you change IMEI / Primary / Secondary, the old value goes back to stock (+1) and the new value gets consumed (−1) — only if those items exist in stock.</small>
+      </span>
+    </label>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary modal-close">Cancel</button>
+      <button type="button" class="btn btn-primary modal-confirm">Save changes</button>
+    </div>
+    `,
+    async () => {
+      const newImei = document.getElementById("editImei").value.trim();
+      const vehicleNo = document.getElementById("editVehicle").value.trim();
+      const gpsModel = document.getElementById("editModel").value.trim();
+      const macId = document.getElementById("editMac").value.trim();
+      const sensorNo = document.getElementById("editSensor").value.trim();
+      const newSecondary = document.getElementById("editSecondarySim").value.trim();
+      const newPrimary = document.getElementById("editPrimarySim").value.trim();
+      const restoreStock = document.getElementById("editRestoreStock").checked;
+
+      // Mandatory: vehicle + model only (other fields optional for flexibility)
+      if (!vehicleNo || !gpsModel) {
+        showToast("Vehicle and GPS Model are required.", true);
+        return false;
+      }
+      const clash = loadInstallations().some(
+        (i) => i.id !== inst.id && i.vehicleNo.toLowerCase() === vehicleNo.toLowerCase()
+      );
+      if (clash) {
+        showToast("Another installation already uses that vehicle number.", true);
+        return false;
+      }
+
+      // Update IMEI history — replace active item's value, or append if changed
+      let newImeiHistory = [...(inst.imeiHistory || [])];
+      const imeiChanged = newImei !== currentImei;
+      if (imeiChanged) {
+        newImeiHistory = newImeiHistory.map((h) => ({ ...h, active: false }));
+        if (newImei) newImeiHistory.push({ value: newImei, addedAt: new Date().toISOString(), active: true });
+      } else if (newImeiHistory.length === 0 && newImei) {
+        newImeiHistory.push({ value: newImei, addedAt: new Date().toISOString(), active: true });
+      }
+
+      // Update SIM history — replace active item or push new
+      let newSimHistory = [...(inst.simHistory || [])];
+      const primaryChanged = newPrimary !== currentPrimary;
+      const secondaryChanged = newSecondary !== currentSecondary;
+      if (primaryChanged || secondaryChanged) {
+        newSimHistory = newSimHistory.map((h) => ({ ...h, active: false }));
+        if (newPrimary || newSecondary) {
+          newSimHistory.push({
+            value: newPrimary || newSecondary,
+            secondaryValue: newSecondary,
+            addedAt: new Date().toISOString(),
+            active: true,
+            pendingDeactivation: false,
+          });
+        }
+      }
+
+      const updated = {
+        ...inst,
+        vehicleNo,
+        gpsModel,
+        macId,
+        sensorNo,
+        secondarySim: newSecondary || null,
+        imeiHistory: newImeiHistory,
+        simHistory: newSimHistory,
+      };
+
+      try {
+        await updateInstallation(updated);
+
+        // Stock restore/consume if checkbox is on
+        let totalRestored = 0;
+        let totalConsumed = 0;
+        if (restoreStock) {
+          if (imeiChanged) {
+            if (currentImei) totalRestored += await restoreStockByValue(currentImei, inst.vehicleNo);
+            if (newImei) totalConsumed += await consumeStockByValue(newImei, inst.id, vehicleNo);
+          }
+          if (primaryChanged) {
+            if (currentPrimary) totalRestored += await restoreStockByValue(currentPrimary, inst.vehicleNo);
+            if (newPrimary) totalConsumed += await consumeStockByValue(newPrimary, inst.id, vehicleNo);
+          }
+          if (secondaryChanged) {
+            if (currentSecondary) totalRestored += await restoreStockByValue(currentSecondary, inst.vehicleNo);
+            if (newSecondary) totalConsumed += await consumeStockByValue(newSecondary, inst.id, vehicleNo);
+          }
+        }
+
+        await refreshAllData();
+        if (restoreStock && (totalRestored || totalConsumed)) {
+          showToast(`✓ Updated. Restored ${totalRestored} · Consumed ${totalConsumed} stock items.`);
+        } else {
+          showToast("✓ Installation updated.");
+        }
+        render();
+        return true;
+      } catch (err) {
+        showToast(err.message || "Failed to update installation.", true);
+        return false;
+      }
+    }
+  );
+}
+
+/* ---------------- Pending actions card ---------------- */
+
+function renderPendingActions() {
+  const totalPending = getPendingActionRows().length;
+
+  // Every task (pending + completed), grouped by vehicle.
+  const groupsMap = new Map();
+  let anyTask = false;
+
+  // Include install-level tasks (Update on Portal + Vehicle number check)
+  for (const inst of loadInstallations()) {
+    const tasks = getInstallTasks(inst);
+    for (const type of INSTALL_TASK_TYPES) {
+      anyTask = true;
+      const tState = tasks[type] || { completedAt: null };
+      const task = {
+        id: `inst-${inst.id}-${type}`,
+        type,
+        done: Boolean(tState.completedAt),
+        completedAt: tState.completedAt || null,
+        completedBy: tState.completedBy || null,
+        remark: tState.remark || null,
+        remarkBy: tState.remarkBy || null,
+      };
+      const key = inst.id;
+      if (!groupsMap.has(key)) {
+        groupsMap.set(key, {
+          vehicleNo: inst.vehicleNo,
+          installationId: inst.id,
+          latest: inst.createdAt,
+          items: [],
+        });
+      }
+      const g = groupsMap.get(key);
+      // Pseudo-record for the install task, carrying the install info.
+      const pseudoRecord = {
+        id: inst.id,
+        vehicleNo: inst.vehicleNo,
+        installationId: inst.id,
+        createdAt: inst.createdAt,
+      };
+      g.items.push({ kind: "installation", record: pseudoRecord, task });
+      if (new Date(inst.createdAt) > new Date(g.latest)) g.latest = inst.createdAt;
+    }
+  }
+
+  // Maintenance / repair tasks
+  for (const record of loadMaintenance()) {
+    for (const task of getTasks(record)) {
+      anyTask = true;
+      const key = record.installationId || `veh:${record.vehicleNo}`;
+      if (!groupsMap.has(key)) {
+        groupsMap.set(key, {
+          vehicleNo: record.vehicleNo,
+          installationId: record.installationId,
+          latest: record.createdAt,
+          items: [],
+        });
+      }
+      const g = groupsMap.get(key);
+      g.items.push({ kind: "maintenance", record, task });
+      if (new Date(record.createdAt) > new Date(g.latest)) g.latest = record.createdAt;
+    }
+  }
+  if (!anyTask) return "";
+
+  const counts = { Portal: 0, SIM: 0, Service: 0 };
+  getPendingActionRows().forEach((r) => {
+    const cat = taskFlow(r.task.type)?.category;
+    if (cat in counts) counts[cat] += 1;
+  });
+
+  const chip = (key, label) =>
+    `<button type="button" class="filter-chip ${pendingFilter === key ? "active" : ""}" data-filter="${key}">${label}</button>`;
+
+  let groups = [...groupsMap.values()];
+
+  // Category filter applies to which tasks are shown.
+  if (pendingFilter !== "all") {
+    groups = groups
+      .map((g) => ({ ...g, items: g.items.filter((it) => taskFlow(it.task.type)?.category === pendingFilter) }))
+      .filter((g) => g.items.length);
+  }
+
+  // A group is "active" if it still has a pending task. By default only
+  // active groups show (so completed tasks stay visible alongside their
+  // still-pending siblings, but fully-done vehicles drop off). The toggle
+  // reveals fully-completed vehicles too.
+  let visibleGroups = groups.filter((g) => showCompleted || g.items.some((it) => !isTaskDone(it.task)));
+  visibleGroups.sort((a, b) => new Date(b.latest) - new Date(a.latest));
+
+  const taskRow = (record, task, kind) => {
+    const flow = taskFlow(task.type);
+    const done = isTaskDone(task);
+    const dataKind = ` data-kind="${kind}"`;
+    const action = done
+      ? `<div class="vg-task-done">
+           <span class="badge badge-ok">✓ Completed${task.completedAt ? " · " + escapeHtml(formatDateTime(task.completedAt)) : ""}</span>
+           <button type="button" class="btn btn-outline btn-sm task-undo" data-record="${record.id}" data-task="${escapeHtml(task.id)}"${dataKind}>↩ Undo</button>
+         </div>`
+      : `<div class="vg-task-pending">
+           <span class="badge badge-warn">Pending</span>
+           <button type="button" class="btn btn-primary btn-sm task-complete" data-record="${record.id}" data-task="${escapeHtml(task.id)}"${dataKind}>✓ Complete</button>
+         </div>`;
+    const remarkLine = task.remark
+      ? `<div class="vg-task-remark has-remark">
+           <span class="remark-icon">📝</span>
+           <span class="remark-text">${escapeHtml(task.remark)}</span>
+           ${task.remarkBy ? `<span class="remark-meta">— ${escapeHtml(task.remarkBy)}</span>` : ""}
+           <button type="button" class="remark-btn task-remark" data-record="${record.id}" data-task="${escapeHtml(task.id)}"${dataKind}>Edit</button>
+         </div>`
+      : `<div class="vg-task-remark">
+           <button type="button" class="remark-btn task-remark" data-record="${record.id}" data-task="${escapeHtml(task.id)}"${dataKind}>+ Add remark</button>
+         </div>`;
+    return `
+      <div class="vg-task ${done ? "is-done" : ""}">
+        <div class="vg-task-body">
+          <div class="vg-task-main">
+            <span class="action-icon">${flow.icon}</span>
+            <span class="vg-task-label">${escapeHtml(flow.label)}</span>
+            <span class="vg-task-detail">${taskDetail(record, task, kind)}</span>
+            <span class="vg-task-date">${escapeHtml(formatDateTime(record.createdAt))}</span>
+          </div>
+          ${remarkLine}
+        </div>
+        ${action}
+      </div>`;
+  };
+
+  const groupsHtml = visibleGroups
+    .map((g) => {
+      const inst =
+        loadInstallations().find((i) => i.id === g.installationId) ||
+        loadInstallations().find((i) => i.vehicleNo.toLowerCase() === (g.vehicleNo || "").toLowerCase());
+      const editBtn = inst
+        ? `<button type="button" class="btn btn-outline btn-sm vg-edit" data-inst="${inst.id}">✎ Edit installation</button>`
+        : "";
+      const pendingItems = g.items.filter((it) => !isTaskDone(it.task));
+      const doneItems = g.items.filter((it) => isTaskDone(it.task));
+      const ordered = [...pendingItems, ...doneItems];
+      const tasksHtml = ordered.map(({ kind, record, task }) => taskRow(record, task, kind)).join("");
+      const doneBadge = doneItems.length ? `<span class="vg-count done">${doneItems.length} done</span>` : "";
+      const pendBadge = pendingItems.length
+        ? `<span class="vg-count">${pendingItems.length} pending</span>`
+        : `<span class="vg-count all-done">All done</span>`;
+      return `
+        <div class="vehicle-group">
+          <div class="vehicle-group-head">
+            <div class="vg-head-left">
+              <span class="vg-name">${escapeHtml(g.vehicleNo)}</span>
+              ${pendBadge}
+              ${doneBadge}
+            </div>
+            ${editBtn}
+          </div>
+          <div class="vg-tasks">${tasksHtml}</div>
+        </div>`;
+    })
+    .join("");
+
+  const emptyMsg = showCompleted
+    ? "No actions match this filter."
+    : totalPending === 0
+    ? "🎉 All actions completed. Toggle “Show completed” to review history."
+    : `No pending ${pendingFilter === "all" ? "" : pendingFilter + " "}actions.`;
+
+  return `
+    <section class="card alert-card">
+      <div class="section-heading">
+        <div>
+          <h2>⚠️ Pending Actions (${totalPending})</h2>
+          <p class="alert-desc">Grouped by vehicle. Tap <strong>Complete</strong> when a task is done — it stays here marked completed (use Undo to reopen).</p>
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm" id="exportPending">⬇ Export</button>
+      </div>
+      <div class="pending-filter">
+        ${chip("all", `All ${totalPending}`)}
+        ${chip("Portal", `🖥️ Portal ${counts.Portal}`)}
+        ${chip("SIM", `📵 SIM Deactivate ${counts.SIM}`)}
+        ${chip("Service", `🔧 Service ${counts.Service}`)}
+        <button type="button" class="filter-chip toggle-chip ${showCompleted ? "active" : ""}" id="toggleCompleted">
+          ${showCompleted ? "✓ " : ""}Show completed
+        </button>
+      </div>
+      ${visibleGroups.length ? groupsHtml : `<p class="muted">${emptyMsg}</p>`}
+    </section>
+  `;
+}
+
+/* ---------------- Vehicle timeline page ---------------- */
+
+function buildVehicleTimeline(inst) {
+  const events = [{ type: "install", date: inst.createdAt, by: inst.createdBy, inst }];
+  loadMaintenance()
+    .filter(
+      (m) =>
+        m.installationId === inst.id ||
+        m.vehicleNo.toLowerCase() === inst.vehicleNo.toLowerCase()
+    )
+    .forEach((m) => events.push({ type: "repair", date: m.createdAt, by: m.createdBy, record: m }));
+  events.sort((a, b) => new Date(a.date) - new Date(b.date));
+  return events;
+}
+
+/* ---------------- Page: Deletion audit log ---------------- */
+
+let deletionLogQuery = "";
+let deletionLogTypeFilter = "all";
+let deletionLogUserFilter = "all";
+
+function renderDeletionsPage() {
+  const log = deletionLog;
+
+  // Counts by entity type
+  const counts = {
+    installation: 0,
+    maintenance: 0,
+    stock_item: 0,
+    sim: 0,
+    category: 0,
+    supplier: 0,
+    other: 0,
+  };
+  const userCounts = {};
+  for (const d of log) {
+    if (counts[d.entityType] != null) counts[d.entityType] += 1;
+    else counts.other += 1;
+    userCounts[d.deletedBy || "unknown"] = (userCounts[d.deletedBy || "unknown"] || 0) + 1;
+  }
+
+  const typeIcon = {
+    installation: "🆕",
+    maintenance: "🔧",
+    stock_item: "📦",
+    sim: "📶",
+    category: "🏷️",
+    supplier: "🏪",
+  };
+  const typeLabel = {
+    installation: "Installation",
+    maintenance: "Repair",
+    stock_item: "Stock item",
+    sim: "SIM",
+    category: "Category",
+    supplier: "Supplier",
+  };
+
+  // Apply filters
+  let filtered = log;
+  if (deletionLogTypeFilter !== "all") {
+    filtered = filtered.filter((d) => d.entityType === deletionLogTypeFilter);
+  }
+  if (deletionLogUserFilter !== "all") {
+    filtered = filtered.filter((d) => d.deletedBy === deletionLogUserFilter);
+  }
+  if (deletionLogQuery) {
+    const q = deletionLogQuery.toLowerCase();
+    filtered = filtered.filter((d) => {
+      const hay = `${d.entityLabel || ""} ${d.reason || ""} ${d.deletedBy || ""} ${d.entityType || ""}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }
+
+  app.innerHTML = `
+    ${renderHeader("Deleted Logs", "Every delete action with reason + snapshot")}
+    <main class="main">
+      ${renderAdminNav("deletions")}
+      <div class="summary-grid">
+        <div class="summary-box summary-danger"><strong>${log.length}</strong><span>Total deleted</span></div>
+        <div class="summary-box summary-warn"><strong>${counts.installation}</strong><span>Installations</span></div>
+        <div class="summary-box summary-warn"><strong>${counts.maintenance}</strong><span>Repairs</span></div>
+        <div class="summary-box"><strong>${counts.stock_item}</strong><span>Stock items</span></div>
+        <div class="summary-box"><strong>${counts.sim + counts.category + counts.supplier + counts.other}</strong><span>Others</span></div>
+      </div>
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>All deletions (${filtered.length} of ${log.length})</h2>
+            <p class="section-subtitle">Newest first. This log is immutable — even if the row is deleted from its main table, the deletion record stays here for accountability.</p>
+          </div>
+          ${!deletionLogTableReady ? `<span class="badge badge-warn">deletion_log table missing — run migration</span>` : ""}
+        </div>
+
+        <input type="search" class="sticky-search" id="deletionSearch" placeholder="Search by vehicle, IMEI, reason, user..." value="${escapeHtml(deletionLogQuery)}" autocomplete="off" />
+
+        <div class="filter-row" style="margin-top: 0.7rem;">
+          <label class="filter-group">
+            <span class="filter-label">Type:</span>
+            <select id="deletionTypeFilter">
+              <option value="all" ${deletionLogTypeFilter === "all" ? "selected" : ""}>All types</option>
+              <option value="installation" ${deletionLogTypeFilter === "installation" ? "selected" : ""}>🆕 Installations (${counts.installation})</option>
+              <option value="maintenance" ${deletionLogTypeFilter === "maintenance" ? "selected" : ""}>🔧 Repairs (${counts.maintenance})</option>
+              <option value="stock_item" ${deletionLogTypeFilter === "stock_item" ? "selected" : ""}>📦 Stock (${counts.stock_item})</option>
+              <option value="sim" ${deletionLogTypeFilter === "sim" ? "selected" : ""}>📶 SIM (${counts.sim})</option>
+              <option value="category" ${deletionLogTypeFilter === "category" ? "selected" : ""}>🏷️ Category (${counts.category})</option>
+              <option value="supplier" ${deletionLogTypeFilter === "supplier" ? "selected" : ""}>🏪 Supplier (${counts.supplier})</option>
+            </select>
+          </label>
+          <label class="filter-group">
+            <span class="filter-label">By:</span>
+            <select id="deletionUserFilter">
+              <option value="all" ${deletionLogUserFilter === "all" ? "selected" : ""}>All users</option>
+              ${Object.keys(userCounts).map((u) => `
+                <option value="${escapeHtml(u)}" ${deletionLogUserFilter === u ? "selected" : ""}>${escapeHtml(u)} (${userCounts[u]})</option>
+              `).join("")}
+            </select>
+          </label>
+          ${(deletionLogTypeFilter !== "all" || deletionLogUserFilter !== "all" || deletionLogQuery) ? `
+            <button type="button" class="btn btn-secondary btn-sm" id="clearDeletionFilters">✕ Clear</button>
+          ` : ""}
+        </div>
+
+        <!-- Desktop table -->
+        <div class="table-wrap deletion-table-desktop">
+          <table>
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Type</th>
+                <th>What was deleted</th>
+                <th>Reason</th>
+                <th>By</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filtered.length
+                ? filtered
+                    .map(
+                      (d) => `
+                        <tr>
+                          <td class="date-cell">${escapeHtml(formatDateTime(d.deletedAt))}</td>
+                          <td>
+                            <span class="cat-pill" title="${escapeHtml(d.entityType)}">
+                              ${typeIcon[d.entityType] || "🗑️"} ${escapeHtml(typeLabel[d.entityType] || d.entityType)}
+                            </span>
+                          </td>
+                          <td class="mono">${escapeHtml(d.entityLabel || d.entityId || "—")}</td>
+                          <td><span class="reason-text">${escapeHtml(d.reason || "—")}</span></td>
+                          <td>${escapeHtml(d.deletedBy || "—")}</td>
+                          <td>
+                            <button type="button" class="btn btn-outline btn-sm view-snapshot-btn" data-deletion-id="${escapeHtml(d.id)}">👁 Snapshot</button>
+                          </td>
+                        </tr>`
+                    )
+                    .join("")
+                : `<tr class="empty-row"><td colspan="6">No deletions match your filters.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Mobile cards -->
+        <div class="deletion-card-grid">
+          ${filtered.length
+            ? filtered.map((d) => `
+              <article class="tk-card deletion-card">
+                <div class="tk-card-head">
+                  <span class="tk-pill tk-pill-deleted">${typeIcon[d.entityType] || "🗑️"} ${escapeHtml(typeLabel[d.entityType] || d.entityType)}</span>
+                  <span class="tk-chip tk-chip-deleted">🗑 by ${escapeHtml(d.deletedBy || "?")}</span>
+                </div>
+                <div class="deletion-card-body">
+                  <div class="del-row">
+                    <span class="del-label">What:</span>
+                    <span class="del-value mono">${escapeHtml(d.entityLabel || d.entityId || "—")}</span>
+                  </div>
+                  <div class="del-row">
+                    <span class="del-label">Reason:</span>
+                    <span class="del-value">${escapeHtml(d.reason || "—")}</span>
+                  </div>
+                  <div class="del-row">
+                    <span class="del-label">When:</span>
+                    <span class="del-value">${escapeHtml(formatDateTime(d.deletedAt))}</span>
+                  </div>
+                </div>
+                <div class="tk-actions">
+                  <button type="button" class="btn btn-outline btn-sm view-snapshot-btn" data-deletion-id="${escapeHtml(d.id)}">👁 View Snapshot</button>
+                </div>
+              </article>
+            `).join("")
+            : `<div class="entry-empty">
+                <div class="entry-empty-icon">🗑️</div>
+                <h3>No deletions found</h3>
+                <p>${log.length === 0 ? "Nothing has been deleted yet." : "Try adjusting your filters."}</p>
+              </div>`
+          }
+        </div>
+      </section>
+    </main>
+  `;
+  bindAdminNav();
+  bindLogout();
+
+  document.getElementById("deletionSearch")?.addEventListener("input", (e) => {
+    deletionLogQuery = e.target.value;
+    render();
+  });
+  document.getElementById("deletionTypeFilter")?.addEventListener("change", (e) => {
+    deletionLogTypeFilter = e.target.value;
+    render();
+  });
+  document.getElementById("deletionUserFilter")?.addEventListener("change", (e) => {
+    deletionLogUserFilter = e.target.value;
+    render();
+  });
+  document.getElementById("clearDeletionFilters")?.addEventListener("click", () => {
+    deletionLogQuery = "";
+    deletionLogTypeFilter = "all";
+    deletionLogUserFilter = "all";
+    render();
+  });
+  app.querySelectorAll(".view-snapshot-btn").forEach((btn) => {
+    btn.addEventListener("click", () => openSnapshotModal(btn.dataset.deletionId));
+  });
+}
+
+function openSnapshotModal(deletionId) {
+  const d = deletionLog.find((x) => x.id === deletionId);
+  if (!d) return;
+  const snap = d.snapshot || {};
+  const typeLabel = {
+    installation: "Installation",
+    maintenance: "Repair",
+    stock_item: "Stock Item",
+    sim: "SIM",
+    category: "Category",
+    supplier: "Supplier",
+  };
+  modal.innerHTML = `
+    <h3>📸 Snapshot — ${escapeHtml(typeLabel[d.entityType] || d.entityType)}</h3>
+    <p class="modal-desc">Full data of what was deleted. This is from the audit log — the actual row no longer exists in the database.</p>
+
+    <div class="snapshot-meta-grid">
+      <div class="snap-meta"><span>What:</span><strong>${escapeHtml(d.entityLabel || d.entityId)}</strong></div>
+      <div class="snap-meta"><span>Deleted by:</span><strong>${escapeHtml(d.deletedBy || "?")}</strong></div>
+      <div class="snap-meta"><span>When:</span><strong>${escapeHtml(formatDateTime(d.deletedAt))}</strong></div>
+      <div class="snap-meta"><span>Reason:</span><strong>${escapeHtml(d.reason || "—")}</strong></div>
+    </div>
+
+    <h4 style="margin-top: 1rem; margin-bottom: 0.4rem;">Snapshot data:</h4>
+    <pre class="snapshot-json">${escapeHtml(JSON.stringify(snap, null, 2))}</pre>
+
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Close</button>
+      <button type="button" class="btn btn-outline" id="copySnapshot">⎘ Copy JSON</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  document.getElementById("copySnapshot")?.addEventListener("click", () => {
+    const text = JSON.stringify(snap, null, 2);
+    try {
+      navigator.clipboard.writeText(text);
+      showToast("✓ JSON copied to clipboard");
+    } catch {
+      showToast("Copy failed", true);
+    }
+  });
+}
+
+function openVehicleTimelineModal(installationId) {
+  const inst = loadInstallations().find((i) => i.id === installationId);
+  if (!inst) return;
+  const events = buildVehicleTimeline(inst);
+  const eventsHtml = events
+    .map((ev) => {
+      if (ev.type === "install") {
+        const i = ev.inst;
+        const primary = resolvePrimarySim(getCurrentSim(i));
+        const detail = `IMEI ${i.imeiHistory[0]?.value || "—"} · SIM ${primary || i.simHistory[0]?.value || "—"} · ${escapeHtml(i.gpsModel)} · MAC ${escapeHtml(i.macId)} · Sensor ${escapeHtml(i.sensorNo)}`;
+        return `
+          <li class="tl-event tl-install">
+            <span class="tl-dot"></span>
+            <div class="tl-body">
+              <div class="tl-title"><span class="badge badge-ok">Installed</span></div>
+              <div class="tl-detail">${detail}</div>
+              <div class="tl-date">${escapeHtml(formatDateTime(ev.date))}${ev.by ? " · by " + escapeHtml(ev.by) : ""}</div>
+            </div>
+          </li>`;
+      }
+      const m = ev.record;
+      return `
+        <li class="tl-event tl-repair">
+          <span class="tl-dot"></span>
+          <div class="tl-body">
+            <div class="tl-title"><span class="badge badge-repair">Repair</span></div>
+            <div class="tl-detail">${escapeHtml(workLabels(m))}${m.otherWorkText ? " · " + escapeHtml(m.otherWorkText) : ""}</div>
+            <div class="tl-date">${escapeHtml(formatDateTime(ev.date))}${m.createdBy ? " · by " + escapeHtml(m.createdBy) : ""}</div>
+          </div>
+        </li>`;
+    })
+    .join("");
+
+  modal.innerHTML = `
+    <h3>📅 Timeline · <span class="mono">${escapeHtml(inst.vehicleNo)}</span></h3>
+    <p class="modal-desc">${events.length} event${events.length === 1 ? "" : "s"} — newest at the bottom.</p>
+    <div class="tl-modal-body">
+      <ul class="tl-events">${eventsHtml || `<li class="muted">No events recorded.</li>`}</ul>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="close">Close</button>
+    </div>
+  `;
+  modal.classList.add("modal-wide");
+  modalOverlay.classList.remove("hidden");
+  const onClose = () => {
+    modal.classList.remove("modal-wide");
+    closeModal();
+  };
+  modal.querySelector('[data-act="close"]').onclick = onClose;
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) onClose(); };
+}
+
+function renderTimeline() {
+  const q = timelineQuery.toLowerCase().trim();
+  const allInstalls = loadInstallations();
+
+  let matches = allInstalls.filter((inst) => {
     if (!q) return true;
     const hay = [
-      i.vehicleNo,
-      i.gpsModel,
-      i.macId,
-      i.sensorNo,
-      ...i.imeiHistory.map((h) => h.value),
-      ...i.simHistory.map((s) => s.value),
+      inst.vehicleNo,
+      inst.gpsModel,
+      inst.secondarySim || "",
+      ...inst.imeiHistory.map((h) => h.value),
+      ...inst.simHistory.map((s) => s.value),
     ]
       .join(" ")
       .toLowerCase();
     return hay.includes(q);
   });
 
-  const filteredMaint = maintenance.filter((m) => {
-    if (!q) return true;
-    return [m.imei, m.vehicleNo, m.newSimNo, m.newImei, workLabels(m)]
-      .join(" ")
-      .toLowerCase()
-      .includes(q);
-  });
+  // Most recently active vehicles first.
+  const lastActivity = (inst) => {
+    const ev = buildVehicleTimeline(inst);
+    return ev.length ? ev[ev.length - 1].date : inst.createdAt;
+  };
+  matches.sort((a, b) => new Date(lastActivity(b)) - new Date(lastActivity(a)));
+
+  const CAP = 40;
+  const shown = matches.slice(0, CAP);
+  const more = matches.length - shown.length;
+
+  const cardsHtml = shown
+    .map((inst) => {
+      const events = buildVehicleTimeline(inst);
+      const eventsHtml = events
+        .map((ev) => {
+          if (ev.type === "install") {
+            const i = ev.inst;
+            const detail = `IMEI ${i.imeiHistory[0]?.value || "—"} · SIM ${i.simHistory[0]?.value || "—"} · ${escapeHtml(i.gpsModel)} · MAC ${escapeHtml(i.macId)} · Sensor ${escapeHtml(i.sensorNo)}`;
+            return `
+              <li class="tl-event tl-install">
+                <span class="tl-dot"></span>
+                <div class="tl-body">
+                  <div class="tl-title"><span class="badge badge-ok">Installed</span></div>
+                  <div class="tl-detail">${detail}</div>
+                  <div class="tl-date">${escapeHtml(formatDateTime(ev.date))}${ev.by ? " · by " + escapeHtml(ev.by) : ""}</div>
+                </div>
+              </li>`;
+          }
+          const m = ev.record;
+          return `
+            <li class="tl-event tl-repair">
+              <span class="tl-dot"></span>
+              <div class="tl-body">
+                <div class="tl-title"><span class="badge badge-repair">Repair</span></div>
+                <div class="tl-detail">${escapeHtml(workLabels(m))}</div>
+                <div class="tl-date">${escapeHtml(formatDateTime(ev.date))}${m.createdBy ? " · by " + escapeHtml(m.createdBy) : ""}</div>
+              </div>
+            </li>`;
+        })
+        .join("");
+
+      const curImei = getCurrentImei(inst);
+      const curSim = getCurrentSim(inst);
+      return `
+        <div class="timeline-card">
+          <div class="timeline-head">
+            <div class="vg-head-left">
+              <span class="vg-name">${escapeHtml(inst.vehicleNo)}</span>
+              <span class="tl-count">${events.length} event${events.length === 1 ? "" : "s"}</span>
+            </div>
+            <div class="tl-meta">
+              <span class="mono">${escapeHtml(curImei)}</span> · SIM <span class="mono">${escapeHtml(curSim)}</span>
+            </div>
+          </div>
+          <ol class="timeline">${eventsHtml}</ol>
+        </div>`;
+    })
+    .join("");
 
   app.innerHTML = `
-    ${renderHeader("Admin Portal", "View all installations and repair work")}
+    ${renderHeader("Vehicle Timeline", "Installation & repair history per vehicle")}
     <main class="main">
-      ${
-        pending.length
-          ? `<section class="card alert-card">
-              <h2>⚠️ Pending SIM Deactivations (${pending.length})</h2>
-              <p class="alert-desc">Old SIM must be deactivated after SIM change repair work.</p>
-              <div class="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Date</th>
-                      <th>Vehicle</th>
-                      <th>Old SIM</th>
-                      <th>New SIM</th>
-                      <th>Action</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${pending
-                      .map(
-                        (m) => `
-                      <tr>
-                        <td class="date-cell">${escapeHtml(formatDateTime(m.createdAt))}</td>
-                        <td>${escapeHtml(m.vehicleNo)}</td>
-                        <td>${escapeHtml(m.oldSimNo || "—")}</td>
-                        <td>${escapeHtml(m.newSimNo || "—")}</td>
-                        <td>
-                          <button type="button" class="btn btn-primary btn-sm deactivate-btn" data-id="${m.id}">
-                            Mark SIM Deactivated
-                          </button>
-                        </td>
-                      </tr>`
-                      )
-                      .join("")}
-                  </tbody>
-                </table>
-              </div>
-            </section>`
-          : ""
-      }
-
+      ${renderAdminNav("timeline")}
       <section class="card">
-        <div class="admin-tabs">
-          <button type="button" class="tab-btn ${adminTab === "installations" ? "active" : ""}" data-tab="installations">
-            Installations (${installations.length})
-          </button>
-          <button type="button" class="tab-btn ${adminTab === "maintenance" ? "active" : ""}" data-tab="maintenance">
-            Repair Work (${maintenance.length})
-          </button>
+        <div class="section-heading">
+          <div>
+            <h2>Vehicle Timeline</h2>
+            <p class="section-subtitle">Search or pick a vehicle to see when it was installed and every repair since.</p>
+          </div>
         </div>
-        <div class="list-tools admin-search">
-          <input type="search" id="adminSearch" placeholder="Search..." value="${escapeHtml(searchQuery)}" />
+        <div class="timeline-search">
+          <input type="search" id="timelineSearch" list="tlVehicles" placeholder="Search or select vehicle (name, IMEI, SIM)..." value="${escapeHtml(timelineQuery)}" autocomplete="off" />
+          <datalist id="tlVehicles">
+            ${allInstalls.map((i) => `<option value="${escapeHtml(i.vehicleNo)}">${escapeHtml(getCurrentImei(i))}</option>`).join("")}
+          </datalist>
+          ${timelineQuery ? `<button type="button" class="btn btn-secondary btn-sm" id="timelineClear">Clear</button>` : ""}
         </div>
-
-        ${
-          adminTab === "installations"
-            ? `<div class="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Date</th>
-                      <th>Vehicle</th>
-                      <th>GPS Model</th>
-                      <th>MAC ID</th>
-                      <th>Sensor</th>
-                      <th>IMEI History</th>
-                      <th>SIM History</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${
-                      filteredInstalls.length
-                        ? filteredInstalls
-                            .map(
-                              (i) => `
-                        <tr>
-                          <td class="date-cell">${escapeHtml(formatDateTime(i.createdAt))}</td>
-                          <td>${escapeHtml(i.vehicleNo)}</td>
-                          <td>${escapeHtml(i.gpsModel)}</td>
-                          <td>${escapeHtml(i.macId)}</td>
-                          <td>${escapeHtml(i.sensorNo)}</td>
-                          <td class="history-cell">${historyList(i.imeiHistory)}</td>
-                          <td class="history-cell">${historyList(i.simHistory)}</td>
-                        </tr>`
-                            )
-                            .join("")
-                        : `<tr class="empty-row"><td colspan="7">No installations found.</td></tr>`
-                    }
-                  </tbody>
-                </table>
-              </div>`
-            : `<div class="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Date</th>
-                      <th>Vehicle</th>
-                      <th>IMEI</th>
-                      <th>Work Done</th>
-                      <th>Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${
-                      filteredMaint.length
-                        ? filteredMaint
-                            .map(
-                              (m) => `
-                        <tr>
-                          <td class="date-cell">${escapeHtml(formatDateTime(m.createdAt))}</td>
-                          <td>${escapeHtml(m.vehicleNo)}</td>
-                          <td>${escapeHtml(m.imei)}</td>
-                          <td>${escapeHtml(workLabels(m))}</td>
-                          <td class="status-cell">${getMaintenanceStatus(m)}</td>
-                        </tr>`
-                            )
-                            .join("")
-                        : `<tr class="empty-row"><td colspan="5">No repair records found.</td></tr>`
-                    }
-                  </tbody>
-                </table>
-              </div>`
-        }
+        <p class="section-subtitle tl-resultcount">${matches.length} vehicle${matches.length === 1 ? "" : "s"}${more > 0 ? ` · showing first ${CAP}, narrow your search to see the rest` : ""}</p>
+        ${shown.length ? cardsHtml : `<p class="muted">No vehicles match "${escapeHtml(timelineQuery)}".</p>`}
       </section>
     </main>
   `;
 
   bindLogout();
+  bindAdminNav();
 
-  app.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      adminTab = btn.dataset.tab;
-      render();
+  const searchEl = document.getElementById("timelineSearch");
+  searchEl?.addEventListener("input", (e) => {
+    timelineQuery = e.target.value;
+    // Re-render but keep focus + caret on the search box.
+    render();
+    const el = document.getElementById("timelineSearch");
+    if (el) {
+      el.focus();
+      const v = el.value;
+      el.setSelectionRange(v.length, v.length);
+    }
+  });
+  document.getElementById("timelineClear")?.addEventListener("click", () => {
+    timelineQuery = "";
+    setView("timeline");
+  });
+}
+
+/* ============================================================
+   ADMIN PAGE FRAMEWORK
+   ============================================================ */
+
+const ADMIN_NAV = [
+  { key: "dashboard",     view: "dashboard",     icon: "⌂", label: "Home",      labelLong: "Home" },
+  { key: "installations", view: "installations", icon: "⊞", label: "Installs",  labelLong: "Installations" },
+  { key: "repairs",       view: "repairs",       icon: "⚒", label: "Repairs",   labelLong: "Repair Work" },
+  { key: "pending",       view: "pending",       icon: "◷", label: "Progress",  labelLong: "Repair Progress" },
+  { key: "sim-db",        view: "sim-db",        icon: "≣", label: "SIMs",      labelLong: "SIM Database" },
+  { key: "stock",         view: "stock",         icon: "▦", label: "Stock",     labelLong: "Stock" },
+  { key: "accounts",      view: "accounts",      icon: "₹", label: "Accounts",  labelLong: "Accounts" },
+  { key: "renewals",      view: "renewals",      icon: "📅", label: "Renewals", labelLong: "Renewal Tracker" },
+];
+
+// Returns nav items the current user can access
+function navForCurrentUser() {
+  const perms = getUserPerms(currentUser);
+  if (!perms) return [];
+  if (perms.isAdmin) return ADMIN_NAV;
+  return ADMIN_NAV.filter((n) => (perms.allowedPages || []).includes(n.key));
+}
+
+function renderAdminNav(activeKey) {
+  const navItems = navForCurrentUser();
+  const perms = getUserPerms(currentUser);
+  return `
+    <div class="admin-nav">${navItems.map(
+      (n) =>
+        `<button type="button" class="nav-pill ${n.key === activeKey ? "active" : ""}" data-nav="${n.view}">
+          <span class="nav-icon">${n.icon}</span>
+          <span class="nav-label-short">${escapeHtml(n.label)}</span>
+          <span class="nav-label-long">${escapeHtml(n.labelLong)}</span>
+        </button>`
+    ).join("")}</div>
+    ${perms?.isAdmin ? `
+      <div class="admin-footer-nav">
+        <button type="button" class="nav-link-sm ${activeKey === "timeline" ? "active" : ""}" data-nav="timeline">📅 Vehicle Timeline</button>
+        <span class="nav-sep">·</span>
+        <button type="button" class="nav-link-sm ${activeKey === "deletions" ? "active" : ""}" data-nav="deletions">🗑️ Deletion Audit Log${deletionLog.length ? ` (${deletionLog.length})` : ""}</button>
+        <span class="nav-sep">·</span>
+        <button type="button" class="nav-link-sm ${activeKey === "user-access" ? "active" : ""}" data-nav="user-access">👥 User Access</button>
+      </div>
+    ` : ""}
+    ${renderMobileBottomBar(activeKey)}
+  `;
+}
+
+// Bottom tab bar for mobile only (hidden on desktop via CSS).
+// 5 most-used tabs: Home, Installs, Repairs, Progress, Stock.
+// Additional tabs (SIM DB, Timeline, Deletions) accessible via "More" sheet.
+function renderMobileBottomBar(activeKey) {
+  const PRIMARY = [
+    { key: "dashboard", view: "dashboard", icon: "🏠", label: "Home" },
+    { key: "installations", view: "installations", icon: "🚛", label: "Installs" },
+    { key: "repairs", view: "repairs", icon: "🛠️", label: "Repairs" },
+    { key: "pending", view: "pending", icon: "⚙️", label: "Progress" },
+    { key: "sim-db", view: "sim-db", icon: "📶", label: "SIMs" },
+  ];
+  // Show pending count badge on the Progress tab if non-zero.
+  const pendingCount = (() => {
+    try {
+      return getPendingActionRows().length;
+    } catch {
+      return 0;
+    }
+  })();
+  return `
+    <nav class="bottom-tab-bar" aria-label="Primary mobile navigation">
+      ${PRIMARY.map(
+        (t) => `
+          <button type="button" class="bt-tab ${t.key === activeKey ? "active" : ""}" data-nav="${t.view}">
+            <span class="bt-icon">${t.icon}</span>
+            <span class="bt-label">${t.label}</span>
+            ${t.key === "pending" && pendingCount ? `<span class="bt-badge">${pendingCount}</span>` : ""}
+          </button>
+        `
+      ).join("")}
+      <button type="button" class="bt-tab" data-act="more-sheet">
+        <span class="bt-icon">⋯</span>
+        <span class="bt-label">More</span>
+      </button>
+    </nav>
+  `;
+}
+
+// Bottom sheet ("More" menu on mobile) — Stock, Timeline, Audit, Logout.
+function openMoreSheet() {
+  modal.innerHTML = `
+    <h3 class="sheet-title">⋯ More</h3>
+    <div class="sheet-grid">
+      <button type="button" class="sheet-item" data-nav="stock">
+        <span class="sheet-icon">📦</span>
+        <span class="sheet-label">Stock</span>
+      </button>
+      <button type="button" class="sheet-item" data-nav="timeline">
+        <span class="sheet-icon">📅</span>
+        <span class="sheet-label">Vehicle Timeline</span>
+      </button>
+      <button type="button" class="sheet-item" data-nav="deletions">
+        <span class="sheet-icon">🗑️</span>
+        <span class="sheet-label">Audit Log${deletionLog.length ? ` (${deletionLog.length})` : ""}</span>
+      </button>
+      <button type="button" class="sheet-item sheet-danger" data-act="logout">
+        <span class="sheet-icon">↩️</span>
+        <span class="sheet-label">Logout</span>
+      </button>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary btn-block" data-act="close">Close</button>
+    </div>
+  `;
+  modal.classList.add("modal-sheet");
+  modalOverlay.classList.remove("hidden");
+  const close = () => {
+    modal.classList.remove("modal-sheet");
+    closeModal();
+  };
+  modal.querySelector('[data-act="close"]').onclick = close;
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) close(); };
+  modal.querySelectorAll("[data-nav]").forEach((b) =>
+    b.addEventListener("click", () => {
+      close();
+      setView(b.dataset.nav);
+    })
+  );
+  modal.querySelector('[data-act="logout"]').onclick = () => {
+    close();
+    currentUser = null;
+    setView("login");
+  };
+}
+
+function bindAdminNav() {
+  app.querySelectorAll("[data-nav]").forEach((btn) => {
+    btn.addEventListener("click", () => setView(btn.dataset.nav));
+  });
+  app.querySelectorAll('[data-act="more-sheet"]').forEach((btn) => {
+    btn.addEventListener("click", openMoreSheet);
+  });
+}
+
+/* ---------------- Page 1: Dashboard ---------------- */
+
+function renderDashboard() {
+  const allInstalls = loadInstallations();
+  const allMaint = loadMaintenance();
+  const pendingCount = getPendingActionRows().length;
+  const allSims = loadSims();
+  const pendingPrimary = allSims.filter((s) => !s.primaryNumber).length;
+  const inUseSims = allSims.filter((s) => {
+    const v = (s.primaryNumber || s.secondaryNumber || "").toLowerCase();
+    if (!v) return false;
+    return allInstalls.some((inst) =>
+      inst.simHistory.some(
+        (h) => h.active && (h.value || "").toLowerCase() === v
+      )
+    );
+  }).length;
+  const allStock = loadStockItems();
+  const lowStock = allStock.filter(
+    (i) =>
+      !isTrackableCategory(i.category) &&
+      i.lowStockThreshold != null &&
+      i.quantity <= i.lowStockThreshold
+  ).length;
+  const totalUnits = allStock.reduce((s, i) => s + (i.quantity || 0), 0);
+  const allDeletions = deletionLog;
+
+  // Pending tasks breakdown — by consolidated category.
+  const pendingRows = getPendingActionRows();
+  const pendingByCategory = { Portal: 0, SIM: 0, Service: 0 };
+  for (const row of pendingRows) {
+    const cat = taskFlow(row.task?.type)?.category;
+    if (cat && pendingByCategory[cat] != null) pendingByCategory[cat] += 1;
+  }
+
+  // ===== Donut chart segments =====
+
+  // 1) Fleet status — Installations grouped by GPS model (top 5)
+  // Normalize known model strings so "fmb"/"FMB"/"Fmb" all count as "FMB"
+  function normalizeModel(raw) {
+    let m = String(raw || "").trim();
+    if (!m) return "Unknown";
+    const lower = m.toLowerCase();
+    if (lower === "fmb") return "FMB";
+    if (lower === "fmc") return "FMC";
+    if (lower === "normal") return "Normal";
+    return m;
+  }
+  const modelCounts = {};
+  for (const inst of allInstalls) {
+    const m = normalizeModel(inst.gpsModel);
+    modelCounts[m] = (modelCounts[m] || 0) + 1;
+  }
+  const MODEL_COLORS = ["#f97316", "#facc15", "#3b82f6", "#10b981", "#a855f7", "#ef4444", "#0891b2", "#64748b"];
+  const modelEntries = Object.entries(modelCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6);
+  const installSegments = modelEntries.map(([label, value], i) => ({
+    label,
+    value,
+    color: MODEL_COLORS[i % MODEL_COLORS.length],
+  }));
+
+  // 2) SIM status — categorize SIMs
+  const simStatus = {
+    "In Use": 0,
+    "Available": 0,
+    "Pending Primary": 0,
+    "Looks Swapped": 0,
+  };
+  const inUseSet = new Set();
+  for (const inst of allInstalls) {
+    for (const h of inst.simHistory) {
+      if (h.active && h.value) inUseSet.add(h.value.toLowerCase());
+    }
+  }
+  for (const s of allSims) {
+    const pri = (s.primaryNumber || "").toLowerCase();
+    const sec = (s.secondaryNumber || "").toLowerCase();
+    const isInUse = (pri && inUseSet.has(pri)) || (sec && inUseSet.has(sec));
+    if (!s.primaryNumber) simStatus["Pending Primary"] += 1;
+    else if (digitsOnly(s.primaryNumber).length >= 18 && digitsOnly(s.secondaryNumber || "").length <= 14) simStatus["Looks Swapped"] += 1;
+    else if (isInUse) simStatus["In Use"] += 1;
+    else simStatus["Available"] += 1;
+  }
+  const simSegments = [
+    { label: "Available", value: simStatus["Available"], color: "#10b981" },
+    { label: "In Use", value: simStatus["In Use"], color: "#3b82f6" },
+    { label: "Pending Primary", value: simStatus["Pending Primary"], color: "#f59e0b" },
+    { label: "Looks Swapped", value: simStatus["Looks Swapped"], color: "#ef4444" },
+  ];
+
+  // 3) Repair Progress — by category
+  const repairSegments = [
+    { label: "Portal updates", value: pendingByCategory.Portal, color: "#0891b2" },
+    { label: "SIM Deactivations", value: pendingByCategory.SIM, color: "#a855f7" },
+    { label: "Service items", value: pendingByCategory.Service, color: "#f97316" },
+  ];
+
+  // 4) Top vehicles by repair count (for horizontal bar chart)
+  const vehicleRepairCounts = {};
+  for (const m of allMaint) {
+    const v = m.vehicleNo;
+    if (!v) continue;
+    vehicleRepairCounts[v] = (vehicleRepairCounts[v] || 0) + 1;
+  }
+  const topVehicles = Object.entries(vehicleRepairCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([label, value], i) => ({
+      label,
+      value,
+      color: ["#0891b2", "#06b6d4", "#22d3ee", "#67e8f9", "#a5f3fc", "#cffafe"][i],
+    }));
+
+  // 5) Devices currently out for service (Trakzee-style "Faulty Devices" card)
+  // A maintenance entry with deviceOutForRepair / sensorOutForRepair flag
+  // and NO subsequent install/repair on the same vehicle indicating return.
+  const devicesOut = [];
+  for (const m of allMaint) {
+    if (!m.deviceOutForRepair && !m.sensorOutForRepair) continue;
+    // Check if any later record on the same vehicle indicates a return
+    // (a new device install or sensor return). Simple heuristic: any later
+    // repair / install with newImei or new sensor.
+    const laterReturn = allMaint
+      .concat(allInstalls.map((i) => ({ vehicleNo: i.vehicleNo, createdAt: i.createdAt, newImei: getCurrentImei(i) })))
+      .find((r) =>
+        r.vehicleNo === m.vehicleNo &&
+        new Date(r.createdAt) > new Date(m.createdAt) &&
+        (r.newImei || r.deviceChange)
+      );
+    if (laterReturn) continue;
+    devicesOut.push({
+      vehicleNo: m.vehicleNo,
+      itemType: m.deviceOutForRepair ? "Device" : "Sensor",
+      identifier: m.deviceOutForRepair ? (m.oldImei || "—") : "—",
+      sentDate: m.createdAt,
+    });
+  }
+  devicesOut.sort((a, b) => new Date(b.sentDate) - new Date(a.sentDate));
+
+  // 6) Vehicles by repair age — when was the last repair done on each vehicle.
+  // Buckets: > 90 days, > 60, > 30, > 15, > 7 (and "active" = within last 7).
+  const now = Date.now();
+  const lastRepairByVehicle = {};
+  for (const m of allMaint) {
+    const t = new Date(m.createdAt).getTime();
+    if (!lastRepairByVehicle[m.vehicleNo] || t > lastRepairByVehicle[m.vehicleNo]) {
+      lastRepairByVehicle[m.vehicleNo] = t;
+    }
+  }
+  // For vehicles without any repair, use install date.
+  for (const inst of allInstalls) {
+    if (!(inst.vehicleNo in lastRepairByVehicle)) {
+      lastRepairByVehicle[inst.vehicleNo] = new Date(inst.createdAt).getTime();
+    }
+  }
+  const ageBuckets = { ">90": [], ">60": [], ">30": [], ">15": [], ">7": [] };
+  for (const [vehicleNo, lastTs] of Object.entries(lastRepairByVehicle)) {
+    const days = Math.floor((now - lastTs) / (24 * 60 * 60 * 1000));
+    const entry = { vehicleNo, lastTs, days };
+    if (days > 90) ageBuckets[">90"].push(entry);
+    else if (days > 60) ageBuckets[">60"].push(entry);
+    else if (days > 30) ageBuckets[">30"].push(entry);
+    else if (days > 15) ageBuckets[">15"].push(entry);
+    else if (days > 7) ageBuckets[">7"].push(entry);
+  }
+  // Sort each bucket by oldest (longest inactive) first
+  for (const k in ageBuckets) {
+    ageBuckets[k].sort((a, b) => b.days - a.days);
+  }
+  // Stash for the modal handler
+  window._lastActivityBuckets = ageBuckets;
+
+  const ageBars = [
+    { label: "> 90 days", value: ageBuckets[">90"].length, color: "#dc2626", bucket: ">90" },
+    { label: "> 60 days", value: ageBuckets[">60"].length, color: "#ea580c", bucket: ">60" },
+    { label: "> 30 days", value: ageBuckets[">30"].length, color: "#f59e0b", bucket: ">30" },
+    { label: "> 15 days", value: ageBuckets[">15"].length, color: "#0ea5e9", bucket: ">15" },
+    { label: "> 7 days",  value: ageBuckets[">7"].length,  color: "#10b981", bucket: ">7" },
+  ];
+
+  // Recent activity feed (top 12 events across installs, repairs, deletions)
+  const events = [
+    ...allInstalls.map((i) => ({
+      kind: "install",
+      at: i.createdAt,
+      title: i.vehicleNo,
+      detail: `IMEI ${getCurrentImei(i)}`,
+      by: i.createdBy || "akash",
+    })),
+    ...allMaint.map((m) => ({
+      kind: "repair",
+      at: m.createdAt,
+      title: m.vehicleNo,
+      detail: workLabels(m),
+      by: m.createdBy || "akash",
+    })),
+    ...allDeletions.map((d) => ({
+      kind: "delete",
+      at: d.deletedAt,
+      title: d.entityLabel || "—",
+      detail: d.reason || "",
+      by: d.deletedBy || "—",
+      entityType: d.entityType,
+    })),
+  ]
+    .sort((a, b) => new Date(b.at) - new Date(a.at))
+    .slice(0, 12);
+
+  // Stock breakdown by category (top 6, others bucketed)
+  const byCategory = {};
+  for (const item of allStock) {
+    const k = item.category || "Uncategorized";
+    byCategory[k] = (byCategory[k] || 0) + (item.quantity || 0);
+  }
+  const catEntries = Object.entries(byCategory).sort((a, b) => b[1] - a[1]);
+  const totalCatUnits = catEntries.reduce((s, e) => s + e[1], 0) || 1;
+  // Color palette for category bars
+  const catColors = ["#0891b2", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#a855f7", "#ec4899", "#64748b"];
+
+  // Akash's contribution this week (last 7 days)
+  const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const installsThisWeek = allInstalls.filter((i) => new Date(i.createdAt) >= weekAgo).length;
+  const repairsThisWeek = allMaint.filter((m) => new Date(m.createdAt) >= weekAgo).length;
+
+  function eventIcon(kind, entityType) {
+    if (kind === "install") return "🆕";
+    if (kind === "repair") return "🔧";
+    if (kind === "delete") {
+      if (entityType === "installation") return "🗑️🆕";
+      if (entityType === "maintenance") return "🗑️🔧";
+      if (entityType === "stock_item") return "🗑️📦";
+      return "🗑️";
+    }
+    return "•";
+  }
+  function eventClass(kind) {
+    if (kind === "install") return "ev-install";
+    if (kind === "repair") return "ev-repair";
+    if (kind === "delete") return "ev-delete";
+    return "";
+  }
+
+  app.innerHTML = `
+    ${renderHeader("Home", "Fleet operations at a glance")}
+    <main class="main">
+      ${renderAdminNav("dashboard")}
+
+      <!-- ROW 1: Big donut charts (Fleet / SIM / Repair Progress) — all clickable -->
+      <div class="donut-row">
+        <button type="button" class="card donut-card accent-blue clickable-card" data-go="installations" aria-label="View all installations">
+          <div class="section-heading">
+            <div>
+              <h2>🚛 Fleet by GPS Model</h2>
+            </div>
+            <span class="card-chevron">›</span>
+          </div>
+          ${donutWithLegend({
+            segments: installSegments,
+            centerLabel: allInstalls.length,
+            centerSub: "Installs",
+          })}
+        </button>
+        <button type="button" class="card donut-card accent-purple clickable-card" data-go="sim-db" aria-label="View SIM database">
+          <div class="section-heading">
+            <div>
+              <h2>📶 SIM Status</h2>
+            </div>
+            <span class="card-chevron">›</span>
+          </div>
+          ${donutWithLegend({
+            segments: simSegments,
+            centerLabel: allSims.length,
+            centerSub: "SIMs",
+          })}
+        </button>
+        <button type="button" class="card donut-card accent-orange clickable-card" data-go="pending" aria-label="View repair progress">
+          <div class="section-heading">
+            <div>
+              <h2>⚙️ Repair Progress</h2>
+            </div>
+            <span class="card-chevron">›</span>
+          </div>
+          ${donutWithLegend({
+            segments: repairSegments,
+            centerLabel: pendingCount,
+            centerSub: "Pending",
+          })}
+          ${pendingCount ? `<div class="donut-cta">⚠️ ${pendingCount} pending — tap to resolve</div>` : ""}
+        </button>
+      </div>
+
+      <!-- ROW 2: Colorful primary stats -->
+      <div class="dash-grid">
+        <button type="button" class="dash-card dash-cyan" data-go="installations">
+          <div class="dash-card-top">
+            <span class="dash-icon">🆕</span>
+            ${installsThisWeek ? `<span class="dash-trend">+${installsThisWeek} this week</span>` : ""}
+          </div>
+          <span class="dash-num">${allInstalls.length}</span>
+          <span class="dash-label">Installations</span>
+          <span class="dash-go">View all →</span>
+        </button>
+        <button type="button" class="dash-card dash-blue" data-go="repairs">
+          <div class="dash-card-top">
+            <span class="dash-icon">🔧</span>
+            ${repairsThisWeek ? `<span class="dash-trend">+${repairsThisWeek} this week</span>` : ""}
+          </div>
+          <span class="dash-num">${allMaint.length}</span>
+          <span class="dash-label">Repair Records</span>
+          <span class="dash-go">View all →</span>
+        </button>
+        <button type="button" class="dash-card ${pendingCount ? "dash-amber" : "dash-green"}" data-go="pending">
+          <div class="dash-card-top">
+            <span class="dash-icon">${pendingCount ? "⚠️" : "✓"}</span>
+            ${pendingCount ? `<span class="dash-trend warn-trend">needs action</span>` : `<span class="dash-trend ok-trend">all clear</span>`}
+          </div>
+          <span class="dash-num">${pendingCount}</span>
+          <span class="dash-label">Repair Progress</span>
+          <span class="dash-go">${pendingCount ? "Resolve →" : "All clear ✓"}</span>
+        </button>
+        <button type="button" class="dash-card dash-purple" data-go="sim-db">
+          <div class="dash-card-top">
+            <span class="dash-icon">📶</span>
+            ${inUseSims ? `<span class="dash-trend">${inUseSims} in use</span>` : ""}
+          </div>
+          <span class="dash-num">${allSims.length}</span>
+          <span class="dash-label">SIMs in database${pendingPrimary ? ` · ${pendingPrimary} pending primary` : ""}</span>
+          <span class="dash-go">View SIM database →</span>
+        </button>
+        <button type="button" class="dash-card ${lowStock ? "dash-red" : "dash-teal"}" data-go="stock">
+          <div class="dash-card-top">
+            <span class="dash-icon">📦</span>
+            ${lowStock ? `<span class="dash-trend warn-trend">${lowStock} low</span>` : `<span class="dash-trend ok-trend">${totalUnits} units</span>`}
+          </div>
+          <span class="dash-num">${allStock.length}</span>
+          <span class="dash-label">Stock items${lowStock ? ` · ${lowStock} low` : ""}</span>
+          <span class="dash-go">View stock →</span>
+        </button>
+        <button type="button" class="dash-card dash-slate" data-go="deletions">
+          <div class="dash-card-top">
+            <span class="dash-icon">🗑️</span>
+            <span class="dash-trend">audit log</span>
+          </div>
+          <span class="dash-num">${allDeletions.length}</span>
+          <span class="dash-label">Deletions logged</span>
+          <span class="dash-go">View audit →</span>
+        </button>
+      </div>
+
+      <!-- Two-column: Activity feed + Stock by category -->
+      <div class="dash-row">
+        <section class="card dash-half accent-blue">
+          <div class="section-heading">
+            <div>
+              <h2>📋 Recent Activity</h2>
+            </div>
+          </div>
+          ${events.length ? `
+            <ul class="activity-feed">
+              ${events.map((e) => `
+                <li class="activity-row ${eventClass(e.kind)}">
+                  <span class="activity-icon">${eventIcon(e.kind, e.entityType)}</span>
+                  <div class="activity-body">
+                    <div class="activity-title">
+                      <strong>${escapeHtml(e.title)}</strong>
+                      <span class="activity-detail">${escapeHtml(e.detail)}</span>
+                    </div>
+                    <div class="activity-meta">
+                      ${escapeHtml(formatDateTime(e.at))} · by ${escapeHtml(e.by)}
+                    </div>
+                  </div>
+                </li>
+              `).join("")}
+            </ul>
+          ` : `<p class="muted" style="padding: 1rem 0;">No activity yet.</p>`}
+        </section>
+
+        <section class="card dash-half accent-green">
+          <div class="section-heading">
+            <div>
+              <h2>📦 Stock by Category</h2>
+            </div>
+          </div>
+          ${catEntries.length ? `
+            <div class="cat-bars">
+              ${catEntries.map(([name, qty], i) => {
+                const pct = Math.max(2, Math.round((qty / totalCatUnits) * 100));
+                const color = catColors[i % catColors.length];
+                return `
+                  <div class="cat-bar-row">
+                    <div class="cat-bar-label">
+                      <span class="cat-bar-name">${escapeHtml(name)}</span>
+                      <span class="cat-bar-qty mono">${qty}</span>
+                    </div>
+                    <div class="cat-bar-track">
+                      <div class="cat-bar-fill" style="width: ${pct}%; background: ${color};"></div>
+                    </div>
+                  </div>
+                `;
+              }).join("")}
+            </div>
+          ` : `<p class="muted" style="padding: 1rem 0;">No stock items yet.</p>`}
+        </section>
+      </div>
+
+      <!-- ROW: Devices Out for Repair + Inactive Vehicles (Trakzee-style) -->
+      <div class="dash-row">
+        <section class="card accent-brown">
+          <div class="section-heading">
+            <div><h2>🔧 Devices Out for Repair</h2></div>
+          </div>
+          ${devicesOut.length ? `
+            <ul class="devices-out-list">
+              ${devicesOut.slice(0, 6).map((d) => `
+                <li>
+                  <div class="dol-main">
+                    <strong>${escapeHtml(d.vehicleNo)}</strong>
+                    <span class="dol-type">${escapeHtml(d.itemType)}</span>
+                  </div>
+                  <div class="dol-meta">
+                    ${d.identifier !== "—" ? `<span class="mono">${escapeHtml(d.identifier)}</span> · ` : ""}
+                    sent ${escapeHtml(formatDateTime(d.sentDate))}
+                  </div>
+                </li>
+              `).join("")}
+            </ul>
+          ` : `<div class="empty-record">No Record Found</div>`}
+        </section>
+        <section class="card accent-cyan">
+          <div class="section-heading">
+            <div><h2>⏱️ Vehicles by Last Activity</h2></div>
+          </div>
+          ${horizontalBarChart(ageBars)}
+        </section>
+      </div>
+
+      <!-- BOTTOM ROW: Top vehicles by repair count -->
+      ${topVehicles.length ? `
+        <section class="card accent-purple">
+          <div class="section-heading">
+            <div>
+              <h2>🚛 Top Vehicles by Repair Count</h2>
+            </div>
+            <button type="button" class="btn btn-secondary btn-sm" data-go="repairs">View all →</button>
+          </div>
+          ${horizontalBarChart(topVehicles.map((v) => ({ ...v, color: "#a78bfa" })))}
+        </section>
+      ` : ""}
+    </main>
+  `;
+  bindLogout();
+  bindAdminNav();
+  app.querySelectorAll("[data-go]").forEach((btn) => {
+    btn.addEventListener("click", () => setView(btn.dataset.go));
+  });
+  // Wire up clickable activity bars
+  app.querySelectorAll(".hbar-row-clickable").forEach((bar) => {
+    bar.addEventListener("click", () => {
+      const bucket = bar.dataset.bucket;
+      openLastActivityBucketModal(bucket);
     });
   });
+}
 
+function openLastActivityBucketModal(bucket) {
+  const buckets = window._lastActivityBuckets || {};
+  const items = buckets[bucket] || [];
+  const labels = {
+    ">90": { title: "Vehicles inactive > 90 days", color: "#dc2626", icon: "🔴" },
+    ">60": { title: "Vehicles inactive > 60 days", color: "#ea580c", icon: "🟠" },
+    ">30": { title: "Vehicles inactive > 30 days", color: "#f59e0b", icon: "🟡" },
+    ">15": { title: "Vehicles inactive > 15 days", color: "#0ea5e9", icon: "🔵" },
+    ">7":  { title: "Vehicles inactive > 7 days",  color: "#10b981", icon: "🟢" },
+  };
+  const meta = labels[bucket] || labels[">7"];
+
+  const allInstalls = loadInstallations();
+  const installByVehicle = {};
+  for (const i of allInstalls) installByVehicle[i.vehicleNo] = i;
+
+  modal.innerHTML = `
+    <h3 style="margin:0 0 0.3rem; display:flex; align-items:center; gap:0.5rem;">
+      <span>${meta.icon}</span>
+      <span style="flex:1;">${escapeHtml(meta.title)}</span>
+      <span style="font-size:0.85rem; color:${meta.color}; font-weight:800;">${items.length}</span>
+    </h3>
+    <p class="modal-desc">Sorted by longest inactive first. Tap a vehicle to view its installation.</p>
+
+    ${items.length === 0 ? `
+      <div class="entry-empty">
+        <div class="entry-empty-icon">✅</div>
+        <h3>No vehicles in this range</h3>
+        <p>All clear here.</p>
+      </div>
+    ` : `
+      <div class="bucket-vehicle-list">
+        ${items.map((it) => {
+          const inst = installByVehicle[it.vehicleNo];
+          const imei = inst ? (getCurrentImei(inst) || "—") : "—";
+          const sim = inst ? (getCurrentSim(inst) || "—") : "—";
+          const lastDate = new Date(it.lastTs);
+          const lastStr = lastDate.toLocaleDateString("en-IN", {
+            day: "2-digit", month: "short", year: "numeric",
+          });
+          const tail = (s, n = 6) => {
+            const v = String(s || "");
+            return v.length > n ? "…" + v.slice(-n) : v || "—";
+          };
+          return `
+            <article class="bucket-vehicle-item" data-vehicle="${escapeHtml(it.vehicleNo)}" tabindex="0">
+              <div class="bucket-vehicle-head">
+                <span class="bucket-vehicle-pill" style="background:${meta.color}15; color:${meta.color}; border-color:${meta.color}30;">
+                  🚛 ${escapeHtml(it.vehicleNo)}
+                </span>
+                <span class="bucket-vehicle-days" style="color:${meta.color};">
+                  ${it.days}d
+                </span>
+              </div>
+              <div class="bucket-vehicle-meta">
+                <span>📡 ${escapeHtml(tail(imei, 8))}</span>
+                <span>📶 ${escapeHtml(tail(sim, 8))}</span>
+              </div>
+              <div class="bucket-vehicle-foot">
+                <span>📅 Last activity: <strong>${escapeHtml(lastStr)}</strong></span>
+              </div>
+            </article>
+          `;
+        }).join("")}
+      </div>
+    `}
+
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Close</button>
+      ${items.length > 0 ? `<button type="button" class="btn btn-primary" data-act="export">↓ Export CSV</button>` : ""}
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modal.querySelector('[data-act="export"]')?.addEventListener("click", () => {
+    exportBucketAsCsv(bucket, items, installByVehicle);
+  });
+
+  // Click vehicle → navigate to installations + search filter
+  modal.querySelectorAll(".bucket-vehicle-item").forEach((el) => {
+    el.addEventListener("click", () => {
+      const v = el.dataset.vehicle;
+      closeModal();
+      searchQuery = v;
+      setView("installations");
+    });
+  });
+}
+
+function exportBucketAsCsv(bucket, items, installByVehicle) {
+  const labels = {
+    ">90": "over_90_days", ">60": "over_60_days", ">30": "over_30_days",
+    ">15": "over_15_days", ">7": "over_7_days",
+  };
+  const rows = [["Vehicle No", "IMEI", "SIM", "Last Activity Date", "Days Inactive"]];
+  for (const it of items) {
+    const inst = installByVehicle[it.vehicleNo];
+    const imei = inst ? (getCurrentImei(inst) || "") : "";
+    const sim = inst ? (getCurrentSim(inst) || "") : "";
+    const d = new Date(it.lastTs).toISOString().slice(0, 10);
+    rows.push([it.vehicleNo, imei, sim, d, it.days]);
+  }
+  const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `inactive-${labels[bucket] || "vehicles"}-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ---------------- Page 2: Installations ---------------- */
+
+function renderInstallationsPage() {
+  const allInstalls = loadInstallations();
+  const q = searchQuery.toLowerCase().trim();
+  const tokens = q.split(/\s+/).filter(Boolean);
+  let filtered = allInstalls.filter((i) => {
+    if (!q) return true;
+    const hay = [
+      i.vehicleNo,
+      i.gpsModel,
+      i.macId,
+      i.sensorNo,
+      i.secondarySim || "",
+      ...i.imeiHistory.map((h) => h.value),
+      ...i.simHistory.map((s) => s.value),
+      ...i.simHistory.map((s) => s.secondaryValue || ""),
+    ]
+      .join(" ")
+      .toLowerCase();
+    return tokens.every((t) => hay.includes(t));
+  });
+
+  // Column-header sort
+  filtered = sortRows(filtered, "installs", {
+    imei: (i) => getCurrentImei(i),
+    gpsModel: (i) => i.gpsModel,
+    vehicleNo: (i) => i.vehicleNo,
+    secondary: (i) => i.secondarySim || "",
+    primary: (i) => resolvePrimarySim(getCurrentSim(i)) || getCurrentSim(i),
+    sensorNo: (i) => i.sensorNo,
+    macId: (i) => i.macId,
+    liveStatus: (i) => getInstallLiveStatus(i),
+    date: (i) => new Date(i.createdAt),
+  });
+
+  // Stats for the colorful strip
+  const withSecSim = allInstalls.filter((i) => i.secondarySim).length;
+  const recentInstalls = allInstalls.filter(
+    (i) => new Date(i.createdAt) >= new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+  ).length;
+  const liveCount = allInstalls.filter((i) => getInstallLiveStatus(i) === "live").length;
+  const offlineCount = allInstalls.filter((i) => getInstallLiveStatus(i) === "offline").length;
+  const unknownCount = allInstalls.filter((i) => getInstallLiveStatus(i) === "unknown").length;
+
+  app.innerHTML = `
+    ${renderHeader("Installations", `${allInstalls.length} vehicles registered`)}
+    <main class="main">
+      ${renderAdminNav("installations")}
+      <div class="summary-grid">
+        <div class="summary-box summary-info"><strong>${allInstalls.length}</strong><span>Total installs</span></div>
+        <div class="summary-box summary-ok"><strong>${liveCount}</strong><span>🟢 Live</span></div>
+        <div class="summary-box summary-danger"><strong>${offlineCount}</strong><span>🔴 Offline</span></div>
+        <div class="summary-box summary-warn"><strong>${unknownCount}</strong><span>⚪ Unknown</span></div>
+        <div class="summary-box summary-purple"><strong>${recentInstalls}</strong><span>This week</span></div>
+      </div>
+
+      ${renderPendingTasksGroups(allInstalls)}
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>All Installations ${filtered.length !== allInstalls.length
+              ? `<span class="filter-count">(${filtered.length} of ${allInstalls.length})</span>`
+              : `(${allInstalls.length})`}</h2>
+            <p class="section-subtitle">Every GPS device installed on the fleet. Use Edit to fix typos in vehicle / model / MAC / sensor.</p>
+          </div>
+          <div class="bulk-actions">
+            <button type="button" class="btn btn-outline btn-sm" id="exportInstallsBtn">↓ Export Excel</button>
+          </div>
+        </div>
+        <div class="list-tools admin-search">
+          <input type="search" id="adminSearch" placeholder="Search vehicle, IMEI, SIM, MAC..." value="${escapeHtml(searchQuery)}" />
+        </div>
+        <div class="bulk-panel">
+          <div>
+            <h3>Bulk Installation Upload</h3>
+            <p>Download the installation sample, fill old records, then upload the Excel file.</p>
+          </div>
+          <div class="bulk-actions">
+            <button type="button" class="btn btn-secondary btn-sm" id="downloadSample">↓ Download sample file</button>
+            <label class="btn btn-primary btn-sm upload-label" for="bulkUpload">↑ Upload filled file</label>
+            <input class="hidden" type="file" id="bulkUpload" accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+          </div>
+        </div>
+        <div class="table-wrap installs-table-desktop">
+          <table>
+            <thead><tr>
+              ${renderSortHeader("IMEI", "imei", "installs")}
+              ${renderSortHeader("GPS Model", "gpsModel", "installs")}
+              ${renderSortHeader("Vehicle", "vehicleNo", "installs")}
+              ${renderSortHeader("Secondary No (ICCID)", "secondary", "installs")}
+              ${renderSortHeader("Primary No (Mobile)", "primary", "installs")}
+              ${renderSortHeader("Sensor No", "sensorNo", "installs")}
+              ${renderSortHeader("MAC ID", "macId", "installs")}
+              ${renderSortHeader("Status", "liveStatus", "installs")}
+              ${renderSortHeader("Date", "date", "installs")}
+              <th>Actions</th>
+            </tr></thead>
+            <tbody>
+              ${
+                filtered.length
+                  ? filtered
+                      .map((i) => {
+                        const currentImei = getCurrentImei(i) || "—";
+                        const currentSim = getCurrentSim(i);
+                        const secondary = i.secondarySim || (digitsOnly(currentSim).length >= 18 ? currentSim : "");
+                        const resolvedPrimary = (() => {
+                          if (currentSim && digitsOnly(currentSim).length < 18) return currentSim;
+                          return resolvePrimarySim(currentSim) || "";
+                        })();
+                        const isPending = resolvedPrimary && resolvedPrimary === currentSim && !sims.find((s) => (s.primaryNumber || "").toLowerCase() === currentSim.toLowerCase());
+                        const looksIccid = currentSim && digitsOnly(currentSim).length >= 18;
+                        const pendingPill = looksIccid && !resolvedPrimary ? `<span class="badge badge-warn" title="Primary not yet known">pending</span>` : "";
+                        const liveStatus = getInstallLiveStatus(i);
+                        const liveBadge = liveStatus === "live"
+                          ? `<span class="live-badge live-yes">🟢 Live</span>`
+                          : liveStatus === "offline"
+                          ? `<span class="live-badge live-no">🔴 Offline</span>`
+                          : `<span class="live-badge live-unknown">⚪ Unknown</span>`;
+                        return `
+                <tr>
+                  <td class="mono">${escapeHtml(currentImei)}</td>
+                  <td>${escapeHtml(i.gpsModel)}</td>
+                  <td><strong>${escapeHtml(i.vehicleNo)}</strong></td>
+                  <td class="mono">${escapeHtml(secondary || "—")}</td>
+                  <td class="mono">${escapeHtml(resolvedPrimary || "—")} ${pendingPill}</td>
+                  <td class="mono">${escapeHtml(i.sensorNo || "—")}</td>
+                  <td class="mono">${escapeHtml(i.macId || "—")}</td>
+                  <td>${liveBadge}</td>
+                  <td class="date-cell">${escapeHtml(formatDateTime(i.createdAt))}</td>
+                  <td class="row-actions">
+                    <button type="button" class="btn btn-outline btn-sm view-tl-btn" data-id="${i.id}" title="View vehicle timeline">📅</button>
+                    <button type="button" class="btn btn-outline btn-sm edit-btn" data-id="${i.id}" title="Edit">✎</button>
+                    <button type="button" class="btn btn-outline btn-sm live-toggle-btn" data-id="${i.id}" title="Set Live status">🟢/🔴</button>
+                    <button type="button" class="btn btn-danger btn-sm admin-delete-install-btn" data-id="${i.id}" title="Delete installation (restores stock)">🗑</button>
+                  </td>
+                </tr>`;
+                      })
+                      .join("")
+                  : `<tr class="empty-row"><td colspan="10">No installations found.</td></tr>`
+              }
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Mobile card grid — Trakzee-style, hidden on desktop -->
+        <div class="installs-card-grid">
+          ${
+            filtered.length
+              ? filtered.map((i) => {
+                  const currentSim = getCurrentSim(i);
+                  const resolved = resolvePrimarySim(currentSim);
+                  const looksIccid = currentSim && digitsOnly(currentSim).length >= 18;
+                  const currentImei = getCurrentImei(i);
+                  const isNormal = (i.gpsModel || "").toLowerCase() === "normal";
+                  const tail = (s, n = 6) => {
+                    const v = String(s || "");
+                    return v.length > n ? "…" + v.slice(-n) : v || "—";
+                  };
+                  return `
+                    <article class="tk-card">
+                      <div class="tk-card-head">
+                        <span class="tk-pill">${escapeHtml(i.vehicleNo)}</span>
+                        ${(() => {
+                          const liveStatus = getInstallLiveStatus(i);
+                          if (liveStatus === "live") return `<span class="live-badge live-yes">🟢 Live</span>`;
+                          if (liveStatus === "offline") return `<span class="live-badge live-no">🔴 Offline</span>`;
+                          return `<span class="live-badge live-unknown">⚪ Status?</span>`;
+                        })()}
+                        <button type="button" class="tk-arrow view-tl-btn" data-id="${i.id}" title="View timeline">›</button>
+                      </div>
+                      <div class="tk-flow">
+                        <div class="tk-flow-box">
+                          <div class="tk-flow-value">${escapeHtml(tail(currentImei))}</div>
+                          <div class="tk-flow-label">IMEI</div>
+                        </div>
+                        <div class="tk-flow-connector">
+                          <div class="tk-flow-icon">📡</div>
+                          <div class="tk-flow-icon-label">${escapeHtml(i.gpsModel || "—")}</div>
+                        </div>
+                        <div class="tk-flow-box tk-flow-end">
+                          <div class="tk-flow-value">${escapeHtml(resolved ? resolved : tail(currentSim))}</div>
+                          <div class="tk-flow-label">${resolved && !looksIccid ? "PRIMARY" : "SIM"}</div>
+                        </div>
+                      </div>
+                      ${!isNormal && (i.macId || i.sensorNo) ? `
+                        <div class="tk-divider"></div>
+                        <div class="tk-stats">
+                          ${i.macId ? `
+                            <div class="tk-stat">
+                              <span class="tk-stat-icon">📱</span>
+                              <span class="tk-stat-label">MAC:</span>
+                              <span class="tk-stat-value">${escapeHtml(tail(i.macId, 8))}</span>
+                            </div>
+                          ` : ""}
+                          ${i.sensorNo ? `
+                            <div class="tk-stat">
+                              <span class="tk-stat-icon">📊</span>
+                              <span class="tk-stat-label">Sensor:</span>
+                              <span class="tk-stat-value">${escapeHtml(i.sensorNo)}</span>
+                            </div>
+                          ` : ""}
+                          ${i.secondarySim ? `
+                            <div class="tk-stat tk-stat-full">
+                              <span class="tk-stat-icon">📡</span>
+                              <span class="tk-stat-label">Secondary No:</span>
+                              <span class="tk-stat-value">${escapeHtml(i.secondarySim)}</span>
+                            </div>
+                          ` : ""}
+                        </div>
+                      ` : ""}
+                      ${looksIccid ? `<div class="tk-reason" style="background: #fef3c7; color: #92400e; border-color: #f59e0b;">⏳ Primary number pending — set via Repair Progress</div>` : ""}
+                      <div class="tk-footer">
+                        <div class="tk-footer-row">
+                          <span class="tk-footer-icon">📅</span>
+                          <span class="tk-footer-label">Installed:</span>
+                          <span class="tk-footer-value">${escapeHtml(formatDateTime(i.createdAt))}</span>
+                        </div>
+                        ${i.createdBy ? `
+                          <div class="tk-footer-row">
+                            <span class="tk-footer-icon">👤</span>
+                            <span class="tk-footer-label">By:</span>
+                            <span class="tk-footer-value">${escapeHtml(i.createdBy)}</span>
+                          </div>
+                        ` : ""}
+                      </div>
+                      <div class="tk-actions">
+                        <button type="button" class="btn btn-outline btn-sm view-tl-btn" data-id="${i.id}">📅 Timeline</button>
+                        <button type="button" class="btn btn-primary btn-sm edit-btn" data-id="${i.id}">✎ Edit</button>
+                        <button type="button" class="btn btn-outline btn-sm live-toggle-btn" data-id="${i.id}">🟢/🔴 Status</button>
+                        <button type="button" class="btn btn-danger btn-sm admin-delete-install-btn" data-id="${i.id}" title="Delete installation">🗑 Delete</button>
+                      </div>
+                    </article>
+                  `;
+                }).join("")
+              : `<div class="entry-empty"><div class="entry-empty-icon">📋</div><h3>No installations found</h3><p>Try a different search.</p></div>`
+          }
+        </div>
+      </section>
+    </main>
+  `;
+  bindLogout();
+  bindAdminNav();
+  bindPendingTaskHandlers();
   document.getElementById("adminSearch")?.addEventListener("input", (e) => {
     searchQuery = e.target.value;
     render();
   });
-
-  app.querySelectorAll(".deactivate-btn").forEach((btn) => {
-    btn.addEventListener("click", () => handleSimDeactivation(btn.dataset.id));
+  document.getElementById("downloadSample")?.addEventListener("click", downloadInstallationSample);
+  document.getElementById("exportInstallsBtn")?.addEventListener("click", exportInstallationsToExcel);
+  document.getElementById("bulkUpload")?.addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    const ok = await showConfirm({
+      title: "Confirm upload",
+      message: "Upload installation records from this Excel file?",
+      confirmLabel: "Upload",
+    });
+    if (!ok) return;
+    renderLoading("Uploading data...");
+    try {
+      await importInstallations(file);
+    } catch (err) {
+      await refreshAllData();
+      render();
+      showToast(err.message || "Upload failed.", true);
+    }
+  });
+  app.querySelectorAll(".edit-btn").forEach((btn) => {
+    btn.addEventListener("click", () => openEditInstallation(btn.dataset.id));
+  });
+  app.querySelectorAll(".view-tl-btn").forEach((btn) => {
+    btn.addEventListener("click", () => openVehicleTimelineModal(btn.dataset.id));
+  });
+  app.querySelectorAll(".admin-delete-install-btn").forEach((btn) => {
+    btn.addEventListener("click", () => deleteAkashInstallation(btn.dataset.id));
+  });
+  app.querySelectorAll(".live-toggle-btn").forEach((btn) => {
+    btn.addEventListener("click", () => openLiveStatusModal(btn.dataset.id));
   });
 }
 
-function handleSimDeactivation(recordId) {
-  const records = loadMaintenance();
-  const record = records.find((m) => m.id === recordId);
-  if (!record) return;
+/* ---------------- Page 3: Repair Work ---------------- */
 
-  if (
-    !confirm(
-      `Confirm old SIM ${record.oldSimNo} is deactivated for vehicle ${record.vehicleNo}?`
-    )
-  ) {
-    return;
-  }
+function renderRepairsPage() {
+  const allMaint = loadMaintenance();
+  const q = searchQuery.toLowerCase().trim();
+  const tokens = q.split(/\s+/).filter(Boolean);
+  let filtered = allMaint.filter((m) => {
+    if (!q) return true;
+    const hay = [
+      m.imei,
+      m.vehicleNo,
+      m.oldImei || "",
+      m.newImei || "",
+      m.oldSimNo || "",
+      m.newSimNo || "",
+      m.otherWorkText || "",
+      workLabels(m),
+    ]
+      .join(" ")
+      .toLowerCase();
+    return tokens.every((t) => hay.includes(t));
+  });
 
-  deactivateSim(recordId);
+  // Column-header sort
+  filtered = sortRows(filtered, "repairs", {
+    date: (m) => new Date(m.createdAt),
+    vehicleNo: (m) => m.vehicleNo || "",
+    imei: (m) => m.imei || "",
+    work: (m) => workLabels(m),
+    status: (m) => m.status || "",
+  });
+
+  // Stats: total / sim changes / device changes / this week
+  const simChangeCount = allMaint.filter((m) => m.simChange).length;
+  const deviceChangeCount = allMaint.filter((m) => m.deviceChange).length;
+  const recentRepairs = allMaint.filter(
+    (m) => new Date(m.createdAt) >= new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+  ).length;
+
+  app.innerHTML = `
+    ${renderHeader("Repair Work", `${allMaint.length} repair records`)}
+    <main class="main">
+      ${renderAdminNav("repairs")}
+      <div class="summary-grid">
+        <div class="summary-box summary-info"><strong>${allMaint.length}</strong><span>Total repairs</span></div>
+        <div class="summary-box summary-ok"><strong>${recentRepairs}</strong><span>This week</span></div>
+        <div class="summary-box summary-purple"><strong>${simChangeCount}</strong><span>SIM changes</span></div>
+        <div class="summary-box summary-warn"><strong>${deviceChangeCount}</strong><span>Device changes</span></div>
+      </div>
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>All Repair Work ${filtered.length !== allMaint.length
+              ? `<span class="filter-count">(${filtered.length} of ${allMaint.length})</span>`
+              : `(${allMaint.length})`}</h2>
+            <p class="section-subtitle">Every repair / maintenance entry from the field, with pending follow-up status.</p>
+          </div>
+          <div class="bulk-actions">
+            <button type="button" class="btn btn-outline btn-sm" id="exportRepairsBtn">↓ Export Excel</button>
+          </div>
+        </div>
+        <div class="list-tools admin-search">
+          <input type="search" id="adminSearch" placeholder="Search vehicle, IMEI, SIM, work..." value="${escapeHtml(searchQuery)}" />
+        </div>
+        <div class="bulk-panel">
+          <div>
+            <h3>Bulk Repair Upload</h3>
+            <p>Download the repair sample, fill old repair work records, then upload the Excel file.</p>
+          </div>
+          <div class="bulk-actions">
+            <button type="button" class="btn btn-secondary btn-sm" id="downloadSample">↓ Download sample file</button>
+            <label class="btn btn-primary btn-sm upload-label" for="bulkUpload">↑ Upload filled file</label>
+            <input class="hidden" type="file" id="bulkUpload" accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+          </div>
+        </div>
+        <div class="table-wrap repairs-table-desktop">
+          <table>
+            <thead><tr>
+              ${renderSortHeader("Date", "date", "repairs")}
+              ${renderSortHeader("Vehicle", "vehicleNo", "repairs")}
+              ${renderSortHeader("IMEI", "imei", "repairs")}
+              ${renderSortHeader("Work Done", "work", "repairs")}
+              ${renderSortHeader("Status", "status", "repairs")}
+            </tr></thead>
+            <tbody>
+              ${
+                filtered.length
+                  ? filtered
+                      .map(
+                        (m) => `
+                <tr>
+                  <td class="date-cell">${escapeHtml(formatDateTime(m.createdAt))}</td>
+                  <td>${escapeHtml(m.vehicleNo)}</td>
+                  <td class="mono">${escapeHtml(m.imei)}</td>
+                  <td>${escapeHtml(workLabels(m))}</td>
+                  <td class="status-cell">${getMaintenanceStatus(m)}</td>
+                </tr>`
+                      )
+                      .join("")
+                  : `<tr class="empty-row"><td colspan="5">No repair records found.</td></tr>`
+              }
+            </tbody>
+          </table>
+        </div>
+        <!-- Mobile card grid -->
+        <div class="repairs-card-grid">
+          ${filtered.length
+            ? filtered.map((m) => {
+                const tail = (s, n = 6) => {
+                  const v = String(s || "");
+                  return v.length > n ? "…" + v.slice(-n) : v || "—";
+                };
+                return `
+                  <article class="tk-card">
+                    <div class="tk-card-head">
+                      <span class="tk-pill tk-pill-repair">${escapeHtml(m.vehicleNo)}</span>
+                      <span class="tk-chip tk-chip-repair">🛠 Repair</span>
+                    </div>
+                    <div class="tk-stats">
+                      <div class="tk-stat tk-stat-full">
+                        <span class="tk-stat-icon">🔧</span>
+                        <span class="tk-stat-label">Work:</span>
+                        <span class="tk-stat-value" style="white-space:normal;">${escapeHtml(workLabels(m))}</span>
+                      </div>
+                      ${m.imei ? `
+                        <div class="tk-stat tk-stat-full">
+                          <span class="tk-stat-icon">📡</span>
+                          <span class="tk-stat-label">IMEI:</span>
+                          <span class="tk-stat-value">${escapeHtml(tail(m.imei))}</span>
+                        </div>
+                      ` : ""}
+                    </div>
+                    <div class="tk-footer">
+                      <div class="tk-footer-row">
+                        <span class="tk-footer-icon">📅</span>
+                        <span class="tk-footer-label">Reported:</span>
+                        <span class="tk-footer-value">${escapeHtml(formatDateTime(m.createdAt))}</span>
+                      </div>
+                      <div class="tk-footer-row">
+                        <span class="tk-footer-icon">📊</span>
+                        <span class="tk-footer-label">Status:</span>
+                        <span class="tk-footer-value">${getMaintenanceStatus(m)}</span>
+                      </div>
+                    </div>
+                  </article>
+                `;
+              }).join("")
+            : `<div class="entry-empty"><div class="entry-empty-icon">🛠️</div><h3>No repairs found</h3><p>Try a different search.</p></div>`
+          }
+        </div>
+      </section>
+    </main>
+  `;
+  bindLogout();
+  bindAdminNav();
+  document.getElementById("adminSearch")?.addEventListener("input", (e) => {
+    searchQuery = e.target.value;
+    render();
+  });
+  document.getElementById("downloadSample")?.addEventListener("click", downloadRepairSample);
+  document.getElementById("exportRepairsBtn")?.addEventListener("click", exportRepairsToExcel);
+  document.getElementById("bulkUpload")?.addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    const ok = await showConfirm({
+      title: "Confirm upload",
+      message: "Upload repair work records from this Excel file?",
+      confirmLabel: "Upload",
+    });
+    if (!ok) return;
+    renderLoading("Uploading data...");
+    try {
+      await importRepairs(file);
+    } catch (err) {
+      await refreshAllData();
+      render();
+      showToast(err.message || "Upload failed.", true);
+    }
+  });
 }
 
-async function deactivateSim(recordId) {
-  const records = loadMaintenance();
-  const record = records.find((m) => m.id === recordId);
-  if (!record) return;
+/* ---------------- Page 4: Pending Work ---------------- */
 
-  const now = new Date().toISOString();
-  record.simDeactivated = true;
-  record.simDeactivatedAt = now;
-  record.simDeactivationPending = false;
+function renderPendingPage() {
+  const pendingCount = getPendingActionRows().length;
+  const pendingHtml = renderPendingActions();
 
-  const allInstalls = loadInstallations();
-  const inst = allInstalls.find((i) => i.id === record.installationId);
+  app.innerHTML = `
+    ${renderHeader("Repair Progress", `${pendingCount} follow-up actions pending`)}
+    <main class="main">
+      ${renderAdminNav("pending")}
+      ${pendingHtml || `<section class="card"><h2>🎉 All caught up</h2><p class="alert-desc">No pending actions right now. New repair entries will show up here automatically.</p></section>`}
+    </main>
+  `;
+  bindLogout();
+  bindAdminNav();
 
-  if (inst && record.oldSimNo) {
-    inst.simHistory.forEach((s) => {
-      if (s.value === record.oldSimNo && s.pendingDeactivation) {
-        s.active = false;
-        s.pendingDeactivation = false;
-        s.deactivatedAt = now;
+  // Wire all the existing pending-action handlers.
+  app.querySelectorAll(".filter-chip[data-filter]").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      pendingFilter = chip.dataset.filter;
+      render();
+    });
+  });
+  app.querySelectorAll(".task-complete").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.dataset.kind === "installation") {
+        completeInstallTask(btn.dataset.record, btn.dataset.task);
+      } else {
+        completeTask(btn.dataset.record, btn.dataset.task);
       }
+    });
+  });
+  app.querySelectorAll(".task-undo").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.dataset.kind === "installation") {
+        undoInstallTask(btn.dataset.record, btn.dataset.task);
+      } else {
+        undoTask(btn.dataset.record, btn.dataset.task);
+      }
+    });
+  });
+  app.querySelectorAll(".task-remark").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.dataset.kind === "installation") {
+        openInstallRemarkEditor(btn.dataset.record, btn.dataset.task);
+      } else {
+        openRemarkEditor(btn.dataset.record, btn.dataset.task);
+      }
+    });
+  });
+  document.getElementById("toggleCompleted")?.addEventListener("click", () => {
+    showCompleted = !showCompleted;
+    render();
+  });
+  document.getElementById("exportPending")?.addEventListener("click", exportPendingActions);
+  app.querySelectorAll(".vg-edit").forEach((btn) => {
+    btn.addEventListener("click", () => openEditInstallation(btn.dataset.inst));
+  });
+}
+
+/* ---------------- Page 5: SIM Upload ---------------- */
+
+function renderSimUpload() {
+  const allInstalls = loadInstallations();
+  const missingSec = allInstalls.filter((i) => !i.secondarySim).length;
+
+  app.innerHTML = `
+    ${renderHeader("SIM Upload", "Add secondary No numbers")}
+    <main class="main">
+      ${renderAdminNav("sim-upload")}
+      <div class="summary-grid">
+        <div class="summary-box"><strong>${allInstalls.length}</strong><span>Installations</span></div>
+        <div class="summary-box ${missingSec ? "summary-warn" : ""}"><strong>${missingSec}</strong><span>Missing secondary</span></div>
+      </div>
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>📋 Quick Paste — Secondary Nos</h2>
+            <p class="section-subtitle">Excel skip karo. Primary SIMs ek box me paste karo, secondary Nos doosre me — line-by-line pair ho jaayenge. 20-digit ICCIDs poore digits ke saath bachenge.</p>
+          </div>
+        </div>
+        <div class="paste-grid">
+          <div class="field">
+            <label for="pastePrimary">Primary SIM numbers <span class="paste-count" id="primaryCount">0 lines</span></label>
+            <textarea id="pastePrimary" rows="10" placeholder="5753200309565&#10;5753200309623&#10;5753200322950&#10;..." spellcheck="false"></textarea>
+          </div>
+          <div class="field">
+            <label for="pasteSecondary">Secondary Nos (ICCIDs) <span class="paste-count" id="secondaryCount">0 lines</span></label>
+            <textarea id="pasteSecondary" rows="10" placeholder="89918720507069157022&#10;89918720507069156917&#10;89918720507069153161&#10;..." spellcheck="false"></textarea>
+          </div>
+        </div>
+        <div class="paste-preview" id="pastePreview">Paste data to preview pairs.</div>
+        <div class="form-actions">
+          <button type="button" class="btn btn-secondary btn-sm" id="pasteClear">Clear</button>
+          <button type="button" class="btn btn-primary" id="pasteUpload">↑ Upload pairs</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>📁 Excel Upload (alternative)</h2>
+            <p class="section-subtitle">Prefer Excel? Download the sample (SIM columns pre-formatted as Text), fill <code>primary_sim, secondary_sim</code> columns, then upload.</p>
+          </div>
+          <div class="bulk-actions">
+            <button type="button" class="btn btn-secondary btn-sm" id="simSampleDl">↓ Sample file</button>
+            <label class="btn btn-primary btn-sm upload-label" for="simBulkUpload">↑ Bulk upload</label>
+            <input class="hidden" type="file" id="simBulkUpload" accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+          </div>
+        </div>
+      </section>
+    </main>
+  `;
+  bindLogout();
+  bindAdminNav();
+
+  // Quick paste wiring (same logic as the SIM database page used to have).
+  const primaryEl = document.getElementById("pastePrimary");
+  const secondaryEl = document.getElementById("pasteSecondary");
+  const primaryCntEl = document.getElementById("primaryCount");
+  const secondaryCntEl = document.getElementById("secondaryCount");
+  const previewEl = document.getElementById("pastePreview");
+
+  function splitPasteLines(text) {
+    const lines = (text || "").split(/\r?\n/).map((s) => s.trim());
+    while (lines.length && lines[lines.length - 1] === "") lines.pop();
+    return lines;
+  }
+  function refreshPastePreview() {
+    if (!primaryEl || !secondaryEl) return;
+    const primaries = splitPasteLines(primaryEl.value);
+    const secondaries = splitPasteLines(secondaryEl.value);
+    primaryCntEl.textContent = `${primaries.length} line${primaries.length === 1 ? "" : "s"}`;
+    secondaryCntEl.textContent = `${secondaries.length} line${secondaries.length === 1 ? "" : "s"}`;
+    if (!primaries.length && !secondaries.length) {
+      previewEl.textContent = "Paste data to preview pairs.";
+      previewEl.className = "paste-preview";
+      return;
+    }
+    if (primaries.length !== secondaries.length) {
+      previewEl.textContent = `⚠️ Line count mismatch — ${primaries.length} primary vs ${secondaries.length} secondary. Each row must align.`;
+      previewEl.className = "paste-preview warn";
+      return;
+    }
+    const first = primaries
+      .slice(0, 3)
+      .map((p, i) => `${p} → ${secondaries[i] || "(clear)"}`)
+      .join("  ·  ");
+    previewEl.textContent = `✓ ${primaries.length} pairs ready. Preview: ${first}${primaries.length > 3 ? "  ..." : ""}`;
+    previewEl.className = "paste-preview ok";
+  }
+  primaryEl?.addEventListener("input", refreshPastePreview);
+  secondaryEl?.addEventListener("input", refreshPastePreview);
+  document.getElementById("pasteClear")?.addEventListener("click", () => {
+    if (primaryEl) primaryEl.value = "";
+    if (secondaryEl) secondaryEl.value = "";
+    refreshPastePreview();
+  });
+  document.getElementById("pasteUpload")?.addEventListener("click", async () => {
+    const primaries = splitPasteLines(primaryEl?.value || "");
+    const secondaries = splitPasteLines(secondaryEl?.value || "");
+    if (!primaries.length || !secondaries.length) {
+      showToast("Paste data in both boxes first.", true);
+      return;
+    }
+    if (primaries.length !== secondaries.length) {
+      showToast(
+        `Line count mismatch: ${primaries.length} primary vs ${secondaries.length} secondary.`,
+        true
+      );
+      return;
+    }
+    const ok = await showConfirm({
+      title: "Upload pairs?",
+      message: `Save ${primaries.length} SIM pair${primaries.length === 1 ? "" : "s"} to the SIM database?`,
+      confirmLabel: "Upload",
+    });
+    if (!ok) return;
+
+    const total = primaries.length;
+    // Detect rows that look swapped (ICCID in primary box, short number in secondary box).
+    const swapCandidates = primaries.reduce(
+      (acc, p, i) => acc + (pairLooksSwapped(p, secondaries[i] || "") ? 1 : 0),
+      0
+    );
+    let autoSwap = false;
+    if (swapCandidates > 0) {
+      autoSwap = await showConfirm({
+        title: "Some rows look swapped",
+        message: `${swapCandidates} of ${total} rows have a 20-digit ICCID in the <strong>primary</strong> box and a short number in the <strong>secondary</strong> box. Auto-swap them before saving?`,
+        confirmLabel: "Yes, swap & save",
+      });
+    }
+    renderLoading(`Saving SIMs to database... 0/${total}`);
+    let saved = 0;
+    const errors = [];
+
+    // Helper to update the loading message in place without re-rendering.
+    function updateProgress(done) {
+      const el = document.querySelector(".loading-card p");
+      if (el) el.textContent = `Saving SIMs to database... ${done}/${total}`;
+      const sub = document.querySelector(".app-title-sub, .header-sub");
+      if (sub) sub.textContent = `Saving SIMs to database... ${done}/${total}`;
+    }
+
+    try {
+      for (let i = 0; i < total; i += 1) {
+        let primary = primaries[i];
+        let secondary = secondaries[i];
+        if (autoSwap && pairLooksSwapped(primary, secondary)) {
+          const tmp = primary;
+          primary = secondary;
+          secondary = tmp;
+        }
+        const rowNo = i + 1;
+        if (!secondary) {
+          errors.push(`Row ${rowNo}: secondary (ICCID) blank — skipped`);
+          updateProgress(i + 1);
+          continue;
+        }
+        try {
+          await withTimeout(
+            upsertSim({
+              primaryNumber: primary || null,
+              secondaryNumber: secondary,
+            }),
+            10000,
+            `Row ${rowNo} upsert`
+          );
+          saved += 1;
+        } catch (err) {
+          if (err.code === SIMS_TABLE_MISSING) {
+            errors.push(`Row ${rowNo}: sims table missing — database setup incomplete — contact admin`);
+          } else {
+            errors.push(`Row ${rowNo}: ${err.message}`);
+          }
+        }
+        updateProgress(i + 1);
+      }
+
+      // Navigate first so the user sees the new SIM Database, then refresh
+      // in the background. This avoids a long extra wait on the spinner.
+      setView("sim-db");
+      try {
+        await refreshAllData();
+        render();
+      } catch (err) {
+        console.warn("Post-upload refresh failed (will catch up on next realtime tick):", err);
+      }
+      showToast(
+        `${saved} SIM${saved === 1 ? "" : "s"} saved.${errors.length ? ` ${errors.length} skipped.` : ""}`,
+        saved === 0
+      );
+      if (errors.length) showImportReport(errors);
+    } catch (err) {
+      // Catch-all so the loading screen never sticks.
+      console.error("SIM upload failed:", err);
+      try {
+        await refreshAllData();
+      } catch (_) {
+        /* ignore — we just need to exit the spinner */
+      }
+      setView("sim-db");
+      showToast(err.message || "Upload failed — check console.", true);
+    }
+  });
+
+  // Excel alternative wiring.
+  document.getElementById("simSampleDl")?.addEventListener("click", downloadSimSample);
+  document.getElementById("simBulkUpload")?.addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    const ok = await showConfirm({
+      title: "Bulk upload SIMs?",
+      message: "Save SIM pairs from this Excel file to the SIM database?",
+      confirmLabel: "Upload",
+    });
+    if (!ok) return;
+    renderLoading("Uploading SIMs to database...");
+    try {
+      await importSimsFromExcel(file);
+      setView("sim-db");
+    } catch (err) {
+      await refreshAllData();
+      render();
+      const msg = err.message || "Upload failed.";
+      showToast(err.code === SIMS_TABLE_MISSING ? "Database setup incomplete — contact admin." : msg, true);
+    }
+  });
+
+  refreshPastePreview();
+}
+
+/* ---------------- Page 6: SIM Database (read-only view) ---------------- */
+
+/**
+ * Builds a unified SIM list across all sources (manual sims table, installations, stock).
+ * Deduplicates by primary or secondary number. Returns array of:
+ *   { id, primary, secondary, sources[], primarySource, secondarySource, ... }
+ * Each entry knows its origin and completeness.
+ */
+function buildUnifiedSimList() {
+  const map = new Map(); // key: dedup key (primary or secondary), value: entry
+  const norm = (v) => String(v || "").trim();
+  const dedupKey = (primary, secondary) => {
+    // Use secondary first (ICCID is most unique), then primary
+    const s = norm(secondary);
+    const p = norm(primary);
+    if (s) return `s:${s}`;
+    if (p) return `p:${p}`;
+    return null;
+  };
+
+  const upsert = (entry) => {
+    const key = dedupKey(entry.primary, entry.secondary);
+    if (!key) return;
+    if (map.has(key)) {
+      // Merge with existing
+      const existing = map.get(key);
+      if (entry.primary && !existing.primary) {
+        existing.primary = entry.primary;
+        existing.primarySource = entry.primarySource || entry.source;
+      }
+      if (entry.secondary && !existing.secondary) {
+        existing.secondary = entry.secondary;
+        existing.secondarySource = entry.secondarySource || entry.source;
+      }
+      // Add this source to the list
+      if (!existing.sources.includes(entry.source)) {
+        existing.sources.push(entry.source);
+      }
+      // Keep useful metadata
+      if (entry.vehicleNo && !existing.vehicleNo) existing.vehicleNo = entry.vehicleNo;
+      if (entry.installId && !existing.installId) existing.installId = entry.installId;
+      if (entry.stockItemId && !existing.stockItemId) existing.stockItemId = entry.stockItemId;
+      if (entry.stockProject && !existing.stockProject) existing.stockProject = entry.stockProject;
+      if (entry.simRecordId && !existing.simRecordId) existing.simRecordId = entry.simRecordId;
+      if (entry.simRecord && !existing.simRecord) existing.simRecord = entry.simRecord;
+      if (entry.notes && !existing.notes) existing.notes = entry.notes;
+      if (entry.createdAt && (!existing.createdAt || entry.createdAt < existing.createdAt)) {
+        existing.createdAt = entry.createdAt;
+      }
+    } else {
+      map.set(key, { ...entry, sources: [entry.source] });
+    }
+  };
+
+  // 1) From manual sims table
+  for (const sim of (sims || [])) {
+    upsert({
+      id: `sim:${sim.id}`,
+      primary: norm(sim.primaryNumber),
+      secondary: norm(sim.secondaryNumber),
+      source: "manual",
+      primarySource: sim.primaryNumber ? "manual" : null,
+      secondarySource: sim.secondaryNumber ? "manual" : null,
+      simRecordId: sim.id,
+      simRecord: sim,
+      notes: sim.notes || "",
+      createdAt: sim.createdAt,
     });
   }
 
-  try {
-    await updateMaintenanceRecord(record);
-    if (inst) await updateInstallation(inst);
-    await refreshAllData();
-    showToast("Old SIM marked as deactivated.");
+  // 2) From installations (current SIM in use)
+  for (const inst of (installations || [])) {
+    const primary = norm(getCurrentSim(inst));
+    // Prefer top-level secondarySim, fall back to the latest history entry's
+    // secondaryValue so old records that didn't set secondarySim still land in
+    // the correct column.
+    let secondary = norm(inst.secondarySim);
+    if (!secondary) {
+      const activeHist = [...(inst.simHistory || [])].reverse().find((s) => s.active) || (inst.simHistory || []).at(-1);
+      secondary = norm(activeHist?.secondaryValue);
+      // Last defense: if simHistory.value itself looks like an ICCID (buggy old
+      // data), treat it as the secondary rather than dropping it entirely.
+      if (!secondary) {
+        const v = norm(activeHist?.value);
+        if (v && isLikelyIccid(v)) secondary = v;
+      }
+    }
+    if (!primary && !secondary) continue;
+    upsert({
+      id: `inst:${inst.id}`,
+      primary,
+      secondary,
+      source: "installed",
+      primarySource: primary ? "installed" : null,
+      secondarySource: secondary ? "installed" : null,
+      vehicleNo: inst.vehicleNo,
+      installId: inst.id,
+      createdAt: inst.updatedAt || inst.createdAt,
+    });
+  }
+
+  // 3) From stock items with SIM category
+  for (const item of (stockItems || [])) {
+    if (categoryKind(item.category) !== "sim") continue;
+    const m = item.metadata || {};
+    const primary = norm(m.primary);
+    const secondary = norm(m.secondary || m.imei); // bulk-scanned land in m.imei
+    if (!primary && !secondary) continue;
+    upsert({
+      id: `stock:${item.id}`,
+      primary,
+      secondary,
+      source: "stock",
+      primarySource: primary ? "stock" : null,
+      secondarySource: secondary ? "stock" : null,
+      stockItemId: item.id,
+      stockProject: m.project || "",
+      stockName: item.name,
+      createdAt: item.createdAt,
+    });
+  }
+
+  // Compute completeness + swap detection + return as array
+  return Array.from(map.values()).map((e) => {
+    const hasP = !!e.primary;
+    const hasS = !!e.secondary;
+    e.hasPrimary = hasP;
+    e.hasSecondary = hasS;
+    // Smart swap detection: 89... in primary slot OR mobile-no in secondary slot
+    e.looksSwapped = pairLooksSwapped(e.primary, e.secondary);
+    // Completeness — but swap-needed overrides "complete"
+    if (!hasP) e.completeness = "needs_primary";
+    else if (!hasS) e.completeness = "needs_secondary";
+    else if (e.looksSwapped) e.completeness = "swap_needed";
+    else e.completeness = "complete";
+    return e;
+  });
+}
+
+function renderSimDb() {
+  if (!simsTableReady) {
+    app.innerHTML = `
+      ${renderHeader("SIM Database", "Standalone SIM inventory")}
+      <main class="main">
+        ${renderAdminNav("sim-db")}
+        <section class="card">
+          <h2>⚙️ Migration needed</h2>
+          <p>The new SIM database needs a one-time setup. One-time setup needed — <code>sims-table-migration.sql</code>, then come back here.</p>
+          <div class="form-actions" style="margin-top: 1rem;">
+            <span class="hint">Contact administrator to complete setup.</span>
+            <button type="button" class="btn btn-secondary" id="retrySimDb">↻ Reload</button>
+          </div>
+        </section>
+      </main>
+    `;
+    bindLogout();
+    bindAdminNav();
+    document.getElementById("retrySimDb")?.addEventListener("click", async () => {
+      renderLoading("Checking SIM table...");
+      try {
+        await refreshAllData();
+        render();
+      } catch (err) {
+        renderConnectionError(err.message);
+      }
+    });
+    return;
+  }
+
+  // Build unified list across all sources
+  const unifiedList = buildUnifiedSimList();
+
+  // Apply source filter
+  let filtered = unifiedList;
+  if (simSourceFilter === "installed") {
+    filtered = filtered.filter((e) => e.sources.includes("installed"));
+  } else if (simSourceFilter === "stock") {
+    filtered = filtered.filter((e) => e.sources.includes("stock"));
+  } else if (simSourceFilter === "manual") {
+    filtered = filtered.filter((e) => e.sources.includes("manual"));
+  }
+
+  // Apply completeness filter (includes swap_needed)
+  if (simCompletenessFilter !== "all") {
+    filtered = filtered.filter((e) => e.completeness === simCompletenessFilter);
+  }
+
+  // Apply search
+  const q = simDbQuery.trim().toLowerCase();
+  if (q) {
+    filtered = filtered.filter((e) =>
+      (e.primary || "").toLowerCase().includes(q) ||
+      (e.secondary || "").toLowerCase().includes(q) ||
+      (e.notes || "").toLowerCase().includes(q) ||
+      (e.vehicleNo || "").toLowerCase().includes(q) ||
+      (e.stockProject || "").toLowerCase().includes(q)
+    );
+  }
+
+  // Sort: incomplete first, then swap_needed, then complete; newest first within each
+  filtered.sort((a, b) => {
+    const order = { needs_primary: 0, needs_secondary: 1, swap_needed: 2, complete: 3 };
+    const oa = order[a.completeness] ?? 99;
+    const ob = order[b.completeness] ?? 99;
+    if (oa !== ob) return oa - ob;
+    return new Date(b.createdAt || 0) - new Date(a.createdAt || 0);
+  });
+
+  // Stats
+  const stats = {
+    total: unifiedList.length,
+    installed: unifiedList.filter((e) => e.sources.includes("installed")).length,
+    stock: unifiedList.filter((e) => e.sources.includes("stock")).length,
+    manual: unifiedList.filter((e) => e.sources.includes("manual")).length,
+    needsPrimary: unifiedList.filter((e) => e.completeness === "needs_primary").length,
+    needsSecondary: unifiedList.filter((e) => e.completeness === "needs_secondary").length,
+    complete: unifiedList.filter((e) => e.completeness === "complete").length,
+    swapped: unifiedList.filter((e) => e.looksSwapped).length,
+  };
+
+  // Auto-detect swap requirements based on 89/57 prefix rules
+  const swapBannerHtml = stats.swapped > 0 ? `
+    <section class="card swap-banner-card">
+      <div class="swap-banner-header">
+        <div class="swap-banner-icon">↔️</div>
+        <div class="swap-banner-text">
+          <h3>Bulk Swap Required for ${stats.swapped} SIM${stats.swapped === 1 ? "" : "s"}</h3>
+          <p>
+            Auto-detected: <strong>${stats.swapped}</strong> SIM${stats.swapped === 1 ? "" : "s"} have their primary & secondary swapped.
+            Numbers starting with <code>89</code> belong in <strong>Secondary (ICCID)</strong>,
+            and mobile numbers (like <code>57…</code>) belong in <strong>Primary</strong>.
+          </p>
+        </div>
+      </div>
+      <div class="swap-banner-actions">
+        <button type="button" class="btn btn-warn" id="bulkSwapBtn">↔ Bulk Swap All (${stats.swapped})</button>
+        <button type="button" class="btn btn-outline btn-sm" id="reviewSwapsBtn">👁 Review List First</button>
+      </div>
+    </section>
+  ` : "";
+
+  app.innerHTML = `
+    ${renderHeader("SIM Database", "Unified — manual + installation + stock")}
+    <main class="main">
+      ${renderAdminNav("sim-db")}
+
+      <div class="summary-grid sim-summary-grid">
+        <div class="summary-box" style="border-left-color: #06b6d4;">
+          <strong>${stats.total}</strong>
+          <span>Total Unified</span>
+        </div>
+        <div class="summary-box" style="border-left-color: #8b5cf6;">
+          <strong>${stats.installed}</strong>
+          <span>In Use</span>
+        </div>
+        <div class="summary-box" style="border-left-color: #f59e0b;">
+          <strong>${stats.stock}</strong>
+          <span>In Stock</span>
+        </div>
+        <div class="summary-box" style="border-left-color: #64748b;">
+          <strong>${stats.manual}</strong>
+          <span>Manual</span>
+        </div>
+        <div class="summary-box ${stats.needsPrimary ? '' : ''}" style="border-left-color: #ef4444;">
+          <strong>${stats.needsPrimary}</strong>
+          <span>Needs Primary</span>
+        </div>
+        <div class="summary-box" style="border-left-color: #f97316;">
+          <strong>${stats.needsSecondary}</strong>
+          <span>Needs Secondary</span>
+        </div>
+      </div>
+
+      ${swapBannerHtml}
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>SIM Database (${filtered.length}${filtered.length !== unifiedList.length ? ` of ${unifiedList.length}` : ""})</h2>
+            <p class="section-subtitle">Unified view — manually added + installed in vehicles + in stock. No duplicates.</p>
+          </div>
+          <div class="bulk-actions">
+            <button type="button" class="btn btn-primary btn-sm" id="addSimBtn">+ Add Manual</button>
+            <button type="button" class="btn btn-outline btn-sm" id="exportUnifiedSimsBtn">↓ Export Excel</button>
+          </div>
+        </div>
+
+        <div class="list-tools admin-search sticky-search">
+          <input type="search" id="simSearch" placeholder="Search primary, secondary, vehicle, project, notes..." value="${escapeHtml(simDbQuery)}" />
+        </div>
+
+        <!-- Filter dropdowns -->
+        <div class="sim-filter-row">
+          <label class="sim-filter-group">
+            <span class="sim-filter-label">Source:</span>
+            <select id="simSourceFilter">
+              <option value="all" ${simSourceFilter === "all" ? "selected" : ""}>All sources (${stats.total})</option>
+              <option value="installed" ${simSourceFilter === "installed" ? "selected" : ""}>📌 Installed SIMs (${stats.installed})</option>
+              <option value="stock" ${simSourceFilter === "stock" ? "selected" : ""}>📦 Stock SIMs (${stats.stock})</option>
+              <option value="manual" ${simSourceFilter === "manual" ? "selected" : ""}>📝 Manual entries (${stats.manual})</option>
+            </select>
+          </label>
+          <label class="sim-filter-group">
+            <span class="sim-filter-label">Status:</span>
+            <select id="simCompletenessFilter">
+              <option value="all" ${simCompletenessFilter === "all" ? "selected" : ""}>All status</option>
+              <option value="swap_needed" ${simCompletenessFilter === "swap_needed" ? "selected" : ""}>↔ Swap needed (${stats.swapped})</option>
+              <option value="needs_primary" ${simCompletenessFilter === "needs_primary" ? "selected" : ""}>⚠️ Needs primary (${stats.needsPrimary})</option>
+              <option value="needs_secondary" ${simCompletenessFilter === "needs_secondary" ? "selected" : ""}>⚠️ Needs secondary (${stats.needsSecondary})</option>
+              <option value="complete" ${simCompletenessFilter === "complete" ? "selected" : ""}>✓ Complete (${stats.complete})</option>
+            </select>
+          </label>
+          ${(simSourceFilter !== "all" || simCompletenessFilter !== "all" || simDbQuery) ? `
+            <button type="button" class="btn btn-secondary btn-sm" id="clearSimFilters">✕ Clear filters</button>
+          ` : ""}
+        </div>
+
+        <!-- Desktop table -->
+        <div class="table-wrap sims-table-desktop">
+          <table>
+            <thead>
+              <tr>
+                <th>Primary (Mobile No)</th>
+                <th>Secondary (ICCID)</th>
+                <th>Status</th>
+                <th>Source</th>
+                <th>Vehicle / Project</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filtered.length
+                ? filtered.map((e) => renderUnifiedSimRow(e)).join("")
+                : `<tr class="empty-row"><td colspan="6">No SIMs match the filters.</td></tr>`
+              }
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Mobile card grid -->
+        <div class="sims-card-grid">
+          ${filtered.length
+            ? filtered.map((e) => renderUnifiedSimCard(e)).join("")
+            : `<div class="entry-empty"><div class="entry-empty-icon">📶</div><h3>No SIMs found</h3><p>${q || simSourceFilter !== "all" || simCompletenessFilter !== "all" ? "Try different filters." : "Use + Add Manual or bulk-add via Stock."}</p></div>`
+          }
+        </div>
+      </section>
+    </main>
+  `;
+
+  bindLogout();
+  bindAdminNav();
+  document.getElementById("simSearch")?.addEventListener("input", (e) => {
+    simDbQuery = e.target.value;
     render();
+    const el = document.getElementById("simSearch");
+    if (el) {
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    }
+  });
+  document.getElementById("simSourceFilter")?.addEventListener("change", (e) => {
+    simSourceFilter = e.target.value;
+    render();
+  });
+  document.getElementById("simCompletenessFilter")?.addEventListener("change", (e) => {
+    simCompletenessFilter = e.target.value;
+    render();
+  });
+  document.getElementById("clearSimFilters")?.addEventListener("click", () => {
+    simSourceFilter = "all";
+    simCompletenessFilter = "all";
+    simDbQuery = "";
+    render();
+  });
+  document.getElementById("addSimBtn")?.addEventListener("click", () => openSimEditor(null));
+  document.getElementById("exportUnifiedSimsBtn")?.addEventListener("click", () => exportUnifiedSimsToExcel(filtered));
+  document.getElementById("bulkSwapBtn")?.addEventListener("click", () => openBulkSwapModal());
+  document.getElementById("reviewSwapsBtn")?.addEventListener("click", () => {
+    simCompletenessFilter = "swap_needed";
+    simSourceFilter = "all";
+    simDbQuery = "";
+    window._showOnlySwapped = false;
+    render();
+    showToast(`Showing ${stats.swapped} SIM${stats.swapped === 1 ? "" : "s"} that need swapping.`);
+  });
+
+  // Wire up row/card actions
+  app.querySelectorAll(".unified-sim-edit").forEach((btn) => {
+    btn.addEventListener("click", () => openUnifiedSimEditor(btn.dataset.entryId));
+  });
+  app.querySelectorAll(".unified-sim-goto").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const installId = btn.dataset.installId;
+      const inst = installations.find((i) => i.id === installId);
+      if (inst) {
+        searchQuery = inst.vehicleNo;
+        setView("installations");
+      }
+    });
+  });
+  app.querySelectorAll(".unified-sim-stock").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      stockQuery = btn.dataset.stockId;
+      setView("stock");
+    });
+  });
+  app.querySelectorAll(".unified-sim-promote").forEach((btn) => {
+    btn.addEventListener("click", () => promoteToSimDb(btn.dataset.entryId));
+  });
+  // Per-row individual swap
+  app.querySelectorAll(".unified-sim-swap").forEach((btn) => {
+    btn.addEventListener("click", () => swapSingleEntry(btn.dataset.entryId));
+  });
+
+  // Click row also opens edit
+  app.querySelectorAll(".stock-copy-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const v = btn.dataset.copy;
+      const label = btn.dataset.label || "Value";
+      try {
+        await navigator.clipboard.writeText(v);
+        showToast(`✓ ${label} copied`);
+        btn.textContent = "✓";
+        btn.classList.add("stock-copy-done");
+        setTimeout(() => { btn.textContent = "⎘"; btn.classList.remove("stock-copy-done"); }, 1200);
+      } catch (err) {}
+    });
+  });
+}
+
+function renderUnifiedSimRow(e) {
+  const sourceBadges = e.sources.map((s) => sourceBadgeHtml(s)).join(" ");
+  const statusBadge = completenessBadgeHtml(e.completeness);
+  const useCtx = e.vehicleNo
+    ? `<span class="src-ctx">🚛 ${escapeHtml(e.vehicleNo)}</span>`
+    : e.stockProject
+    ? `<span class="src-ctx">📁 ${escapeHtml(e.stockProject)}</span>`
+    : "—";
+  const tail = (s) => {
+    const v = String(s || "");
+    return v.length > 12 ? "…" + v.slice(-10) : v;
+  };
+  return `
+    <tr>
+      <td class="mono">
+        ${e.hasPrimary
+          ? `${escapeHtml(e.primary)} ${stockCopyBtn(e.primary, "Primary")}`
+          : `<span class="missing-cell">⚠️ Missing</span>`}
+      </td>
+      <td class="mono">
+        ${e.hasSecondary
+          ? `${escapeHtml(tail(e.secondary))} ${stockCopyBtn(e.secondary, "Secondary")}`
+          : `<span class="missing-cell">⚠️ Missing</span>`}
+      </td>
+      <td>${statusBadge}</td>
+      <td>${sourceBadges}</td>
+      <td>${useCtx}</td>
+      <td class="row-actions">
+        ${e.looksSwapped
+          ? `<button type="button" class="btn btn-warn btn-sm unified-sim-swap" data-entry-id="${escapeHtml(e.id)}" title="Swap primary & secondary">↔ Swap</button>`
+          : ""}
+        ${e.simRecordId
+          ? `<button type="button" class="btn btn-outline btn-sm unified-sim-edit" data-entry-id="${escapeHtml(e.id)}">✎ Edit</button>`
+          : `<button type="button" class="btn btn-primary btn-sm unified-sim-promote" data-entry-id="${escapeHtml(e.id)}" title="Add to SIM DB so you can edit primary/secondary">+ To DB</button>`}
+        ${e.installId
+          ? `<button type="button" class="btn btn-secondary btn-sm unified-sim-goto" data-install-id="${escapeHtml(e.installId)}" title="Open installation">→ Install</button>`
+          : ""}
+      </td>
+    </tr>
+  `;
+}
+
+function renderUnifiedSimCard(e) {
+  const sourceBadges = e.sources.map((s) => sourceBadgeHtml(s)).join(" ");
+  const statusBadge = completenessBadgeHtml(e.completeness);
+  const tail = (s) => {
+    const v = String(s || "");
+    return v.length > 14 ? "…" + v.slice(-12) : v;
+  };
+  return `
+    <article class="tk-card ${e.completeness !== "complete" ? "tk-card-warn" : ""}">
+      <div class="tk-card-head">
+        <span class="tk-pill">${e.hasPrimary ? escapeHtml(e.primary) : "⚠️ No primary"}</span>
+        ${statusBadge}
+      </div>
+      <div class="tk-stats">
+        <div class="tk-stat tk-stat-full">
+          <span class="tk-stat-icon">📶</span>
+          <span class="tk-stat-label">Secondary:</span>
+          <span class="tk-stat-value mono">${e.hasSecondary ? escapeHtml(tail(e.secondary)) : "⚠️ Missing"}</span>
+          ${e.hasSecondary ? stockCopyBtn(e.secondary, "Secondary") : ""}
+        </div>
+        ${e.hasPrimary ? `
+          <div class="tk-stat tk-stat-full">
+            <span class="tk-stat-icon">📱</span>
+            <span class="tk-stat-label">Primary:</span>
+            <span class="tk-stat-value mono">${escapeHtml(e.primary)}</span>
+            ${stockCopyBtn(e.primary, "Primary")}
+          </div>
+        ` : ""}
+        <div class="tk-stat tk-stat-full sim-sources-row">
+          <span class="tk-stat-icon">🏷️</span>
+          <span class="tk-stat-label">Source:</span>
+          <span class="tk-stat-value">${sourceBadges}</span>
+        </div>
+        ${e.vehicleNo ? `
+          <div class="tk-stat tk-stat-full">
+            <span class="tk-stat-icon">🚛</span>
+            <span class="tk-stat-label">Vehicle:</span>
+            <span class="tk-stat-value">${escapeHtml(e.vehicleNo)}</span>
+          </div>
+        ` : ""}
+        ${e.stockProject ? `
+          <div class="tk-stat tk-stat-full">
+            <span class="tk-stat-icon">📁</span>
+            <span class="tk-stat-label">Project:</span>
+            <span class="tk-stat-value">${escapeHtml(e.stockProject)}</span>
+          </div>
+        ` : ""}
+        ${e.notes ? `
+          <div class="tk-stat tk-stat-full">
+            <span class="tk-stat-icon">📝</span>
+            <span class="tk-stat-label">Notes:</span>
+            <span class="tk-stat-value" style="white-space:normal;">${escapeHtml(e.notes)}</span>
+          </div>
+        ` : ""}
+      </div>
+      <div class="tk-actions">
+        ${e.looksSwapped
+          ? `<button type="button" class="btn btn-warn btn-sm unified-sim-swap" data-entry-id="${escapeHtml(e.id)}">↔ Swap</button>`
+          : ""}
+        ${e.simRecordId
+          ? `<button type="button" class="btn btn-outline btn-sm unified-sim-edit" data-entry-id="${escapeHtml(e.id)}">✎ Edit</button>`
+          : `<button type="button" class="btn btn-primary btn-sm unified-sim-promote" data-entry-id="${escapeHtml(e.id)}">+ To SIM DB</button>`}
+        ${e.installId
+          ? `<button type="button" class="btn btn-secondary btn-sm unified-sim-goto" data-install-id="${escapeHtml(e.installId)}">→ Install</button>`
+          : ""}
+        ${e.stockItemId && !e.installId
+          ? `<button type="button" class="btn btn-secondary btn-sm unified-sim-stock" data-stock-id="${escapeHtml(e.stockItemId)}">→ Stock</button>`
+          : ""}
+      </div>
+    </article>
+  `;
+}
+
+function sourceBadgeHtml(source) {
+  const map = {
+    installed: { label: "📌 In Use", cls: "src-installed" },
+    stock:     { label: "📦 In Stock", cls: "src-stock" },
+    manual:    { label: "📝 Manual", cls: "src-manual" },
+  };
+  const m = map[source] || { label: source, cls: "" };
+  return `<span class="src-badge ${m.cls}">${m.label}</span>`;
+}
+
+function completenessBadgeHtml(c) {
+  if (c === "complete") return `<span class="completeness-badge cb-complete">✓ Complete</span>`;
+  if (c === "swap_needed") return `<span class="completeness-badge cb-swap">↔ Swap Needed</span>`;
+  if (c === "needs_primary") return `<span class="completeness-badge cb-needs">⚠️ Needs Primary</span>`;
+  if (c === "needs_secondary") return `<span class="completeness-badge cb-needs">⚠️ Needs Secondary</span>`;
+  return "";
+}
+
+function openUnifiedSimEditor(entryId) {
+  const unified = buildUnifiedSimList();
+  const entry = unified.find((e) => e.id === entryId);
+  if (!entry) return;
+  // If it has a sim record, edit that directly
+  if (entry.simRecordId) {
+    openSimEditor(entry.simRecordId);
+    return;
+  }
+  // Otherwise prompt to promote first
+  promoteToSimDb(entryId);
+}
+
+async function promoteToSimDb(entryId) {
+  const unified = buildUnifiedSimList();
+  const entry = unified.find((e) => e.id === entryId);
+  if (!entry) return;
+  const ok = await showConfirm({
+    title: "Add to SIM Database?",
+    message: `This will create a SIM Database entry for:<br><br>
+              <strong>Primary:</strong> ${escapeHtml(entry.primary || "—")}<br>
+              <strong>Secondary:</strong> ${escapeHtml(entry.secondary || "—")}<br><br>
+              You'll then be able to add/edit either number directly.`,
+    confirmLabel: "+ Add to DB",
+  });
+  if (!ok) return;
+  try {
+    const newSim = {
+      id: crypto.randomUUID(),
+      primaryNumber: entry.primary || "",
+      secondaryNumber: entry.secondary || "",
+      notes: entry.vehicleNo
+        ? `Auto-promoted from installation (${entry.vehicleNo})`
+        : entry.stockProject
+        ? `Auto-promoted from stock (${entry.stockProject})`
+        : "Auto-promoted to SIM DB",
+      createdAt: new Date().toISOString(),
+      createdBy: currentUser || "admin",
+    };
+    const saved = await insertSim(newSim);
+    sims.push(saved);
+    render();
+    showToast("Added to SIM Database. You can now edit.");
+    // Auto-open the editor
+    setTimeout(() => openSimEditor(saved.id), 200);
   } catch (err) {
-    showToast(err.message || "Failed to update SIM status.", true);
+    showToast(err.message || "Failed to add.", true);
   }
 }
 
+async function swapSingleEntry(entryId) {
+  const unified = buildUnifiedSimList();
+  const entry = unified.find((e) => e.id === entryId);
+  if (!entry || !entry.looksSwapped) return;
+  const tail = (s) => {
+    const v = String(s || "");
+    return v.length > 16 ? "…" + v.slice(-14) : v;
+  };
+  const ok = await showConfirm({
+    title: "Swap primary & secondary?",
+    message: `Current:<br>
+              <strong>Primary:</strong> <code>${escapeHtml(entry.primary)}</code><br>
+              <strong>Secondary:</strong> <code>${escapeHtml(entry.secondary)}</code><br><br>
+              After swap:<br>
+              <strong>Primary:</strong> <code>${escapeHtml(entry.secondary)}</code><br>
+              <strong>Secondary:</strong> <code>${escapeHtml(entry.primary)}</code>`,
+    confirmLabel: "↔ Confirm Swap",
+  });
+  if (!ok) return;
+  try {
+    await applySwap(entry);
+    await refreshAllData();
+    render();
+    showToast("✓ Swapped successfully.");
+  } catch (err) {
+    showToast(err.message || "Swap failed.", true);
+  }
+}
+
+function openBulkSwapModal() {
+  const unified = buildUnifiedSimList();
+  const swapped = unified.filter((e) => e.looksSwapped);
+  if (swapped.length === 0) {
+    showToast("No SIMs need swapping.");
+    return;
+  }
+
+  // Preview list — show before/after
+  const previewHtml = swapped.slice(0, 20).map((e, i) => {
+    const tail = (s) => {
+      const v = String(s || "");
+      return v.length > 16 ? "…" + v.slice(-14) : v;
+    };
+    return `
+      <div class="swap-preview-row">
+        <div class="swap-preview-num">${i + 1}</div>
+        <div class="swap-preview-before">
+          <div class="swap-preview-label">BEFORE</div>
+          <div class="swap-preview-line"><span>P:</span> <span class="mono swap-wrong">${escapeHtml(tail(e.primary))}</span></div>
+          <div class="swap-preview-line"><span>S:</span> <span class="mono swap-wrong">${escapeHtml(tail(e.secondary))}</span></div>
+        </div>
+        <div class="swap-preview-arrow">↔</div>
+        <div class="swap-preview-after">
+          <div class="swap-preview-label">AFTER</div>
+          <div class="swap-preview-line"><span>P:</span> <span class="mono swap-right">${escapeHtml(tail(e.secondary))}</span></div>
+          <div class="swap-preview-line"><span>S:</span> <span class="mono swap-right">${escapeHtml(tail(e.primary))}</span></div>
+        </div>
+        <div class="swap-preview-src">
+          ${e.sources.map(sourceBadgeHtml).join(" ")}
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  modal.innerHTML = `
+    <h3 style="margin:0 0 0.4rem;">↔️ Bulk Swap Primary & Secondary</h3>
+    <p class="modal-desc">
+      <strong>${swapped.length}</strong> SIM${swapped.length === 1 ? " has" : "s have"} primary/secondary in wrong fields.
+      Numbers starting with <code>89</code> will move to <strong>Secondary (ICCID)</strong> and others to <strong>Primary</strong>.
+      ${swapped.length > 20 ? `<br><br>Showing first 20 below. All ${swapped.length} will be processed.` : ""}
+    </p>
+
+    <div class="swap-preview-list">
+      ${previewHtml}
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-warn" data-act="confirm">↔ Confirm Swap All (${swapped.length})</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modal.querySelector('[data-act="confirm"]').onclick = () => executeBulkSwap(swapped);
+}
+
+async function executeBulkSwap(swapped) {
+  let successCount = 0;
+  let errorCount = 0;
+  const errors = [];
+
+  // Disable button + show progress
+  const confirmBtn = modal.querySelector('[data-act="confirm"]');
+  if (confirmBtn) {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = `Swapping 0 / ${swapped.length}…`;
+  }
+
+  for (let i = 0; i < swapped.length; i++) {
+    const e = swapped[i];
+    try {
+      await applySwap(e);
+      successCount++;
+    } catch (err) {
+      errorCount++;
+      errors.push({ entry: e, message: err.message });
+      console.error("Swap failed for", e, err);
+    }
+    if (confirmBtn) {
+      confirmBtn.textContent = `Swapping ${i + 1} / ${swapped.length}…`;
+    }
+  }
+
+  // Refresh data so changes reflect
+  await refreshAllData();
+  closeModal();
+  render();
+
+  if (errorCount === 0) {
+    showToast(`✓ ${successCount} SIM${successCount === 1 ? "" : "s"} swapped successfully.`);
+  } else if (successCount === 0) {
+    // All failed — show first error message for quick diagnosis
+    const firstErr = errors[0]?.message || "Unknown error";
+    console.error("All swaps failed. First error:", firstErr, "All errors:", errors);
+    showToast(`❌ 0 swapped, ${errorCount} failed. First error: ${firstErr.slice(0, 80)}. See console.`, true);
+  } else {
+    console.error("Partial swap failures:", errors);
+    showToast(`⚠️ ${successCount} OK, ${errorCount} failed. See console for details.`, true);
+  }
+}
+
+/**
+ * Swaps primary <-> secondary for a single unified entry, across whichever
+ * sources it came from (sims table, installation, stock metadata).
+ */
+async function applySwap(entry) {
+  const newPrimary = entry.secondary;   // what was in Secondary is now Primary
+  const newSecondary = entry.primary;   // what was in Primary is now Secondary
+  let didAnyUpdate = false;
+
+  // 1) sims table entry
+  if (entry.simRecordId) {
+    const existing = sims.find((s) => s.id === entry.simRecordId);
+    if (existing) {
+      const updated = {
+        ...existing,
+        primaryNumber: newPrimary || null,
+        secondaryNumber: newSecondary || null,
+      };
+      await updateSim(updated);
+      const idx = sims.findIndex((s) => s.id === existing.id);
+      if (idx >= 0) sims[idx] = updated;
+      didAnyUpdate = true;
+    }
+  }
+
+  // 2) installation entry — swap Primary (simHistory[last].value) and Secondary (inst.secondarySim)
+  //    CRITICAL: Preserve object shape of simHistory items. Never replace an entry with a string.
+  if (entry.installId) {
+    const inst = installations.find((i) => i.id === entry.installId);
+    if (inst) {
+      // Deep-copy simHistory so we don't mutate cache
+      const newHistory = (inst.simHistory || []).map((h) =>
+        typeof h === "object" && h !== null ? { ...h } : { value: String(h || ""), addedAt: new Date().toISOString(), active: true, pendingDeactivation: false }
+      );
+
+      // Find the last active entry (or last entry)
+      let target = null;
+      for (let i = newHistory.length - 1; i >= 0; i--) {
+        if (newHistory[i].active) { target = newHistory[i]; break; }
+      }
+      if (!target && newHistory.length > 0) target = newHistory[newHistory.length - 1];
+
+      if (target) {
+        target.value = newPrimary || "";
+        target.secondaryValue = newSecondary || "";
+      } else {
+        // Empty history — create new entry
+        newHistory.push({
+          value: newPrimary || "",
+          secondaryValue: newSecondary || "",
+          addedAt: new Date().toISOString(),
+          active: true,
+          pendingDeactivation: false,
+        });
+      }
+
+      const updated = {
+        ...inst,
+        simHistory: newHistory,
+        secondarySim: newSecondary || "",
+      };
+      await updateInstallation(updated);
+      const idx = installations.findIndex((i) => i.id === inst.id);
+      if (idx >= 0) installations[idx] = updated;
+      didAnyUpdate = true;
+    }
+  }
+
+  // 3) stock entry — swap metadata.primary <-> metadata.secondary (or m.imei)
+  if (entry.stockItemId) {
+    const item = stockItems.find((s) => s.id === entry.stockItemId);
+    if (item) {
+      const newMeta = { ...(item.metadata || {}) };
+      newMeta.primary = newPrimary || "";
+      newMeta.secondary = newSecondary || "";
+      // Clean legacy field: bulk-scan used to store ICCID in metadata.imei
+      if (newMeta.imei && (newMeta.imei === entry.primary || newMeta.imei === entry.secondary)) {
+        delete newMeta.imei;
+      }
+      const updated = { ...item, metadata: newMeta };
+      await updateStockItem(updated);
+      const idx = stockItems.findIndex((s) => s.id === item.id);
+      if (idx >= 0) stockItems[idx] = updated;
+      didAnyUpdate = true;
+    }
+  }
+
+  if (!didAnyUpdate) {
+    throw new Error(`Nothing to swap — entry has no valid source. Primary=${entry.primary}, Secondary=${entry.secondary}, sources=${(entry.sources || []).join(",")}`);
+  }
+}
+
+function exportUnifiedSimsToExcel(list) {
+  try {
+    const rows = list.map((e) => ({
+      "Primary (Mobile No)": e.primary || "",
+      "Secondary (ICCID)": e.secondary || "",
+      Status: e.completeness === "complete" ? "Complete" : e.completeness === "needs_primary" ? "Needs Primary" : "Needs Secondary",
+      Sources: e.sources.join(", "),
+      Vehicle: e.vehicleNo || "",
+      "Stock Project": e.stockProject || "",
+      Notes: e.notes || "",
+    }));
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, "Unified SIMs");
+    XLSX.writeFile(wb, `unified-sims-${new Date().toISOString().slice(0, 10)}.xlsx`);
+    showToast("Exported.");
+  } catch (err) {
+    showToast("Export failed: " + err.message, true);
+  }
+}
+
+function _OLD_renderSimDb_v321() {
+  if (!simsTableReady) {
+    app.innerHTML = `
+      ${renderHeader("SIM Database", "Standalone SIM inventory")}
+      <main class="main">
+        ${renderAdminNav("sim-db")}
+        <section class="card">
+          <h2>⚙️ Migration needed</h2>
+          <p>The new SIM database needs a one-time setup. One-time setup needed — <code>sims-table-migration.sql</code>, then come back here.</p>
+          <div class="form-actions" style="margin-top: 1rem;">
+            <span class="hint">Contact administrator to complete setup.</span>
+            <button type="button" class="btn btn-secondary" id="retrySimDb">↻ Reload</button>
+          </div>
+        </section>
+      </main>
+    `;
+    bindLogout();
+    bindAdminNav();
+    document.getElementById("retrySimDb")?.addEventListener("click", async () => {
+      renderLoading("Checking SIM table...");
+      try {
+        await refreshAllData();
+        render();
+      } catch (err) {
+        renderConnectionError(err.message);
+      }
+    });
+    return;
+  }
+
+  const allSims = loadSims();
+  const allInstalls = loadInstallations();
+
+  // Pre-compute which installation is currently using a given SIM (by either
+  // primary or secondary value).
+  function findUsingInstallation(sim) {
+    const primary = (sim.primaryNumber || "").toLowerCase();
+    const secondary = (sim.secondaryNumber || "").toLowerCase();
+    return allInstalls.find((inst) => {
+      return inst.simHistory.some((s) => {
+        const v = (s.value || "").toLowerCase();
+        const sv = (s.secondaryValue || "").toLowerCase();
+        const active = s.active && !s.pendingDeactivation;
+        return (
+          active &&
+          ((v && (v === primary || v === secondary)) ||
+            (sv && (sv === primary || sv === secondary)))
+        );
+      });
+    });
+  }
+
+  function simStatus(sim) {
+    if (!sim.primaryNumber) return { label: "Pending primary", className: "status-warn" };
+    const inst = findUsingInstallation(sim);
+    if (inst) return { label: `In use · ${inst.vehicleNo}`, className: "status-ok" };
+    return { label: "Available", className: "status-muted" };
+  }
+
+  const q = simDbQuery.toLowerCase().trim();
+  const tokens = q.split(/\s+/).filter(Boolean);
+  const matches = allSims.filter((s) => {
+    if (!q) return true;
+    const hay = [s.primaryNumber || "", s.secondaryNumber || "", s.notes || ""]
+      .join(" ")
+      .toLowerCase();
+    return tokens.every((t) => hay.includes(t));
+  });
+  matches.sort((a, b) => {
+    // Pending-primary rows first, then alphabetical by secondary.
+    const ap = !a.primaryNumber ? 0 : 1;
+    const bp = !b.primaryNumber ? 0 : 1;
+    if (ap !== bp) return ap - bp;
+    return (a.secondaryNumber || "").localeCompare(b.secondaryNumber || "");
+  });
+
+  const totalSims = allSims.length;
+  const pendingPrimary = allSims.filter((s) => !s.primaryNumber).length;
+  const inUseCount = allSims.filter((s) => findUsingInstallation(s)).length;
+  const availableCount = totalSims - inUseCount - pendingPrimary;
+
+  const swappedCount = allSims.filter(simLooksSwapped).length;
+
+  const tableHtml = matches.length
+    ? matches
+        .map((sim) => {
+          const status = simStatus(sim);
+          const isSwapped = simLooksSwapped(sim);
+          // If the row's data looks swapped, display it in the CORRECT order
+          // visually so the table is immediately readable while the user
+          // decides whether to persist the swap via the Fix button.
+          const displayPrimary = isSwapped ? sim.secondaryNumber : sim.primaryNumber;
+          const displaySecondary = isSwapped ? sim.primaryNumber : sim.secondaryNumber;
+          const primaryCell = displayPrimary || `<span class="muted">Not set</span>`;
+          return `
+            <tr class="${isSwapped ? "row-swap-warn" : ""}">
+              <td class="mono">
+                ${typeof primaryCell === "string" && primaryCell.startsWith("<") ? primaryCell : escapeHtml(primaryCell)}
+                ${isSwapped ? `<span class="swap-tag" title="Stored swapped in the database — showing the corrected order here. Click ↔ Fix to make it permanent.">auto-corrected display</span>` : ""}
+              </td>
+              <td class="mono">${escapeHtml(displaySecondary || "")}</td>
+              <td><span class="sim-status ${status.className}">${escapeHtml(status.label)}</span></td>
+              <td>${escapeHtml(sim.notes || "")}</td>
+              <td class="date-cell">${escapeHtml(formatDateTime(sim.createdAt))}</td>
+              <td class="row-actions">
+                ${isSwapped ? `<button type="button" class="btn btn-warn btn-sm sim-row-fix" data-id="${sim.id}" title="Persist the swap in the database">↔ Fix in DB</button>` : ""}
+                <button type="button" class="btn btn-outline btn-sm sim-row-edit" data-id="${sim.id}">✎ Edit</button>
+                <button type="button" class="btn btn-danger btn-sm sim-row-delete" data-id="${sim.id}">Delete</button>
+              </td>
+            </tr>`;
+        })
+        .join("")
+    : `<tr class="empty-row"><td colspan="6">${q ? `No SIMs match "${escapeHtml(simDbQuery)}".` : "No SIMs in the database yet. Use SIM Upload to add some."}</td></tr>`;
+
+  app.innerHTML = `
+    ${renderHeader("SIM Database", "Independent inventory of SIM cards (primary + secondary)")}
+    <main class="main">
+      ${renderAdminNav("sim-db")}
+      <div class="summary-grid">
+        <div class="summary-box summary-info"><strong>${totalSims}</strong><span>Total SIMs</span></div>
+        <div class="summary-box summary-purple"><strong>${inUseCount}</strong><span>In use</span></div>
+        <div class="summary-box summary-ok"><strong>${availableCount}</strong><span>Available</span></div>
+        <div class="summary-box ${pendingPrimary ? "summary-warn" : ""}"><strong>${pendingPrimary}</strong><span>Pending primary</span></div>
+        ${swappedCount ? `<div class="summary-box summary-danger"><strong>${swappedCount}</strong><span>Looks swapped</span></div>` : ""}
+      </div>
+      ${swappedCount ? `
+        <div class="swap-banner">
+          <span>⚠️ <strong>${swappedCount}</strong> SIM${swappedCount === 1 ? " is" : "s are"} stored with primary &amp; secondary swapped in the database. The table below is showing them auto-corrected for readability, but the database still has them backwards. Click below to fix them permanently.</span>
+          <button type="button" class="btn btn-warn btn-sm" id="fixAllSwap">↔ Fix all in DB</button>
+        </div>
+      ` : ""}
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>All SIMs (${totalSims})</h2>
+            <p class="section-subtitle">Each SIM card has a primary number (13-digit, given by telecom) and a secondary number (20-digit ICCID, printed on the card). Akash sees only the ICCID — the system looks up the primary from this database when he saves an entry.</p>
+          </div>
+          <div class="bulk-actions">
+            <button type="button" class="btn btn-secondary btn-sm" id="addSimBtn">+ Add SIM</button>
+            <button type="button" class="btn btn-primary btn-sm" data-nav="sim-upload">↑ Bulk upload</button>
+            <button type="button" class="btn btn-outline btn-sm" id="exportSimsBtn">↓ Export Excel</button>
+          </div>
+        </div>
+        <div class="list-tools admin-search sticky-search">
+          <input type="search" id="simSearch" placeholder="Search primary, secondary, notes..." value="${escapeHtml(simDbQuery)}" />
+        </div>
+        <div class="table-wrap sims-table-desktop">
+          <table>
+            <thead>
+              <tr><th>Primary</th><th>Secondary (ICCID)</th><th>Status</th><th>Notes</th><th>Added</th><th></th></tr>
+            </thead>
+            <tbody>${tableHtml}</tbody>
+          </table>
+        </div>
+        <!-- Mobile card grid -->
+        <div class="sims-card-grid">
+          ${matches.length
+            ? matches.map((sim) => {
+                const status = simStatus(sim);
+                const isSwapped = simLooksSwapped(sim);
+                const displayPrimary = isSwapped ? sim.secondaryNumber : sim.primaryNumber;
+                const displaySecondary = isSwapped ? sim.primaryNumber : sim.secondaryNumber;
+                const tail = (s, n = 8) => {
+                  const v = String(s || "");
+                  return v.length > n ? "…" + v.slice(-n) : v || "—";
+                };
+                return `
+                  <article class="tk-card ${isSwapped ? "tk-card-warn" : ""}">
+                    <div class="tk-card-head">
+                      <span class="tk-pill">${escapeHtml(displayPrimary || "Pending primary")}</span>
+                      <span class="tk-chip sim-status-${status.className}">${escapeHtml(status.label)}</span>
+                    </div>
+                    <div class="tk-stats">
+                      <div class="tk-stat tk-stat-full">
+                        <span class="tk-stat-icon">📶</span>
+                        <span class="tk-stat-label">Secondary No:</span>
+                        <span class="tk-stat-value">${escapeHtml(tail(displaySecondary, 10))}</span>
+                      </div>
+                      ${sim.notes ? `
+                        <div class="tk-stat tk-stat-full">
+                          <span class="tk-stat-icon">📝</span>
+                          <span class="tk-stat-label">Notes:</span>
+                          <span class="tk-stat-value" style="white-space:normal;">${escapeHtml(sim.notes)}</span>
+                        </div>
+                      ` : ""}
+                    </div>
+                    ${isSwapped ? `<div class="tk-reason" style="background:#fef3c7;color:#92400e;border-color:#f59e0b;">⚠️ Stored swapped — auto-corrected display</div>` : ""}
+                    <div class="tk-footer">
+                      <div class="tk-footer-row">
+                        <span class="tk-footer-icon">📅</span>
+                        <span class="tk-footer-label">Added:</span>
+                        <span class="tk-footer-value">${escapeHtml(formatDateTime(sim.createdAt))}</span>
+                      </div>
+                    </div>
+                    <div class="tk-actions">
+                      ${isSwapped ? `<button type="button" class="btn btn-warn btn-sm sim-row-fix" data-id="${sim.id}">↔ Fix</button>` : ""}
+                      <button type="button" class="btn btn-outline btn-sm sim-row-edit" data-id="${sim.id}">✎ Edit</button>
+                      <button type="button" class="btn btn-danger btn-sm sim-row-delete" data-id="${sim.id}">🗑</button>
+                    </div>
+                  </article>
+                `;
+              }).join("")
+            : `<div class="entry-empty"><div class="entry-empty-icon">📶</div><h3>No SIMs found</h3><p>${q ? `Try a different search.` : `Use SIM Upload to bulk-add.`}</p></div>`
+          }
+        </div>
+      </section>
+    </main>
+  `;
+  bindLogout();
+  bindAdminNav();
+
+  const searchEl = document.getElementById("simSearch");
+  searchEl?.addEventListener("input", (e) => {
+    simDbQuery = e.target.value;
+    render();
+    const el = document.getElementById("simSearch");
+    if (el) {
+      el.focus();
+      const v = el.value;
+      el.setSelectionRange(v.length, v.length);
+    }
+  });
+
+  document.getElementById("addSimBtn")?.addEventListener("click", () => openSimEditor(null));
+  document.getElementById("exportSimsBtn")?.addEventListener("click", exportSimsToExcel);
+  app.querySelectorAll(".sim-row-edit").forEach((btn) => {
+    btn.addEventListener("click", () => openSimEditor(btn.dataset.id));
+  });
+  app.querySelectorAll(".sim-row-delete").forEach((btn) => {
+    btn.addEventListener("click", () => onDeleteSim(btn.dataset.id));
+  });
+  app.querySelectorAll(".sim-row-fix").forEach((btn) => {
+    btn.addEventListener("click", () => onFixSwappedSim(btn.dataset.id));
+  });
+  document.getElementById("fixAllSwap")?.addEventListener("click", onFixAllSwappedSims);
+}
+
+async function onFixSwappedSim(simId) {
+  const sim = loadSims().find((s) => s.id === simId);
+  if (!sim) return;
+  const ok = await showConfirm({
+    title: "Swap primary ↔ secondary?",
+    message: `Move <strong>${escapeHtml(sim.primaryNumber || "")}</strong> to the secondary slot and <strong>${escapeHtml(sim.secondaryNumber || "")}</strong> to the primary slot?`,
+    confirmLabel: "Swap",
+  });
+  if (!ok) return;
+  renderLoading("Swapping numbers...");
+  try {
+    // We can't just swap because secondary_number is the unique key. Easiest
+    // safe path: delete the row, then re-insert with the swapped values.
+    await deleteSim(simId);
+    await upsertSim({
+      primaryNumber: sim.secondaryNumber || null,
+      secondaryNumber: sim.primaryNumber || "",
+      notes: sim.notes,
+    });
+    await refreshAllData();
+    render();
+    showToast("Swapped.");
+  } catch (err) {
+    await refreshAllData();
+    render();
+    showToast(err.message || "Swap failed.", true);
+  }
+}
+
+async function onFixAllSwappedSims() {
+  const targets = loadSims().filter(simLooksSwapped);
+  if (!targets.length) {
+    showToast("Nothing to fix.");
+    return;
+  }
+  const ok = await showConfirm({
+    title: `Auto-fix ${targets.length} SIM${targets.length === 1 ? "" : "s"}?`,
+    message: `Swap primary ↔ secondary for all SIMs where the primary slot looks like a 20-digit ICCID. This cannot be undone in one click — but each row can be edited manually afterwards.`,
+    confirmLabel: "Fix all",
+  });
+  if (!ok) return;
+  renderLoading(`Fixing ${targets.length} SIMs...`);
+  let fixed = 0;
+  for (const sim of targets) {
+    try {
+      await deleteSim(sim.id);
+      await upsertSim({
+        primaryNumber: sim.secondaryNumber || null,
+        secondaryNumber: sim.primaryNumber || "",
+        notes: sim.notes,
+      });
+      fixed += 1;
+    } catch (err) {
+      console.warn("Auto-fix swap failed for SIM", sim.id, err);
+    }
+  }
+  await refreshAllData();
+  render();
+  showToast(`${fixed} of ${targets.length} SIMs fixed.`, fixed < targets.length);
+}
+
+function openSimEditor(simId) {
+  const sim = simId ? loadSims().find((s) => s.id === simId) : null;
+  modal.innerHTML = `
+    <h3>${sim ? "✎ Edit SIM" : "+ Add SIM"}</h3>
+    <div class="field">
+      <label for="simPrimary">Primary number (13-digit)</label>
+      <input type="text" id="simPrimary" class="mono" inputmode="numeric" autocomplete="off" placeholder="e.g. 5753200309565" value="${escapeHtml(sim?.primaryNumber || "")}" />
+    </div>
+    <div class="field">
+      <label for="simSecondary">Secondary number / ICCID (20-digit) <span class="required">*</span></label>
+      <input type="text" id="simSecondary" class="mono" inputmode="numeric" autocomplete="off" placeholder="e.g. 89918720507069156677" value="${escapeHtml(sim?.secondaryNumber || "")}" />
+    </div>
+    <div class="field">
+      <label for="simNotes">Notes (optional)</label>
+      <input type="text" id="simNotes" autocomplete="off" placeholder="e.g. Spare batch March 2026" value="${escapeHtml(sim?.notes || "")}" />
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" data-act="save">${sim ? "Save changes" : "Add SIM"}</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+
+  modalOverlay.onclick = (e) => {
+    if (e.target === modalOverlay) closeModal();
+  };
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+
+  modal.querySelector('[data-act="save"]').onclick = async () => {
+    let primary = modal.querySelector("#simPrimary").value.trim();
+    let secondary = modal.querySelector("#simSecondary").value.trim();
+    const notes = modal.querySelector("#simNotes").value.trim() || null;
+    if (!secondary) {
+      showToast("Secondary number (ICCID) is required.", true);
+      return;
+    }
+    // Auto-detect swap and offer to fix before saving.
+    if (pairLooksSwapped(primary, secondary)) {
+      const swap = await showConfirm({
+        title: "Numbers look swapped",
+        message: `<strong>${escapeHtml(primary)}</strong> looks like a 20-digit ICCID (should be the secondary), and <strong>${escapeHtml(secondary)}</strong> looks like a 13-digit primary number. Swap them automatically before saving?`,
+        confirmLabel: "Swap & save",
+      });
+      if (swap) {
+        const tmp = primary;
+        primary = secondary;
+        secondary = tmp;
+      }
+    }
+    closeModal();
+    renderLoading(sim ? "Saving changes..." : "Adding SIM...");
+    try {
+      if (sim) {
+        await updateSim({ id: sim.id, primaryNumber: primary || null, secondaryNumber: secondary, notes });
+      } else {
+        await upsertSim({ primaryNumber: primary || null, secondaryNumber: secondary, notes });
+      }
+      await refreshAllData();
+      render();
+      showToast(sim ? "SIM updated." : "SIM added.");
+    } catch (err) {
+      await refreshAllData();
+      render();
+      showToast(err.message || "Save failed.", true);
+    }
+  };
+}
+
+async function onDeleteSim(simId) {
+  const sim = loadSims().find((s) => s.id === simId);
+  if (!sim) return;
+  const ok = await showConfirm({
+    title: "Delete this SIM?",
+    message: `Remove SIM (primary: ${sim.primaryNumber || "—"}, secondary: ${sim.secondaryNumber}) from the database? This does not affect existing installation history.`,
+    confirmLabel: "Delete",
+    danger: true,
+  });
+  if (!ok) return;
+  renderLoading("Deleting SIM...");
+  try {
+    await deleteSim(simId);
+    await refreshAllData();
+    render();
+    showToast("SIM deleted.");
+  } catch (err) {
+    await refreshAllData();
+    render();
+    showToast(err.message || "Delete failed.", true);
+  }
+}
+
+/* ---------------- Page 7: Timeline (preserved) ---------------- */
+
+/* ---------------- Page 8: Stock Inventory ---------------- */
+
+// Default category list used to seed the DB (also used as fallback if the
+// stock_categories migration hasn't been run yet).
+const STOCK_CATEGORIES_DEFAULT = [
+  "GPS",
+  "SIM-AIRTEL",
+  "SIM-JIO",
+  "Sensor",
+  "Roll",
+  "Tape",
+  "Drill",
+  "Drill beat",
+];
+
+// Live category options used in dropdowns: admin-managed list from the DB,
+// merged with any categories already used by existing items (so categories
+// added before the table migration don't disappear).
+function getCategoryOptions() {
+  const fromDb = stockCategories.map((c) => c.name);
+  const fromItems = stockItems.map((i) => i.category).filter(Boolean);
+  const merged = stockCategoriesTableReady
+    ? Array.from(new Set([...fromDb, ...fromItems]))
+    : Array.from(new Set([...STOCK_CATEGORIES_DEFAULT, ...fromItems]));
+  return merged.sort();
+}
+
+const STOCK_UNITS = ["pcs", "set", "box", "meters", "kg", "liters", "pack"];
+
+// Detect what kind of identifiers this category needs.
+function categoryKind(category) {
+  if (!category) return "generic";
+  const c = String(category).toUpperCase();
+  if (c.includes("GPS")) return "gps";
+  if (c.includes("SIM")) return "sim";
+  if (c.includes("SENSOR")) return "sensor";
+  return "generic";
+}
+
+// "Trackable" items each represent ONE specific device (unique IMEI, ICCID,
+// sensor No / MAC). For these, qty is always 1 (in stock) or 0 (installed),
+// so the "low stock" concept is meaningless and shouldn't be applied.
+// Low-stock alerts only make sense for bulk consumables (Roll, Tape, Drill...).
+function isTrackableCategory(category) {
+  const k = categoryKind(category);
+  return k === "gps" || k === "sim" || k === "sensor";
+}
+
+// --- Name normalization & fuzzy matching for duplicate prevention ---
+
+// Strip all non-alphanumeric, lowercase. "FMB-02" / "fmb 02" -> "fmb02"
+function normalizeName(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+// Lowercase + sort tokens. "02 FMB" / "FMB-02" both -> "02 fmb"
+function tokenSorted(s) {
+  return String(s || "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)
+    .sort()
+    .join(" ");
+}
+
+// Classic Levenshtein distance — bounded so we exit early for cheap.
+function levenshtein(a, b, max = 3) {
+  if (a === b) return 0;
+  const m = a.length;
+  const n = b.length;
+  if (Math.abs(m - n) > max) return max + 1;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = new Array(n + 1);
+  let curr = new Array(n + 1);
+  for (let j = 0; j <= n; j += 1) prev[j] = j;
+  for (let i = 1; i <= m; i += 1) {
+    curr[0] = i;
+    let rowMin = i;
+    for (let j = 1; j <= n; j += 1) {
+      const cost = a.charCodeAt(i - 1) === b.charCodeAt(j - 1) ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+      if (curr[j] < rowMin) rowMin = curr[j];
+    }
+    if (rowMin > max) return max + 1;
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n];
+}
+
+// Find the closest existing item to a typed name. Returns { item, reason } or null.
+//   reason = "exact"   -> normalized strings identical
+//   reason = "tokens"  -> same words, different order/separator
+//   reason = "typo"    -> Levenshtein <= 2 (after normalization)
+function findClosestItem(query, excludeId = null) {
+  const items = loadStockItems().filter((i) => i.id !== excludeId);
+  if (!items.length) return null;
+  const qNorm = normalizeName(query);
+  if (qNorm.length < 2) return null;
+  const qSort = tokenSorted(query);
+
+  for (const it of items) {
+    if (normalizeName(it.name) === qNorm) return { item: it, reason: "exact" };
+  }
+  if (qSort) {
+    for (const it of items) {
+      if (tokenSorted(it.name) === qSort) return { item: it, reason: "tokens" };
+    }
+  }
+  if (qNorm.length >= 3) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const it of items) {
+      const d = levenshtein(qNorm, normalizeName(it.name), 2);
+      if (d <= 2 && d < bestDist) {
+        bestDist = d;
+        best = it;
+      }
+    }
+    if (best) return { item: best, reason: "typo" };
+  }
+  return null;
+}
+
+// Rank items for the suggestion dropdown given a query.
+function rankItemSuggestions(query, excludeId = null) {
+  const items = loadStockItems().filter((i) => i.id !== excludeId);
+  if (!items.length) return [];
+
+  // Sort by createdAt desc so recent items naturally come first.
+  const byRecent = [...items].sort(
+    (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+  );
+
+  const q = (query || "").trim();
+  if (!q) {
+    return byRecent.slice(0, 8).map((it) => ({ item: it, reason: "recent" }));
+  }
+
+  const qNorm = normalizeName(q);
+  const qSort = tokenSorted(q);
+
+  const scored = byRecent
+    .map((it) => {
+      const nNorm = normalizeName(it.name);
+      const nSort = tokenSorted(it.name);
+      let score = 0;
+      let reason = "";
+      if (nNorm === qNorm) {
+        score = 100;
+        reason = "exact";
+      } else if (nSort === qSort && qSort) {
+        score = 90;
+        reason = "tokens";
+      } else if (nNorm.startsWith(qNorm)) {
+        score = 70;
+        reason = "starts";
+      } else if (nNorm.includes(qNorm)) {
+        score = 60;
+        reason = "contains";
+      } else if (qNorm.length >= 3 && levenshtein(qNorm, nNorm, 2) <= 2) {
+        score = 40;
+        reason = "typo";
+      }
+      return { item: it, score, reason };
+    })
+    .filter((s) => s.score > 0);
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 8);
+}
+
+// Render a short summary line for an item's metadata (for the table row).
+/**
+ * Searches across stockItems, installations, and sims table for any record
+ * containing the given code (IMEI / ICCID / mobile). Returns first match.
+ *
+ * Options:
+ *   - skipStock: true  → don't count stock matches as duplicates
+ *                        (use this for install scans — Akash IS taking from stock)
+ *   - skipInstallHistory: true  → don't count old history IMEI/SIMs as duplicates
+ */
+function findExistingCode(value, options = {}) {
+  const norm = String(value || "").trim();
+  if (!norm) return null;
+  const skipStock = !!options.skipStock;
+  const skipHistory = !!options.skipInstallHistory;
+
+  // 1) Stock items — only if not skipped
+  if (!skipStock) {
+    for (const item of stockItems) {
+      const m = item.metadata || {};
+      if (m.imei === norm || m.secondary === norm || m.primary === norm || m.macId === norm) {
+        const where = m.imei === norm ? "IMEI" : m.secondary === norm ? "Secondary" : m.primary === norm ? "Primary" : "MAC";
+        return {
+          source: "stock",
+          label: `Already in Stock as ${item.name} (${where})`,
+          item,
+        };
+      }
+    }
+  }
+
+  // 2) Installations — check current IMEI, current SIM, secondary SIM, plus history
+  for (const inst of installations) {
+    const currentImei = getCurrentImei(inst) || "";
+    const currentSim = getCurrentSim(inst) || "";
+    const secondary = inst.secondarySim || "";
+    if (currentImei === norm) {
+      return {
+        source: "install",
+        label: `Already installed in ${inst.vehicleNo} (current IMEI)`,
+        install: inst,
+      };
+    }
+    if (currentSim === norm) {
+      return {
+        source: "install",
+        label: `Already used in ${inst.vehicleNo} (Primary SIM)`,
+        install: inst,
+      };
+    }
+    if (secondary === norm) {
+      return {
+        source: "install",
+        label: `Already used in ${inst.vehicleNo} (Secondary SIM)`,
+        install: inst,
+      };
+    }
+    // Old history — soft signal, can be skipped
+    if (!skipHistory) {
+      if ((inst.imeiHistory || []).some((h) => h.value === norm)) {
+        return {
+          source: "install_history",
+          label: `Previously used in ${inst.vehicleNo} (old IMEI)`,
+          install: inst,
+        };
+      }
+      if ((inst.simHistory || []).some((h) => h.value === norm || h.secondaryValue === norm)) {
+        return {
+          source: "install_history",
+          label: `Previously used in ${inst.vehicleNo} (old SIM)`,
+          install: inst,
+        };
+      }
+    }
+  }
+
+  // 3) Manual SIM DB — informational, not a hard duplicate
+  for (const sim of sims) {
+    if (sim.primaryNumber === norm || sim.secondaryNumber === norm) {
+      const where = sim.primaryNumber === norm ? "Primary" : "Secondary";
+      return {
+        source: "sim_db",
+        label: `Already in SIM Database (${where})`,
+        sim,
+      };
+    }
+  }
+
+  return null;
+}
+
+function stockMetadataSummary(item) {
+  const kind = categoryKind(item.category);
+  const m = item.metadata || {};
+  if (kind === "gps" && m.imei) return `IMEI: ${m.imei}`;
+  if (kind === "sim") {
+    const p = m.primary || "";
+    const s = m.secondary || m.imei || ""; // fallback: bulk-scanned ICCIDs land in m.imei
+    if (p && s) return `${p} · ${s}`;
+    if (s) return `SIM NO: ${s}`;
+    if (p) return `Primary: ${p}`;
+  }
+  if (kind === "sensor") {
+    const sn = m.sensorNo || "";
+    const mac = m.macId || "";
+    if (sn && mac) return `${sn} · ${mac}`;
+    if (sn) return `Sensor: ${sn}`;
+    if (mac) return `MAC: ${mac}`;
+  }
+  // Fallback: any scanned imei in non-categorized items
+  if (m.imei) return `Code: ${m.imei}`;
+  return "";
+}
+
+/**
+ * Returns the primary copyable value for an item (the one user wants to copy most).
+ * GPS → IMEI, SIM → ICCID (scanned), Sensor → sensor no, etc.
+ * Returns { value, label } or null.
+ */
+function stockCopyableValue(item) {
+  const kind = categoryKind(item.category);
+  const m = item.metadata || {};
+  if (kind === "gps" && m.imei) return { value: m.imei, label: "IMEI" };
+  if (kind === "sim") {
+    const iccid = m.secondary || m.imei || "";
+    if (iccid) return { value: iccid, label: "SIM NO" };
+    if (m.primary) return { value: m.primary, label: "Primary" };
+  }
+  if (kind === "sensor") {
+    if (m.sensorNo) return { value: m.sensorNo, label: "Sensor" };
+    if (m.macId) return { value: m.macId, label: "MAC" };
+  }
+  if (m.imei) return { value: m.imei, label: "Code" };
+  return null;
+}
+
+/** Renders an inline copy button HTML next to the value. */
+function stockCopyBtn(value, label) {
+  if (!value) return "";
+  return `<button type="button" class="stock-copy-btn" data-copy="${escapeHtml(value)}" data-label="${escapeHtml(label || "Value")}" aria-label="Copy ${escapeHtml(label || "value")}" title="Copy ${escapeHtml(value)}">⎘</button>`;
+}
+
+function renderStockPage() {
+  if (!stockItemsTableReady) {
+    app.innerHTML = `
+      ${renderHeader("Stock Inventory", "Equipment & spares")}
+      <main class="main">
+        ${renderAdminNav("stock")}
+        <section class="card">
+          <h2>⚙️ Migration needed</h2>
+          <p>The Stock page needs a one-time setup. One-time setup needed — <code>stock-items-migration.sql</code>, then come back here.</p>
+          <div class="form-actions" style="margin-top: 1rem;">
+            <span class="hint">Contact administrator to complete setup.</span>
+            <button type="button" class="btn btn-secondary" id="retryStock">↻ Reload</button>
+          </div>
+        </section>
+      </main>
+    `;
+    bindLogout();
+    bindAdminNav();
+    document.getElementById("retryStock")?.addEventListener("click", async () => {
+      renderLoading("Checking stock table...");
+      try {
+        await refreshAllData();
+        render();
+      } catch (err) {
+        renderConnectionError(err.message);
+      }
+    });
+    return;
+  }
+
+  const items = loadStockItems();
+  const q = stockQuery.toLowerCase().trim();
+
+  // Build category list from existing items + presets (deduped, sorted).
+  const liveCategories = Array.from(
+    new Set(items.map((i) => i.category).filter(Boolean))
+  );
+  const allCategoryOptions = getCategoryOptions();
+
+  let filtered = items;
+  if (stockCategoryFilter !== "all") {
+    filtered = filtered.filter((i) => (i.category || "Uncategorized") === stockCategoryFilter);
+  }
+  if (q) {
+    // Tokenise the query so "fmb 920" matches "FMB-920" and a long IMEI
+    // can be searched by any contiguous substring (like Ctrl+F).
+    const tokens = q.split(/\s+/).filter(Boolean);
+    filtered = filtered.filter((i) => {
+      const m = i.metadata || {};
+      const hay = [
+        i.name,
+        i.category || "",
+        i.unit || "",
+        i.notes || "",
+        i.supplier || "",
+        m.imei || "",
+        m.primary || "",
+        m.secondary || "",
+        m.sensorNo || "",
+        m.macId || "",
+      ]
+        .join(" ")
+        .toLowerCase();
+      // ALL tokens must match (AND search)
+      return tokens.every((t) => hay.includes(t));
+    });
+  }
+
+  // Stats
+  const totalItems = items.length;
+  const totalUnits = items.reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const totalValue = items.reduce(
+    (sum, i) => sum + (i.costPerUnit != null ? i.quantity * i.costPerUnit : 0),
+    0
+  );
+  // Low-stock only applies to BULK items (Roll, Tape, Drill...). For
+  // trackable items (GPS, SIM, Sensor) each row IS one specific unit, so
+  // the concept of "low stock" doesn't apply.
+  function isLow(item) {
+    if (isTrackableCategory(item.category)) return false;
+    return item.lowStockThreshold != null && item.quantity <= item.lowStockThreshold;
+  }
+  const lowStockItems = items.filter(isLow);
+
+  // Category filter chips — color-coded by kind so GPS/SIM/SENSOR are
+  // visually distinguishable from generic bulk categories.
+  function chipKindClass(category) {
+    const k = categoryKind(category);
+    if (k === "gps") return "chip-kind-gps";
+    if (k === "sim") return "chip-kind-sim";
+    if (k === "sensor") return "chip-kind-sensor";
+    return "chip-kind-bulk";
+  }
+  const chipsHtml = `
+    <div class="filter-chips" style="margin-bottom: 0.85rem;">
+      <button type="button" class="filter-chip ${stockCategoryFilter === "all" ? "active" : ""}" data-cat="all">All (${items.length})</button>
+      ${liveCategories
+        .sort()
+        .map((c) => {
+          const count = items.filter((i) => i.category === c).length;
+          return `<button type="button" class="filter-chip ${chipKindClass(c)} ${stockCategoryFilter === c ? "active" : ""}" data-cat="${escapeHtml(c)}">${escapeHtml(c)} (${count})</button>`;
+        })
+        .join("")}
+    </div>
+  `;
+
+  // Per-name stat chips inside the current filter — lets you see
+  // "FMB-920: 8" / "FMB-100: 4" at a glance instead of scrolling rows.
+  // Aggregates total qty per distinct item name (preserves the trackable
+  // grain — each FMB-920 stock row contributes its quantity).
+  const nameStats = {};
+  for (const it of filtered) {
+    const k = it.name;
+    if (!nameStats[k]) nameStats[k] = { qty: 0, rows: 0 };
+    nameStats[k].qty += it.quantity || 0;
+    nameStats[k].rows += 1;
+  }
+  const nameEntries = Object.entries(nameStats).sort((a, b) => b[1].qty - a[1].qty);
+  const STAT_CHIP_COLORS = ["chip-cyan", "chip-blue", "chip-green", "chip-amber", "chip-purple", "chip-teal", "chip-pink", "chip-slate"];
+  const nameStripHtml = nameEntries.length > 1 ? `
+    <div class="name-stat-strip">
+      ${nameEntries
+        .map(([name, info], i) => `
+          <div class="stat-chip ${STAT_CHIP_COLORS[i % STAT_CHIP_COLORS.length]}">
+            <span class="stat-chip-num">${info.qty}</span>
+            <span class="stat-chip-name">${escapeHtml(name)}</span>
+            ${info.rows !== info.qty ? `<span class="stat-chip-sub">${info.rows} rows</span>` : ""}
+          </div>
+        `).join("")}
+    </div>
+  ` : "";
+
+  // Sort: user column sort takes precedence, otherwise low-stock first + by name
+  if (tableSortState["stock"] && tableSortState["stock"].column) {
+    filtered = sortRows(filtered, "stock", {
+      name: (i) => i.name,
+      category: (i) => i.category || "",
+      supplier: (i) => i.supplier || "",
+      quantity: (i) => Number(i.quantity) || 0,
+      unit: (i) => i.unit || "",
+      updatedAt: (i) => new Date(i.updatedAt || i.createdAt),
+    });
+  } else {
+    filtered.sort((a, b) => {
+      const la = isLow(a) ? 0 : 1;
+      const lb = isLow(b) ? 0 : 1;
+      if (la !== lb) return la - lb;
+      return a.name.localeCompare(b.name);
+    });
+  }
+
+  const fmtMoney = (n) =>
+    n == null ? "—" : "₹" + Number(n).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+  const fmtQty = (n) => Number(n).toLocaleString("en-IN", { maximumFractionDigits: 3 });
+
+  const tableHtml = filtered.length
+    ? filtered
+        .map((item) => {
+          const low = isLow(item);
+          const value = item.costPerUnit != null ? item.quantity * item.costPerUnit : null;
+          const uses = getStockUses(item, 3);
+          const recentHtml = uses.length
+            ? uses
+                .map((u) => {
+                  if (u.source === "install") {
+                    return `<span class="use-pill" title="Currently in installation">${escapeHtml(u.vehicleNo)}<span class="use-qty in-use">in use</span></span>`;
+                  }
+                  return `<span class="use-pill" title="${escapeHtml(String(-u.delta) + " " + item.unit + " on " + formatDateTime(u.at))}">${escapeHtml(u.vehicleNo)}<span class="use-qty">${u.delta}</span></span>`;
+                })
+                .join(" ")
+            : `<span class="muted">—</span>`;
+          const metaSummary = stockMetadataSummary(item);
+          const copyable = stockCopyableValue(item);
+          return `
+            <tr class="${low ? "stock-row-low" : ""}">
+              <td>
+                <div class="stock-name">${escapeHtml(item.name)}${low ? ` <span class="low-pill">Low stock</span>` : ""}</div>
+                ${metaSummary ? `<div class="stock-meta mono">${escapeHtml(metaSummary)}${copyable ? ` ${stockCopyBtn(copyable.value, copyable.label)}` : ""}</div>` : ""}
+                ${item.notes ? `<div class="stock-notes">${escapeHtml(item.notes.split("\n")[0])}</div>` : ""}
+              </td>
+              <td>${item.category ? `<span class="cat-pill">${escapeHtml(item.category)}</span>` : `<span class="muted">—</span>`}</td>
+              <td>${item.supplier ? `<span class="supplier-pill">${escapeHtml(item.supplier)}</span>` : `<span class="muted">—</span>`}</td>
+              <td class="mono qty-cell">${fmtQty(item.quantity)}</td>
+              <td class="mono">${escapeHtml(item.unit)}</td>
+              <td class="recent-use">${recentHtml}</td>
+              <td class="date-cell">${escapeHtml(formatDateTime(item.updatedAt))}</td>
+              <td class="row-actions">
+                <button type="button" class="btn btn-outline btn-sm stock-edit" data-id="${item.id}">✎ Edit</button>
+                <button type="button" class="btn btn-danger btn-sm stock-delete" data-id="${item.id}">Delete</button>
+              </td>
+            </tr>`;
+        })
+        .join("")
+    : `<tr class="empty-row"><td colspan="8">${q || stockCategoryFilter !== "all" ? "No items match the filters." : "No items in stock yet. Click + Add Item to start."}</td></tr>`;
+
+  app.innerHTML = `
+    ${renderHeader("Stock Inventory", "Equipment, spares, and consumables")}
+    <main class="main">
+      ${renderAdminNav("stock")}
+      <div class="summary-grid">
+        <div class="summary-box summary-info"><strong>${totalItems}</strong><span>Items</span></div>
+        <div class="summary-box summary-ok"><strong>${fmtQty(totalUnits)}</strong><span>Total units</span></div>
+        <div class="summary-box ${lowStockItems.length ? "summary-warn" : "summary-ok"}"><strong>${lowStockItems.length}</strong><span>Low stock</span></div>
+      </div>
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>All Items ${filtered.length !== items.length
+              ? `<span class="filter-count">(${filtered.length} of ${items.length})</span>`
+              : `(${items.length})`}</h2>
+            <p class="section-subtitle">Track equipment, spares, and consumables. Stock is auto-consumed when Akash uses an item in an installation or repair.</p>
+          </div>
+          <div class="bulk-actions">
+            <button type="button" class="btn btn-secondary btn-sm" id="manageCatsBtn">⚙️ Manage categories</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="manageSuppliersBtn">🏷️ Manage suppliers</button>
+            <button type="button" class="btn btn-outline btn-sm" id="exportStockBtn">↓ Export Excel</button>
+            <button type="button" class="btn btn-primary btn-sm" id="addStockBtn">+ Add Item</button>
+          </div>
+        </div>
+        <div class="list-tools admin-search sticky-search">
+          <input type="search" id="stockSearch" placeholder="Search anything — name, IMEI, SIM number, MAC, supplier..." value="${escapeHtml(stockQuery)}" />
+        </div>
+        ${liveCategories.length ? chipsHtml : ""}
+        ${nameStripHtml}
+        <div class="table-wrap stock-table-desktop">
+          <table>
+            <thead>
+              <tr>
+                ${renderSortHeader("Item", "name", "stock")}
+                ${renderSortHeader("Category", "category", "stock")}
+                ${renderSortHeader("Supplier", "supplier", "stock")}
+                ${renderSortHeader("Qty", "quantity", "stock")}
+                ${renderSortHeader("Unit", "unit", "stock")}
+                <th>Recent use</th>
+                ${renderSortHeader("Last updated", "updatedAt", "stock")}
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>${tableHtml}</tbody>
+          </table>
+        </div>
+        <!-- Mobile card grid -->
+        <div class="stock-card-grid">
+          ${filtered.length
+            ? filtered.map((item) => {
+                const low = isLow(item);
+                const metaSummary = stockMetadataSummary(item);
+                const tail = (s, n = 8) => {
+                  const v = String(s || "");
+                  return v.length > n ? "…" + v.slice(-n) : v || "—";
+                };
+                const imei = item.metadata?.imei || "";
+                const project = item.metadata?.project || "";
+                const needsSupplier = item.metadata?.needsSupplier && !item.supplier;
+                const copyable = stockCopyableValue(item);
+                return `
+                  <article class="tk-card ${low ? "tk-card-warn" : ""} ${needsSupplier ? "tk-card-needs-supplier" : ""}">
+                    <div class="tk-card-head">
+                      <span class="tk-pill">${escapeHtml(item.name)}</span>
+                      <span class="tk-chip ${low ? "tk-chip-deleted" : "tk-chip-install"}" style="text-decoration:none;">
+                        ${fmtQty(item.quantity)} ${escapeHtml(item.unit)}${low ? " · LOW" : ""}
+                      </span>
+                    </div>
+                    ${needsSupplier ? `<div class="needs-supplier-banner">⚠️ Needs supplier — admin please fill</div>` : ""}
+                    <div class="tk-stats">
+                      ${item.category ? `
+                        <div class="tk-stat">
+                          <span class="tk-stat-icon">🏷️</span>
+                          <span class="tk-stat-label">Category:</span>
+                          <span class="tk-stat-value">${escapeHtml(item.category)}</span>
+                        </div>
+                      ` : ""}
+                      ${project ? `
+                        <div class="tk-stat">
+                          <span class="tk-stat-icon">📁</span>
+                          <span class="tk-stat-label">Project:</span>
+                          <span class="tk-stat-value">${escapeHtml(project)}</span>
+                        </div>
+                      ` : ""}
+                      ${item.supplier ? `
+                        <div class="tk-stat">
+                          <span class="tk-stat-icon">🏭</span>
+                          <span class="tk-stat-label">Supplier:</span>
+                          <span class="tk-stat-value">${escapeHtml(item.supplier)}</span>
+                        </div>
+                      ` : ""}
+                      ${copyable ? `
+                        <div class="tk-stat tk-stat-full stock-copyable-row">
+                          <span class="tk-stat-icon">${copyable.label === "IMEI" ? "📡" : copyable.label === "SIM NO" ? "📶" : "🔢"}</span>
+                          <span class="tk-stat-label">${escapeHtml(copyable.label)}:</span>
+                          <span class="tk-stat-value mono">${escapeHtml(copyable.value)}</span>
+                          ${stockCopyBtn(copyable.value, copyable.label)}
+                        </div>
+                      ` : ""}
+                    </div>
+                    <div class="tk-footer">
+                      <div class="tk-footer-row">
+                        <span class="tk-footer-icon">📅</span>
+                        <span class="tk-footer-label">Updated:</span>
+                        <span class="tk-footer-value">${escapeHtml(formatDateTime(item.updatedAt))}</span>
+                      </div>
+                    </div>
+                    <div class="tk-actions">
+                      <button type="button" class="btn btn-outline btn-sm stock-edit" data-id="${item.id}">✎ Edit</button>
+                      <button type="button" class="btn btn-danger btn-sm stock-delete" data-id="${item.id}">🗑</button>
+                    </div>
+                  </article>
+                `;
+              }).join("")
+            : `<div class="entry-empty"><div class="entry-empty-icon">📦</div><h3>No items found</h3><p>${q || stockCategoryFilter !== "all" ? "Try different filters." : "Tap + Add Item to start."}</p></div>`
+          }
+        </div>
+      </section>
+    </main>
+  `;
+
+  bindLogout();
+  bindAdminNav();
+
+  document.getElementById("stockSearch")?.addEventListener("input", (e) => {
+    stockQuery = e.target.value;
+    render();
+    const el = document.getElementById("stockSearch");
+    if (el) {
+      el.focus();
+      const v = el.value;
+      el.setSelectionRange(v.length, v.length);
+    }
+  });
+
+  app.querySelectorAll(".filter-chip[data-cat]").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      stockCategoryFilter = chip.dataset.cat;
+      render();
+    });
+  });
+
+  // Old single-item editor still available, but NEW default: bulk scan flow
+  document.getElementById("addStockBtn")?.addEventListener("click", () => {
+    // Show choice modal — Quick scan (bulk) vs Detailed entry
+    showModal(`
+      <h3>Add to Stock</h3>
+      <p class="modal-desc">How do you want to add items?</p>
+      <div style="display:flex; flex-direction:column; gap:0.6rem; margin: 1rem 0;">
+        <button type="button" class="btn btn-primary" id="chooseBulk" style="padding: 0.85rem;">
+          📷 Bulk Scan (multiple items, same type)
+        </button>
+        <button type="button" class="btn btn-outline" id="chooseSingle" style="padding: 0.85rem;">
+          ✏️ Detailed Entry (one item, full fields)
+        </button>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary modal-close">Cancel</button>
+      </div>
+    `, null);
+    setTimeout(() => {
+      document.getElementById("chooseBulk")?.addEventListener("click", () => {
+        closeModal();
+        openBulkStockAdd();
+      });
+      document.getElementById("chooseSingle")?.addEventListener("click", () => {
+        closeModal();
+        openStockEditor(null, allCategoryOptions);
+      });
+    }, 50);
+  });
+  document.getElementById("manageCatsBtn")?.addEventListener("click", openCategoryManager);
+  document.getElementById("manageSuppliersBtn")?.addEventListener("click", openSupplierManager);
+  document.getElementById("exportStockBtn")?.addEventListener("click", exportStockToExcel);
+  app.querySelectorAll(".stock-edit").forEach((btn) => {
+    btn.addEventListener("click", () => openStockEditor(btn.dataset.id, allCategoryOptions));
+  });
+  // Copy IMEI/SIM NO buttons
+  app.querySelectorAll(".stock-copy-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const value = btn.dataset.copy;
+      const label = btn.dataset.label || "Value";
+      try {
+        await navigator.clipboard.writeText(value);
+        showToast(`✓ ${label} copied: ${value.length > 14 ? value.slice(0, 6) + "…" + value.slice(-6) : value}`);
+        // Visual feedback on button
+        const orig = btn.textContent;
+        btn.textContent = "✓";
+        btn.classList.add("stock-copy-done");
+        setTimeout(() => {
+          btn.textContent = orig;
+          btn.classList.remove("stock-copy-done");
+        }, 1200);
+      } catch (err) {
+        // Fallback for older browsers / non-secure context
+        const ta = document.createElement("textarea");
+        ta.value = value;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand("copy");
+          showToast(`✓ ${label} copied`);
+        } catch (e2) {
+          showToast("Failed to copy. Try long-press → Copy.", true);
+        }
+        document.body.removeChild(ta);
+      }
+    });
+  });
+  app.querySelectorAll(".stock-delete").forEach((btn) => {
+    btn.addEventListener("click", () => onDeleteStockItem(btn.dataset.id));
+  });
+}
+
+function openStockEditor(itemId, categoryOptions) {
+  const item = itemId ? loadStockItems().find((i) => i.id === itemId) : null;
+  const allItems = loadStockItems();
+
+  // Build a name → most-recent-category map so picking a known name can
+  // auto-fill the category.
+  const nameToCategory = new Map();
+  // Sort by createdAt desc so older items don't overwrite the latest mapping.
+  const sortedItems = [...allItems].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  for (const i of sortedItems) {
+    if (i.name && !nameToCategory.has(i.name.toLowerCase())) {
+      nameToCategory.set(i.name.toLowerCase(), i.category || "");
+    }
+  }
+  const knownNames = Array.from(new Set(sortedItems.map((i) => i.name).filter(Boolean))).sort();
+
+  // Stash on window so the listener can look up without closure capture issues.
+  window.__stockNameCategoryMap = nameToCategory;
+
+  modal.innerHTML = `
+    <h3>${item ? "✎ Edit item" : "+ Add item"}</h3>
+    <div class="field smart-name-field">
+      <label for="stkName">Item name <span class="required">*</span></label>
+      <div class="combobox">
+        <input type="text" id="stkName" autocomplete="off" placeholder="Click to see existing items, or type a new name..." value="${escapeHtml(item?.name || "")}" />
+        <div class="combobox-panel hidden" id="namePanel"></div>
+      </div>
+      <p class="hint" id="nameHint">Pick an existing item from the list to avoid duplicate entries.</p>
+      <div class="dup-warn hidden" id="dupWarn"></div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="stkCategory">Category <span class="required">*</span></label>
+        <input type="text" id="stkCategory" autocomplete="off" list="stockCatList" placeholder="GPS, SIM-AIRTEL, SENSOR..." value="${escapeHtml(item?.category || "")}" />
+        <datalist id="stockCatList">
+          ${categoryOptions.map((c) => `<option value="${escapeHtml(c)}">`).join("")}
+        </datalist>
+      </div>
+      <div class="field">
+        <label for="stkQty">Quantity <span class="required">*</span></label>
+        <input type="number" id="stkQty" inputmode="decimal" min="0" step="any" autocomplete="off" placeholder="1" value="${item ? item.quantity : 1}" class="mono" />
+      </div>
+    </div>
+    <!-- Hidden unit field (always pcs unless edited) -->
+    <input type="hidden" id="stkUnit" value="${escapeHtml(item?.unit || "pcs")}" />
+
+    <!-- Conditional fields based on category -->
+    <div id="metaGps" class="meta-block hidden">
+      <div class="meta-title">📡 GPS device identifier</div>
+      <div class="field">
+        <label for="metaImei">IMEI number <span class="required">*</span></label>
+        <input type="text" id="metaImei" class="mono" inputmode="numeric" autocomplete="off" placeholder="e.g. 867530012345678" value="${escapeHtml(item?.metadata?.imei || "")}" />
+      </div>
+    </div>
+
+    <div id="metaSim" class="meta-block hidden">
+      <div class="meta-title">📶 SIM card numbers</div>
+      <div class="field-row">
+        <div class="field">
+          <label for="metaSimPrimary">Primary number (13-digit)</label>
+          <input type="text" id="metaSimPrimary" class="mono" inputmode="numeric" autocomplete="off" placeholder="e.g. 5753200309565" value="${escapeHtml(item?.metadata?.primary || "")}" />
+        </div>
+        <div class="field">
+          <label for="metaSimSecondary">Secondary / ICCID (20-digit) <span class="required">*</span></label>
+          <input type="text" id="metaSimSecondary" class="mono" inputmode="numeric" autocomplete="off" placeholder="e.g. 89918720507069156677" value="${escapeHtml(item?.metadata?.secondary || "")}" />
+        </div>
+      </div>
+      <p class="hint">This SIM will also be added to the <strong>SIM Database</strong> automatically so Akash can use it during repair.</p>
+    </div>
+
+    <div id="metaSensor" class="meta-block hidden">
+      <div class="meta-title">🛰️ Sensor identifiers</div>
+      <div class="field-row">
+        <div class="field">
+          <label for="metaSensorNo">Sensor number <span class="required">*</span></label>
+          <input type="text" id="metaSensorNo" class="mono" autocomplete="off" placeholder="e.g. SN-12345" value="${escapeHtml(item?.metadata?.sensorNo || "")}" />
+        </div>
+        <div class="field">
+          <label for="metaMacId">MAC ID <span class="required">*</span></label>
+          <input type="text" id="metaMacId" class="mono" autocomplete="off" placeholder="e.g. AA:BB:CC:DD:EE:FF" value="${escapeHtml(item?.metadata?.macId || "")}" />
+        </div>
+      </div>
+    </div>
+
+    <div class="field low-stock-field" id="lowStockField">
+      <label for="stkLow">Low-stock alert at</label>
+      <input type="number" id="stkLow" inputmode="decimal" min="0" step="any" autocomplete="off" placeholder="5" value="${item?.lowStockThreshold ?? 5}" class="mono" />
+      <p class="hint">Only used for bulk consumables (rolls, tape, drill bits).</p>
+    </div>
+    <div class="field">
+      <label for="stkSupplier">Supplier</label>
+      <input type="text" id="stkSupplier" autocomplete="off" list="stockSupplierList" placeholder="Pick from list or type a new supplier..." value="${escapeHtml(item?.supplier || "")}" />
+      <datalist id="stockSupplierList">
+        ${getSupplierOptions().map((s) => `<option value="${escapeHtml(s)}">`).join("")}
+      </datalist>
+    </div>
+    <div class="field">
+      <label for="stkNotes">Notes (optional)</label>
+      <input type="text" id="stkNotes" autocomplete="off" placeholder="e.g. batch, storage location, condition" value="${escapeHtml(item?.notes || "")}" />
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" data-act="save">${item ? "Save changes" : "Add item"}</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modalOverlay.onclick = (e) => {
+    if (e.target === modalOverlay) closeModal();
+  };
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modal.querySelector("#stkName")?.focus();
+
+  const nameEl = modal.querySelector("#stkName");
+  const categoryEl = modal.querySelector("#stkCategory");
+  const hintEl = modal.querySelector("#nameHint");
+
+  // Toggle the meta blocks based on category.
+  function refreshMetaVisibility() {
+    const kind = categoryKind(categoryEl.value);
+    modal.querySelector("#metaGps").classList.toggle("hidden", kind !== "gps");
+    modal.querySelector("#metaSim").classList.toggle("hidden", kind !== "sim");
+    modal.querySelector("#metaSensor").classList.toggle("hidden", kind !== "sensor");
+    // Low-stock alert only makes sense for bulk items (Roll, Tape, etc.)
+    const trackable = kind === "gps" || kind === "sim" || kind === "sensor";
+    modal.querySelector("#lowStockField")?.classList.toggle("hidden", trackable);
+  }
+  refreshMetaVisibility();
+  categoryEl.addEventListener("input", refreshMetaVisibility);
+  categoryEl.addEventListener("change", refreshMetaVisibility);
+
+  // When the name matches an existing item, auto-fill its category.
+  function autofillCategoryIfKnown() {
+    const typed = nameEl.value.trim();
+    if (!typed) {
+      if (hintEl) {
+        hintEl.textContent = "Pick an existing item from the list to avoid duplicate entries.";
+        hintEl.className = "hint";
+      }
+      return;
+    }
+    const cat = nameToCategory.get(typed.toLowerCase());
+    if (cat && !categoryEl.value.trim()) {
+      categoryEl.value = cat;
+      refreshMetaVisibility();
+      if (hintEl) {
+        hintEl.textContent = `✓ Recognised — auto-filled category "${cat}".`;
+        hintEl.className = "hint hint-ok";
+      }
+    } else if (cat) {
+      if (hintEl) {
+        hintEl.textContent = `Existing item. Category for this product is usually "${cat}".`;
+        hintEl.className = "hint";
+      }
+    } else {
+      if (hintEl) {
+        hintEl.textContent = "New item — pick or type a category below.";
+        hintEl.className = "hint";
+      }
+    }
+  }
+  nameEl.addEventListener("input", autofillCategoryIfKnown);
+  nameEl.addEventListener("change", autofillCategoryIfKnown);
+  nameEl.addEventListener("blur", autofillCategoryIfKnown);
+
+  // ----- Smart combobox: suggestions dropdown + duplicate warning -----
+  const panelEl = modal.querySelector("#namePanel");
+  const dupWarnEl = modal.querySelector("#dupWarn");
+
+  function pickExistingItem(existingItem) {
+    nameEl.value = existingItem.name;
+    if (existingItem.category) {
+      categoryEl.value = existingItem.category;
+      refreshMetaVisibility();
+    }
+    panelEl.classList.add("hidden");
+    autofillCategoryIfKnown();
+    refreshDupWarn();
+  }
+
+  function reasonBadge(reason) {
+    switch (reason) {
+      case "recent":
+        return `<span class="cbi-tag tag-recent">recent</span>`;
+      case "exact":
+        return `<span class="cbi-tag tag-exact">exact match</span>`;
+      case "tokens":
+        return `<span class="cbi-tag tag-warn">same words</span>`;
+      case "starts":
+      case "contains":
+        return `<span class="cbi-tag tag-match">match</span>`;
+      case "typo":
+        return `<span class="cbi-tag tag-warn">possible typo</span>`;
+      default:
+        return "";
+    }
+  }
+
+  function renderSuggestions(query) {
+    const ranked = rankItemSuggestions(query, item?.id);
+    if (!ranked.length) {
+      panelEl.classList.add("hidden");
+      panelEl.innerHTML = "";
+      return;
+    }
+    // Group: "Recently added" header if showing recent items (no query)
+    const headerHtml = !query.trim() ? `<div class="cb-header">Recently added — click to reuse</div>` : "";
+    const itemsHtml = ranked
+      .map((s) => {
+        const it = s.item;
+        const metaSummary = stockMetadataSummary(it);
+        return `
+          <button type="button" class="combobox-item" data-id="${escapeHtml(it.id)}">
+            <div class="cbi-main">
+              <span class="cbi-name">${escapeHtml(it.name)}</span>
+              ${reasonBadge(s.reason)}
+            </div>
+            <div class="cbi-sub">
+              ${it.category ? `<span class="cat-pill">${escapeHtml(it.category)}</span>` : `<span class="muted">no category</span>`}
+              <span class="muted">·</span>
+              <span class="mono">${it.quantity} ${escapeHtml(it.unit)}</span>
+              ${metaSummary ? `<span class="muted"> · </span><span class="mono cbi-meta">${escapeHtml(metaSummary)}</span>` : ""}
+            </div>
+          </button>`;
+      })
+      .join("");
+    panelEl.innerHTML = headerHtml + itemsHtml;
+    panelEl.classList.remove("hidden");
+
+    panelEl.querySelectorAll(".combobox-item").forEach((btn) => {
+      // mousedown fires BEFORE blur, so the click is registered even if
+      // input loses focus on click.
+      btn.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        const id = btn.dataset.id;
+        const found = loadStockItems().find((i) => i.id === id);
+        if (found) pickExistingItem(found);
+      });
+    });
+  }
+
+  function refreshDupWarn() {
+    const typed = nameEl.value.trim();
+    if (!typed) {
+      dupWarnEl.classList.add("hidden");
+      dupWarnEl.innerHTML = "";
+      return;
+    }
+    const match = findClosestItem(typed, item?.id);
+    if (!match) {
+      dupWarnEl.classList.add("hidden");
+      dupWarnEl.innerHTML = "";
+      return;
+    }
+    let icon = "⚠️";
+    let label = "";
+    let cls = "dup-warn dup-typo";
+    if (match.reason === "exact") {
+      icon = "ℹ️";
+      label = `Already in stock as <strong>${escapeHtml(match.item.name)}</strong>${match.item.category ? ` (${escapeHtml(match.item.category)})` : ""}. Pick it instead of creating a new entry.`;
+      cls = "dup-warn dup-exact";
+    } else if (match.reason === "tokens") {
+      label = `Looks like the same product, different order/spacing: <strong>${escapeHtml(match.item.name)}</strong>${match.item.category ? ` (${escapeHtml(match.item.category)})` : ""}. Reuse it to avoid duplicates.`;
+      cls = "dup-warn dup-tokens";
+    } else if (match.reason === "typo") {
+      label = `Did you mean <strong>${escapeHtml(match.item.name)}</strong>${match.item.category ? ` (${escapeHtml(match.item.category)})` : ""}?`;
+      cls = "dup-warn dup-typo";
+    }
+    dupWarnEl.className = cls;
+    dupWarnEl.innerHTML = `${icon} ${label} <button type="button" class="dup-pick" data-id="${escapeHtml(match.item.id)}">Use existing →</button>`;
+    dupWarnEl.classList.remove("hidden");
+    dupWarnEl.querySelector(".dup-pick")?.addEventListener("click", () => {
+      pickExistingItem(match.item);
+    });
+  }
+
+  nameEl.addEventListener("focus", () => renderSuggestions(nameEl.value));
+  nameEl.addEventListener("input", () => {
+    renderSuggestions(nameEl.value);
+    refreshDupWarn();
+  });
+  // Delay hide so the mousedown handler can fire on suggestion clicks.
+  nameEl.addEventListener("blur", () => {
+    setTimeout(() => panelEl.classList.add("hidden"), 120);
+  });
+  // Initial duplicate check if editing
+  if (item) refreshDupWarn();
+
+  modal.querySelector('[data-act="save"]').onclick = async () => {
+    const name = nameEl.value.trim();
+    const category = categoryEl.value.trim() || null;
+    const unit = modal.querySelector("#stkUnit").value.trim() || "pcs";
+    const qtyRaw = modal.querySelector("#stkQty").value;
+    const lowRaw = modal.querySelector("#stkLow").value;
+    const notes = modal.querySelector("#stkNotes").value.trim() || null;
+    const supplier = modal.querySelector("#stkSupplier")?.value.trim() || null;
+
+    if (!name) {
+      showToast("Item name is required.", true);
+      return;
+    }
+    if (!category) {
+      showToast("Category is required.", true);
+      return;
+    }
+    const quantity = qtyRaw === "" ? 0 : Number(qtyRaw);
+    if (Number.isNaN(quantity) || quantity < 0) {
+      showToast("Quantity must be a non-negative number.", true);
+      return;
+    }
+
+    // Collect category-specific metadata.
+    const kind = categoryKind(category);
+    const metadata = {};
+    let simPrimary = null;
+    let simSecondary = null;
+    if (kind === "gps") {
+      const imei = modal.querySelector("#metaImei").value.trim();
+      if (!imei) {
+        showToast("IMEI number is required for GPS items.", true);
+        return;
+      }
+      // Duplicate check
+      const dup = loadStockItems().find(
+        (i) => i.id !== item?.id && (i.metadata?.imei || "").toLowerCase() === imei.toLowerCase()
+      );
+      if (dup) {
+        showToast(`IMEI ${imei} already exists in stock (${dup.name}). Edit that item instead.`, true);
+        return;
+      }
+      metadata.imei = imei;
+    } else if (kind === "sim") {
+      simPrimary = modal.querySelector("#metaSimPrimary").value.trim();
+      simSecondary = modal.querySelector("#metaSimSecondary").value.trim();
+      if (!simSecondary) {
+        showToast("Secondary / ICCID is required for SIM items.", true);
+        return;
+      }
+      // Duplicate check by secondary (the unique permanent ID)
+      const dupSec = loadStockItems().find(
+        (i) =>
+          i.id !== item?.id &&
+          (i.metadata?.secondary || "").toLowerCase() === simSecondary.toLowerCase()
+      );
+      if (dupSec) {
+        showToast(
+          `ICCID ${simSecondary} already exists in stock (${dupSec.name}). Edit that item instead.`,
+          true
+        );
+        return;
+      }
+      // Also reject if the entered primary number is already used by another stock SIM
+      if (simPrimary) {
+        const dupPri = loadStockItems().find(
+          (i) =>
+            i.id !== item?.id &&
+            (i.metadata?.primary || "").toLowerCase() === simPrimary.toLowerCase()
+        );
+        if (dupPri) {
+          showToast(
+            `Primary number ${simPrimary} already exists in stock (${dupPri.name}). Each primary must be unique.`,
+            true
+          );
+          return;
+        }
+      }
+      // Auto-detect swap and offer to fix before saving.
+      if (pairLooksSwapped(simPrimary, simSecondary)) {
+        const swap = await showConfirm({
+          title: "Numbers look swapped",
+          message: `<strong>${escapeHtml(simPrimary)}</strong> looks like a 20-digit ICCID (should be the secondary), and <strong>${escapeHtml(simSecondary)}</strong> looks like a 13-digit primary number. Swap them before saving?`,
+          confirmLabel: "Swap & save",
+        });
+        if (swap) {
+          const tmp = simPrimary;
+          simPrimary = simSecondary;
+          simSecondary = tmp;
+        }
+      }
+      metadata.primary = simPrimary || null;
+      metadata.secondary = simSecondary;
+    } else if (kind === "sensor") {
+      const sensorNo = modal.querySelector("#metaSensorNo").value.trim();
+      const macId = modal.querySelector("#metaMacId").value.trim();
+      if (!sensorNo) {
+        showToast("Sensor number is required.", true);
+        return;
+      }
+      if (!macId) {
+        showToast("MAC ID is required.", true);
+        return;
+      }
+      // Duplicate check (sensor no OR mac id matches another item)
+      const dup = loadStockItems().find(
+        (i) =>
+          i.id !== item?.id &&
+          ((sensorNo && (i.metadata?.sensorNo || "").toLowerCase() === sensorNo.toLowerCase()) ||
+            (macId && (i.metadata?.macId || "").toLowerCase() === macId.toLowerCase()))
+      );
+      if (dup) {
+        showToast(`Sensor with this number/MAC already exists in stock (${dup.name}).`, true);
+        return;
+      }
+      metadata.sensorNo = sensorNo;
+      metadata.macId = macId;
+    }
+
+    closeModal();
+    renderLoading(item ? "Saving changes..." : "Adding item...");
+    try {
+      const payload = {
+        id: item?.id,
+        name,
+        category,
+        unit,
+        quantity,
+        costPerUnit: null,
+        // Trackable categories don't use the low-stock concept; force null.
+        lowStockThreshold: isTrackableCategory(category)
+          ? null
+          : lowRaw === ""
+          ? null
+          : Number(lowRaw),
+        notes,
+        supplier,
+        metadata,
+      };
+      if (item) {
+        await updateStockItem(payload);
+      } else {
+        await insertStockItem(payload);
+      }
+      // SIM integration: also upsert into the sims table so it shows up in
+      // the SIM Database and is auto-found during Akash's repair flow.
+      if (kind === "sim" && simSecondary && simsTableReady) {
+        try {
+          await upsertSim({
+            primaryNumber: simPrimary || null,
+            secondaryNumber: simSecondary,
+            notes: `Stock: ${name}`,
+          });
+        } catch (simErr) {
+          console.warn("Stock SIM also-write to sims table failed:", simErr);
+        }
+      }
+      await refreshAllData();
+      render();
+      showToast(item ? "Item updated." : "Item added.");
+    } catch (err) {
+      await refreshAllData();
+      render();
+      showToast(err.message || "Save failed.", true);
+    }
+  };
+}
+
+function openStockAdjust(itemId) {
+  const item = loadStockItems().find((i) => i.id === itemId);
+  if (!item) return;
+
+  const installs = loadInstallations();
+  // Sort vehicles alphabetically for the dropdown.
+  const sortedInstalls = [...installs].sort((a, b) => a.vehicleNo.localeCompare(b.vehicleNo));
+
+  modal.innerHTML = `
+    <h3>± Adjust stock — ${escapeHtml(item.name)}</h3>
+    <p class="modal-desc">Current quantity: <strong>${item.quantity} ${escapeHtml(item.unit)}</strong>${item.category ? ` · ${escapeHtml(item.category)}` : ""}</p>
+    <div class="field">
+      <label for="adjAmount">Adjustment amount</label>
+      <input type="number" id="adjAmount" inputmode="decimal" step="any" autocomplete="off" placeholder="e.g. 5 or -2" class="mono" />
+      <p class="hint">Use a positive number to <strong>add</strong> stock (received) or a negative number to <strong>remove</strong> (used).</p>
+    </div>
+    <div class="adj-preview" id="adjPreview">New total: <strong>${item.quantity} ${escapeHtml(item.unit)}</strong></div>
+    <div class="field hidden" id="vehicleField">
+      <label for="adjVehicle">Used on vehicle (optional)</label>
+      <select id="adjVehicle">
+        <option value="">— not linked to a vehicle —</option>
+        ${sortedInstalls
+          .map(
+            (i) =>
+              `<option value="${escapeHtml(i.id)}" data-vno="${escapeHtml(i.vehicleNo)}">${escapeHtml(i.vehicleNo)}</option>`
+          )
+          .join("")}
+      </select>
+      <p class="hint">Picking a vehicle lets the Stock page show "Used in VEHICLE-X" and keep a per-vehicle usage history.</p>
+    </div>
+    <div class="field">
+      <label for="adjNote">Note (optional)</label>
+      <input type="text" id="adjNote" autocomplete="off" placeholder="e.g. supplier batch, reason for use" />
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" data-act="save">Apply</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modalOverlay.onclick = (e) => {
+    if (e.target === modalOverlay) closeModal();
+  };
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+
+  const input = modal.querySelector("#adjAmount");
+  const preview = modal.querySelector("#adjPreview");
+  const vehicleField = modal.querySelector("#vehicleField");
+  input.focus();
+
+  function refreshPreview() {
+    const raw = input.value;
+    const delta = raw === "" ? 0 : Number(raw);
+    // Show vehicle dropdown only when removing stock.
+    if (delta < 0) {
+      vehicleField.classList.remove("hidden");
+    } else {
+      vehicleField.classList.add("hidden");
+    }
+    if (Number.isNaN(delta)) {
+      preview.innerHTML = `<span class="warn">Enter a number.</span>`;
+      preview.className = "adj-preview warn";
+      return;
+    }
+    const next = item.quantity + delta;
+    if (next < 0) {
+      preview.innerHTML = `Would go below zero (${next}). Adjust must not exceed current stock.`;
+      preview.className = "adj-preview warn";
+    } else {
+      preview.innerHTML = `New total: <strong>${next} ${escapeHtml(item.unit)}</strong> ${delta > 0 ? `<span class="ok">(+${delta})</span>` : delta < 0 ? `<span class="warn">(${delta})</span>` : ""}`;
+      preview.className = "adj-preview ok";
+    }
+  }
+  input.addEventListener("input", refreshPreview);
+
+  modal.querySelector('[data-act="save"]').onclick = async () => {
+    const raw = input.value;
+    if (raw === "" || raw === "-" || raw === "+") {
+      showToast("Enter an adjustment amount.", true);
+      return;
+    }
+    const delta = Number(raw);
+    if (Number.isNaN(delta) || delta === 0) {
+      showToast("Adjustment must be a non-zero number.", true);
+      return;
+    }
+    const next = item.quantity + delta;
+    if (next < 0) {
+      showToast(`Cannot go below 0 (current ${item.quantity}, delta ${delta}).`, true);
+      return;
+    }
+    const note = modal.querySelector("#adjNote").value.trim();
+    const vehicleSelect = modal.querySelector("#adjVehicle");
+    const installationId = delta < 0 ? vehicleSelect?.value || null : null;
+    const vehicleNo =
+      installationId && vehicleSelect
+        ? vehicleSelect.options[vehicleSelect.selectedIndex]?.dataset.vno || null
+        : null;
+
+    closeModal();
+    renderLoading("Adjusting stock...");
+    try {
+      // 1) Update the stock_items quantity.
+      await updateStockItem({
+        ...item,
+        quantity: next,
+      });
+      // 2) Record the transaction (if the migration has been run).
+      if (stockTxTableReady) {
+        try {
+          await insertStockTransaction({
+            stockItemId: item.id,
+            installationId,
+            vehicleNo,
+            delta,
+            resultingQuantity: next,
+            note: note || null,
+            createdBy: currentUser || "admin",
+          });
+        } catch (txErr) {
+          // Stock quantity was updated; transaction record failed. Surface a
+          // soft warning but don't roll back the quantity change.
+          console.warn("Stock transaction record failed:", txErr);
+          showToast("Quantity updated but transaction log failed. Run stock-transactions-migration.sql.", true);
+        }
+      }
+      await refreshAllData();
+      render();
+      const vehicleSuffix = vehicleNo ? ` (linked to ${vehicleNo})` : "";
+      showToast(`Stock adjusted to ${next} ${item.unit}${vehicleSuffix}.`);
+    } catch (err) {
+      await refreshAllData();
+      render();
+      showToast(err.message || "Adjustment failed.", true);
+    }
+  };
+}
+
+function openStockHistory(itemId) {
+  const item = loadStockItems().find((i) => i.id === itemId);
+  if (!item) return;
+  const txs = getStockItemTransactions(itemId);
+
+  const fmtMoney = (n) =>
+    n == null ? "—" : "₹" + Number(n).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+
+  const rowsHtml = txs.length
+    ? txs
+        .map((t) => {
+          const isPositive = t.delta > 0;
+          return `
+            <tr>
+              <td class="date-cell">${escapeHtml(formatDateTime(t.createdAt))}</td>
+              <td class="mono"><span class="${isPositive ? "tx-plus" : "tx-minus"}">${isPositive ? "+" : ""}${t.delta}</span></td>
+              <td class="mono">${t.resultingQuantity != null ? t.resultingQuantity : "—"}</td>
+              <td>${t.vehicleNo ? `<span class="use-pill">${escapeHtml(t.vehicleNo)}</span>` : `<span class="muted">—</span>`}</td>
+              <td>${escapeHtml(t.note || "")}</td>
+              <td class="mono muted">${escapeHtml(t.createdBy || "—")}</td>
+            </tr>
+          `;
+        })
+        .join("")
+    : `<tr class="empty-row"><td colspan="6">No transactions recorded for this item yet.</td></tr>`;
+
+  // Summary: total received, total used, # of vehicles served
+  const received = txs.filter((t) => t.delta > 0).reduce((s, t) => s + t.delta, 0);
+  const used = txs.filter((t) => t.delta < 0).reduce((s, t) => s + Math.abs(t.delta), 0);
+  const vehicleSet = new Set(txs.filter((t) => t.vehicleNo).map((t) => t.vehicleNo));
+
+  modal.innerHTML = `
+    <h3>🕐 History — ${escapeHtml(item.name)}</h3>
+    <p class="modal-desc">Current stock: <strong>${item.quantity} ${escapeHtml(item.unit)}</strong>${item.costPerUnit != null ? ` · ${fmtMoney(item.costPerUnit)}/unit` : ""}</p>
+    <div class="history-summary">
+      <div class="hs-box"><strong class="tx-plus">+${received}</strong><span>Received</span></div>
+      <div class="hs-box"><strong class="tx-minus">−${used}</strong><span>Used</span></div>
+      <div class="hs-box"><strong>${vehicleSet.size}</strong><span>Vehicles served</span></div>
+      <div class="hs-box"><strong>${txs.length}</strong><span>Total entries</span></div>
+    </div>
+    <div class="table-wrap history-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>When</th>
+            <th>Δ</th>
+            <th>After</th>
+            <th>Vehicle</th>
+            <th>Note</th>
+            <th>By</th>
+          </tr>
+        </thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Close</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modalOverlay.onclick = (e) => {
+    if (e.target === modalOverlay) closeModal();
+  };
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+}
+
+async function onDeleteStockItem(itemId) {
+  const item = loadStockItems().find((i) => i.id === itemId);
+  if (!item) return;
+
+  const reason = await promptForReason({
+    title: "Delete this stock item?",
+    message: `You're about to remove <strong>${escapeHtml(item.name)}</strong>${item.category ? ` (${escapeHtml(item.category)})` : ""} — current stock <strong>${item.quantity} ${escapeHtml(item.unit)}</strong>. This cannot be undone.`,
+    confirmLabel: "Delete item",
+    placeholder: "e.g. wrong entry, damaged, returned to supplier",
+  });
+  if (!reason) return;
+
+  renderLoading("Deleting item...");
+  try {
+    // 1) Audit log
+    await auditDeletion({
+      entityType: "stock_item",
+      entityId: item.id,
+      entityLabel: `${item.name}${item.category ? ` (${item.category})` : ""} · ${item.quantity} ${item.unit}`,
+      reason,
+      snapshot: item,
+    });
+    // 2) Record a final transaction so stock history still shows the reason.
+    if (stockTxTableReady) {
+      try {
+        await insertStockTransaction({
+          stockItemId: item.id, // FK will be set to NULL after delete
+          installationId: null,
+          vehicleNo: null,
+          delta: -item.quantity,
+          resultingQuantity: 0,
+          note: `DELETED — reason: ${reason}`,
+          createdBy: currentUser || "admin",
+          itemNameSnapshot: item.name + (item.category ? ` (${item.category})` : ""),
+        });
+      } catch (txErr) {
+        console.warn("Deletion transaction record failed:", txErr);
+      }
+    }
+    // 3) Delete the row.
+    await deleteStockItem(itemId);
+    await refreshAllData();
+    render();
+    showToast("Item deleted.");
+  } catch (err) {
+    await refreshAllData();
+    render();
+    showToast(err.message || "Delete failed.", true);
+  }
+}
+
+function openCategoryManager() {
+  const cats = loadStockCategories ? loadStockCategories() : stockCategories;
+  const itemsByCat = new Map();
+  for (const it of loadStockItems()) {
+    if (!it.category) continue;
+    itemsByCat.set(it.category, (itemsByCat.get(it.category) || 0) + 1);
+  }
+
+  function rowHtml(cat) {
+    const inUse = itemsByCat.get(cat.name) || 0;
+    return `
+      <div class="cat-row">
+        <span class="cat-pill">${escapeHtml(cat.name)}</span>
+        <span class="cat-usage">${inUse > 0 ? `${inUse} item${inUse === 1 ? "" : "s"} use this` : "not in use"}</span>
+        <button type="button" class="btn btn-danger btn-sm cat-delete" data-id="${escapeHtml(cat.id)}" ${inUse > 0 ? "disabled" : ""} title="${inUse > 0 ? "Cannot delete — items use this category" : "Delete this category"}">Delete</button>
+      </div>
+    `;
+  }
+
+  modal.innerHTML = `
+    <h3>⚙️ Manage categories</h3>
+    <p class="modal-desc">Add new categories or remove ones you don't need. Categories that have items can't be deleted until those items are moved or removed.</p>
+
+    <div class="cat-add-row">
+      <input type="text" id="newCatName" autocomplete="off" placeholder="New category name (e.g. SIM-VI)" />
+      <button type="button" class="btn btn-primary btn-sm" id="addCatBtn">+ Add</button>
+    </div>
+
+    <div class="cat-list" id="catList">
+      ${cats.length ? cats.map(rowHtml).join("") : `<p class="muted">No categories yet. Add one above.</p>`}
+    </div>
+
+    <div class="modal-actions" style="margin-top: 1rem;">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Close</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modalOverlay.onclick = (e) => {
+    if (e.target === modalOverlay) closeModal();
+  };
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+
+  function wireListButtons() {
+    modal.querySelectorAll(".cat-delete").forEach((btn) => {
+      if (btn.disabled) return;
+      btn.addEventListener("click", async () => {
+        const id = btn.dataset.id;
+        const cat = stockCategories.find((c) => c.id === id);
+        if (!cat) return;
+        const ok = await showConfirm({
+          title: "Delete category?",
+          message: `Remove "${cat.name}" from the category list? This cannot be undone.`,
+          confirmLabel: "Delete",
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          await deleteStockCategory(id);
+          await refreshAllData();
+          // Re-render the modal to reflect the updated list
+          closeModal();
+          openCategoryManager();
+        } catch (err) {
+          showToast(err.message || "Delete failed.", true);
+        }
+      });
+    });
+  }
+  wireListButtons();
+
+  async function addNewCategory() {
+    const name = modal.querySelector("#newCatName").value.trim();
+    if (!name) {
+      showToast("Type a category name first.", true);
+      return;
+    }
+    try {
+      await insertStockCategory(name);
+      await refreshAllData();
+      closeModal();
+      openCategoryManager();
+    } catch (err) {
+      showToast(err.message || "Add failed.", true);
+    }
+  }
+  modal.querySelector("#addCatBtn").onclick = addNewCategory;
+  modal.querySelector("#newCatName").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      addNewCategory();
+    }
+  });
+}
+
+function openSupplierManager() {
+  const sups = loadSuppliers();
+  const itemsBySupplier = new Map();
+  for (const it of loadStockItems()) {
+    if (!it.supplier) continue;
+    itemsBySupplier.set(it.supplier, (itemsBySupplier.get(it.supplier) || 0) + 1);
+  }
+  function rowHtml(sup) {
+    const inUse = itemsBySupplier.get(sup.name) || 0;
+    return `
+      <div class="cat-row">
+        <span class="supplier-pill">${escapeHtml(sup.name)}</span>
+        <span class="cat-usage">${inUse > 0 ? `${inUse} item${inUse === 1 ? "" : "s"}` : "not in use"}</span>
+        <button type="button" class="btn btn-danger btn-sm sup-delete" data-id="${escapeHtml(sup.id)}" ${inUse > 0 ? "disabled" : ""} title="${inUse > 0 ? "Items use this supplier — clear them first" : "Delete this supplier"}">Delete</button>
+      </div>`;
+  }
+  modal.innerHTML = `
+    <h3>🏷️ Manage suppliers</h3>
+    <p class="modal-desc">Add suppliers or remove ones you don't use. Suppliers that have items can't be deleted until those items are reassigned.</p>
+    <div class="cat-add-row">
+      <input type="text" id="newSupName" autocomplete="off" placeholder="Supplier name (e.g. ABC Telecom)" />
+      <button type="button" class="btn btn-primary btn-sm" id="addSupBtn">+ Add</button>
+    </div>
+    <div class="cat-list">
+      ${sups.length ? sups.map(rowHtml).join("") : `<p class="muted">No suppliers yet. Add one above.</p>`}
+    </div>
+    <div class="modal-actions" style="margin-top: 1rem;">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Close</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modalOverlay.onclick = (e) => {
+    if (e.target === modalOverlay) closeModal();
+  };
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+
+  modal.querySelectorAll(".sup-delete").forEach((btn) => {
+    if (btn.disabled) return;
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.id;
+      const sup = suppliers.find((s) => s.id === id);
+      if (!sup) return;
+      const ok = await showConfirm({
+        title: "Delete supplier?",
+        message: `Remove "${sup.name}" from the supplier list?`,
+        confirmLabel: "Delete",
+        danger: true,
+      });
+      if (!ok) return;
+      try {
+        await deleteSupplier(id);
+        await refreshAllData();
+        closeModal();
+        openSupplierManager();
+      } catch (err) {
+        showToast(err.message || "Delete failed.", true);
+      }
+    });
+  });
+
+  async function addNewSupplier() {
+    const name = modal.querySelector("#newSupName").value.trim();
+    if (!name) {
+      showToast("Type a supplier name first.", true);
+      return;
+    }
+    try {
+      await insertSupplier(name);
+      await refreshAllData();
+      closeModal();
+      openSupplierManager();
+    } catch (err) {
+      showToast(err.message || "Add failed.", true);
+    }
+  }
+  modal.querySelector("#addSupBtn").onclick = addNewSupplier;
+  modal.querySelector("#newSupName").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      addNewSupplier();
+    }
+  });
+}
+
+let _lastRenderedView = null;
+let _scrollMemo = {}; // view -> scrollY
+
 function render() {
+  // Save scroll position of the view we're leaving (same view = mid-action re-render)
+  const prevScrollY = window.scrollY || document.documentElement.scrollTop || 0;
+  if (_lastRenderedView) {
+    _scrollMemo[_lastRenderedView] = prevScrollY;
+  }
+  const sameView = _lastRenderedView === view;
+
+  // Capture focused input state so we can restore it after re-render.
+  // Without this, typing in any search box loses cursor every keystroke
+  // because innerHTML replacement destroys the old <input> element.
+  let focusSnapshot = null;
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA") && ae.id) {
+    focusSnapshot = {
+      id: ae.id,
+      start: ae.selectionStart,
+      end: ae.selectionEnd,
+      direction: ae.selectionDirection,
+      scrollTop: ae.scrollTop,
+      scrollLeft: ae.scrollLeft,
+    };
+  }
+
   switch (view) {
     case "login":
       renderLogin();
@@ -883,40 +10491,4987 @@ function render() {
     case "akash-home":
       renderAkashHome();
       break;
+    case "akash-deleted":
+      renderAkashDeleted();
+      break;
     case "install":
       renderInstallForm();
       break;
     case "repair":
       renderRepairForm();
       break;
+    case "dashboard":
+      renderDashboard();
+      break;
+    case "installations":
+      renderInstallationsPage();
+      break;
+    case "repairs":
+      renderRepairsPage();
+      break;
+    case "pending":
+      renderPendingPage();
+      break;
+    case "sim-upload":
+      renderSimUpload();
+      break;
+    case "sim-db":
+      renderSimDb();
+      break;
+    case "stock":
+      renderStockPage();
+      break;
+    case "accounts":
+      renderAccountsPage();
+      break;
+    case "renewals":
+      renderRenewalsPage();
+      break;
+    case "user-access":
+      renderUserAccessPage();
+      break;
+    case "deletions":
+      renderDeletionsPage();
+      break;
+    case "timeline":
+      renderTimeline();
+      break;
+    // Legacy aliases
     case "admin":
-      renderAdmin();
+      renderDashboard();
       break;
     default:
       renderLogin();
   }
+
+  // Restore focus on the same input element (by ID) if it still exists.
+  // Done synchronously before scroll restore so cursor doesn't visibly jump.
+  if (focusSnapshot) {
+    const reborn = document.getElementById(focusSnapshot.id);
+    if (reborn && (reborn.tagName === "INPUT" || reborn.tagName === "TEXTAREA")) {
+      try {
+        reborn.focus({ preventScroll: true });
+        if (typeof reborn.setSelectionRange === "function" && focusSnapshot.start != null) {
+          // Some input types (number, email, etc.) don't support setSelectionRange — try/catch is critical
+          try {
+            reborn.setSelectionRange(focusSnapshot.start, focusSnapshot.end, focusSnapshot.direction || "none");
+          } catch {}
+        }
+        reborn.scrollTop = focusSnapshot.scrollTop || 0;
+        reborn.scrollLeft = focusSnapshot.scrollLeft || 0;
+      } catch {}
+    }
+  }
+
+  // Restore scroll position after render
+  _lastRenderedView = view;
+  if (sameView) {
+    // Mid-action re-render — restore previous scroll position
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: prevScrollY, behavior: "instant" });
+    });
+  } else if (_scrollMemo[view] !== undefined) {
+    // View change — restore scroll if we've been here before
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: _scrollMemo[view] || 0, behavior: "instant" });
+    });
+  } else {
+    // New view — start at top
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, behavior: "instant" });
+    });
+  }
+}
+
+// ============================================================
+// ACCOUNTS MODULE (v3.0)
+// Balance tracking with project-wise credit / expense / salary
+// ============================================================
+
+function formatINR(n) {
+  const num = Number(n) || 0;
+  return "₹" + num.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function calculateAccountsBalance(transactions) {
+  let bal = 0;
+  for (const tx of transactions) {
+    if (tx.isPlanned) continue; // planned items don't affect current balance
+    if (tx.type === "opening" || tx.type === "credit") bal += tx.amount;
+    else if (tx.type === "expense" || tx.type === "salary") bal -= tx.amount;
+  }
+  return bal;
+}
+
+function calculateUpcomingTotal(transactions) {
+  // Sum of all PLANNED expenses + salaries (these are future outflows)
+  let total = 0;
+  for (const tx of transactions) {
+    if (!tx.isPlanned) continue;
+    if (tx.type === "expense" || tx.type === "salary") total += tx.amount;
+  }
+  return total;
+}
+
+function accountsProjectSummary(transactions) {
+  const summary = {};
+  for (const tx of transactions) {
+    if (tx.isPlanned) continue; // planned not yet realized
+    const proj = tx.projectName || "Uncategorized";
+    if (!summary[proj]) summary[proj] = { credit: 0, expense: 0, salary: 0, net: 0 };
+    if (tx.type === "credit") summary[proj].credit += tx.amount;
+    else if (tx.type === "expense") summary[proj].expense += tx.amount;
+    else if (tx.type === "salary") summary[proj].salary += tx.amount;
+  }
+  for (const proj in summary) {
+    summary[proj].net = summary[proj].credit - summary[proj].expense - summary[proj].salary;
+  }
+  return summary;
+}
+
+function renderAccountsPage() {
+  const balance = calculateAccountsBalance(accountsTransactions);
+  const upcomingTotal = calculateUpcomingTotal(accountsTransactions);
+  const projectedBalance = balance - upcomingTotal;
+  const summary = accountsProjectSummary(accountsTransactions);
+  const projectKeys = Object.keys(summary).sort((a, b) => Math.abs(summary[b].net) - Math.abs(summary[a].net));
+
+  // Split transactions: actual vs upcoming
+  const actualTxs = accountsTransactions.filter((t) => !t.isPlanned);
+  const upcomingTxs = accountsTransactions.filter((t) => t.isPlanned).sort((a, b) => {
+    return new Date(a.transactionDate || a.createdAt) - new Date(b.transactionDate || b.createdAt);
+  });
+  const recent = actualTxs.slice(0, 30);
+
+  const totalCredit = actualTxs.filter((t) => t.type === "credit" || t.type === "opening").reduce((s, t) => s + t.amount, 0);
+  const totalExpense = actualTxs.filter((t) => t.type === "expense").reduce((s, t) => s + t.amount, 0);
+  const totalSalary = actualTxs.filter((t) => t.type === "salary").reduce((s, t) => s + t.amount, 0);
+
+  app.innerHTML = `
+    ${renderHeader("Accounts", "Money in, money out, project-wise")}
+    <main class="main">
+      ${renderAdminNav("accounts")}
+
+      <!-- Balance hero: two-column current vs projected -->
+      <section class="card acc-hero ${balance < 0 ? "acc-hero-neg" : ""}">
+        <div class="acc-hero-split">
+          <div class="acc-hero-side acc-hero-current">
+            <div class="acc-hero-label">Current Balance</div>
+            <div class="acc-hero-amount">${escapeHtml(formatINR(balance))}</div>
+            <div class="acc-hero-sub">As of today</div>
+          </div>
+          <div class="acc-hero-side acc-hero-projected ${projectedBalance < 0 ? "acc-projected-neg" : ""}">
+            <div class="acc-hero-label">After Upcoming</div>
+            <div class="acc-hero-amount">${escapeHtml(formatINR(projectedBalance))}</div>
+            <div class="acc-hero-sub">
+              ${upcomingTotal > 0 ? `− ${escapeHtml(formatINR(upcomingTotal))} planned` : "No planned expenses"}
+            </div>
+          </div>
+        </div>
+        <div class="acc-hero-stats">
+          <div class="acc-hero-stat">
+            <span class="acc-hero-stat-dot" style="background:#10b981;"></span>
+            <span class="acc-hero-stat-label">Credits</span>
+            <span class="acc-hero-stat-value">${escapeHtml(formatINR(totalCredit))}</span>
+          </div>
+          <div class="acc-hero-stat">
+            <span class="acc-hero-stat-dot" style="background:#f97316;"></span>
+            <span class="acc-hero-stat-label">Expenses</span>
+            <span class="acc-hero-stat-value">${escapeHtml(formatINR(totalExpense))}</span>
+          </div>
+          <div class="acc-hero-stat">
+            <span class="acc-hero-stat-dot" style="background:#8b5cf6;"></span>
+            <span class="acc-hero-stat-label">Salaries</span>
+            <span class="acc-hero-stat-value">${escapeHtml(formatINR(totalSalary))}</span>
+          </div>
+        </div>
+        <div class="acc-actions">
+          <button type="button" class="btn btn-primary" id="addCreditBtn">＋ Credit</button>
+          <button type="button" class="btn btn-outline" id="addExpenseBtn">－ Expense</button>
+          <button type="button" class="btn btn-outline" id="addSalaryBtn">👤 Salary</button>
+          <button type="button" class="btn btn-warn" id="addUpcomingBtn">⏳ Upcoming</button>
+          ${accountsTransactions.length === 0 ? `<button type="button" class="btn btn-secondary btn-sm" id="setOpeningBtn">Set Opening</button>` : ""}
+        </div>
+      </section>
+
+      <!-- Upcoming expenses section (only shown if there are any) -->
+      ${upcomingTxs.length > 0 ? `
+        <section class="card acc-upcoming-card">
+          <div class="section-heading">
+            <div>
+              <h2>⏳ Upcoming Expenses (${upcomingTxs.length})</h2>
+              <p class="section-subtitle">Planned outflows. Mark Paid when payment done → moves to actual expenses.</p>
+            </div>
+            <div class="acc-upcoming-total">
+              <span class="acc-upcoming-total-label">Total upcoming</span>
+              <strong>${escapeHtml(formatINR(upcomingTotal))}</strong>
+            </div>
+          </div>
+          <div class="acc-upcoming-list">
+            ${upcomingTxs.map((tx) => {
+              const dueDate = tx.transactionDate || tx.createdAt;
+              const dueDateObj = new Date(dueDate);
+              const today = new Date();
+              today.setHours(0,0,0,0);
+              const isDue = dueDateObj <= today;
+              const isSoon = !isDue && (dueDateObj - today) < 7 * 86400000;
+              const typeLabel = tx.type === "salary" ? "👤 Salary" : "－ Expense";
+              return `
+                <article class="acc-upcoming-item ${isDue ? "acc-upcoming-due" : isSoon ? "acc-upcoming-soon" : ""}">
+                  <div class="acc-upcoming-head">
+                    <span class="acc-upcoming-type">${typeLabel}</span>
+                    ${isDue ? `<span class="acc-upcoming-badge acc-badge-due">⚠️ Due</span>` : isSoon ? `<span class="acc-upcoming-badge acc-badge-soon">Soon</span>` : ""}
+                  </div>
+                  <div class="acc-upcoming-main">
+                    <div class="acc-upcoming-desc">
+                      <strong>${escapeHtml(tx.projectName || "Uncategorized")}</strong>
+                      ${tx.description ? `<span>${escapeHtml(tx.description)}</span>` : ""}
+                    </div>
+                    <div class="acc-upcoming-amount">${escapeHtml(formatINR(tx.amount))}</div>
+                  </div>
+                  <div class="acc-upcoming-foot">
+                    <span class="acc-upcoming-date">📅 ${escapeHtml(formatDateTime(dueDate))}</span>
+                    <div class="acc-upcoming-actions">
+                      <button type="button" class="btn btn-primary btn-sm acc-mark-paid" data-id="${tx.id}">✓ Mark Paid</button>
+                      <button type="button" class="btn btn-danger btn-sm acc-delete-tx" data-id="${tx.id}">🗑</button>
+                    </div>
+                  </div>
+                </article>
+              `;
+            }).join("")}
+          </div>
+        </section>
+      ` : ""}
+
+      <!-- Project-wise summary -->
+      <section class="card">
+        <div class="section-heading">
+          <h2>📊 Project-wise Summary</h2>
+        </div>
+        ${projectKeys.length === 0 ? `
+          <div class="entry-empty">
+            <div class="entry-empty-icon">📂</div>
+            <h3>No transactions yet</h3>
+            <p>Add a credit or expense to see project-wise summary.</p>
+          </div>
+        ` : `
+          <div class="table-wrap acc-summary-desktop">
+            <table>
+              <thead>
+                <tr>
+                  <th>Project</th>
+                  <th class="num">Credit</th>
+                  <th class="num">Expense</th>
+                  <th class="num">Salary</th>
+                  <th class="num">Net</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${projectKeys.map((p) => `
+                  <tr>
+                    <td>${escapeHtml(p)}</td>
+                    <td class="num mono">${escapeHtml(formatINR(summary[p].credit))}</td>
+                    <td class="num mono">${escapeHtml(formatINR(summary[p].expense))}</td>
+                    <td class="num mono">${escapeHtml(formatINR(summary[p].salary))}</td>
+                    <td class="num mono" style="font-weight:800; color:${summary[p].net >= 0 ? "#047857" : "#b91c1c"};">${escapeHtml(formatINR(summary[p].net))}</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+          <!-- Mobile card view -->
+          <div class="acc-summary-cards">
+            ${projectKeys.map((p) => `
+              <article class="tk-card">
+                <div class="tk-card-head">
+                  <span class="tk-pill">${escapeHtml(p)}</span>
+                  <span class="tk-chip ${summary[p].net >= 0 ? "tk-chip-install" : "tk-chip-deleted"}" style="text-decoration:none;">${escapeHtml(formatINR(summary[p].net))}</span>
+                </div>
+                <div class="tk-stats">
+                  <div class="tk-stat">
+                    <span class="tk-stat-icon" style="color:#10b981;">●</span>
+                    <span class="tk-stat-label">Credit:</span>
+                    <span class="tk-stat-value">${escapeHtml(formatINR(summary[p].credit))}</span>
+                  </div>
+                  <div class="tk-stat">
+                    <span class="tk-stat-icon" style="color:#f97316;">●</span>
+                    <span class="tk-stat-label">Expense:</span>
+                    <span class="tk-stat-value">${escapeHtml(formatINR(summary[p].expense))}</span>
+                  </div>
+                  <div class="tk-stat tk-stat-full">
+                    <span class="tk-stat-icon" style="color:#8b5cf6;">●</span>
+                    <span class="tk-stat-label">Salary:</span>
+                    <span class="tk-stat-value">${escapeHtml(formatINR(summary[p].salary))}</span>
+                  </div>
+                </div>
+              </article>
+            `).join("")}
+          </div>
+        `}
+      </section>
+
+      <!-- Recent transactions -->
+      <section class="card">
+        <div class="section-heading">
+          <h2>🕒 Recent Transactions</h2>
+        </div>
+        ${recent.length === 0 ? `
+          <p style="color:#94a3b8; text-align:center; padding: 1rem 0;">No transactions yet.</p>
+        ` : `
+          <div class="table-wrap acc-tx-desktop">
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Type</th>
+                  <th>Project</th>
+                  <th>Description</th>
+                  <th class="num">Amount</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                ${recent.map((tx) => {
+                  const isOut = tx.type === "expense" || tx.type === "salary";
+                  const typeClass = tx.type === "credit" ? "badge-ok" : tx.type === "expense" ? "badge-warn" : tx.type === "salary" ? "badge-info" : "badge";
+                  const typeLabel = tx.type === "opening" ? "Opening" : tx.type === "credit" ? "Credit" : tx.type === "salary" ? "Salary" : "Expense";
+                  return `
+                    <tr>
+                      <td class="date-cell">${escapeHtml(formatDateTime(tx.transactionDate || tx.createdAt))}</td>
+                      <td><span class="badge ${typeClass}">${escapeHtml(typeLabel)}</span></td>
+                      <td>${escapeHtml(tx.projectName || "—")}</td>
+                      <td>${escapeHtml(tx.description || "")}</td>
+                      <td class="num mono" style="font-weight:800; color:${isOut ? "#b91c1c" : "#047857"};">${isOut ? "−" : "+"} ${escapeHtml(formatINR(tx.amount))}</td>
+                      <td class="row-actions"><button type="button" class="btn btn-danger btn-sm acc-delete-tx" data-id="${tx.id}">🗑</button></td>
+                    </tr>
+                  `;
+                }).join("")}
+              </tbody>
+            </table>
+          </div>
+          <div class="acc-tx-cards">
+            ${recent.map((tx) => {
+              const isOut = tx.type === "expense" || tx.type === "salary";
+              const typeLabel = tx.type === "opening" ? "Opening" : tx.type === "credit" ? "Credit" : tx.type === "salary" ? "Salary" : "Expense";
+              const chipClass = tx.type === "credit" || tx.type === "opening" ? "tk-chip-install" : tx.type === "salary" ? "tk-chip-repair" : "tk-chip-deleted";
+              return `
+                <article class="tk-card" style="margin-bottom: 0.6rem;">
+                  <div class="tk-card-head">
+                    <span class="tk-pill">${escapeHtml(tx.projectName || "Uncategorized")}</span>
+                    <span class="tk-chip ${chipClass}" style="text-decoration:none;">${escapeHtml(typeLabel)}</span>
+                  </div>
+                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+                    <div style="font-family: var(--font-mono); font-size: 1.1rem; font-weight: 800; color: ${isOut ? "#b91c1c" : "#047857"};">
+                      ${isOut ? "−" : "+"} ${escapeHtml(formatINR(tx.amount))}
+                    </div>
+                    <div style="font-size: 0.72rem; color: #64748b;">${escapeHtml(formatDateTime(tx.transactionDate || tx.createdAt))}</div>
+                  </div>
+                  ${tx.description ? `<div style="font-size: 0.78rem; color: #475569; margin-bottom: 0.3rem;">${escapeHtml(tx.description)}</div>` : ""}
+                  <div class="tk-actions" style="padding-top: 0.5rem;">
+                    <button type="button" class="btn btn-danger btn-sm acc-delete-tx" data-id="${tx.id}">🗑 Delete</button>
+                  </div>
+                </article>
+              `;
+            }).join("")}
+          </div>
+        `}
+      </section>
+    </main>
+  `;
+
+  bindLogout();
+  bindAdminNav();
+  document.getElementById("addCreditBtn")?.addEventListener("click", () => openAccountsTxModal("credit"));
+  document.getElementById("addExpenseBtn")?.addEventListener("click", () => openAccountsTxModal("expense"));
+  document.getElementById("addSalaryBtn")?.addEventListener("click", () => openAccountsTxModal("salary"));
+  document.getElementById("addUpcomingBtn")?.addEventListener("click", () => openAccountsUpcomingModal());
+  document.getElementById("setOpeningBtn")?.addEventListener("click", () => openAccountsTxModal("opening"));
+  document.querySelectorAll(".acc-delete-tx").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      const id = e.currentTarget.dataset.id;
+      handleAccountsDeleteTx(id);
+    });
+  });
+  document.querySelectorAll(".acc-mark-paid").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      const id = e.currentTarget.dataset.id;
+      handleMarkUpcomingPaid(id);
+    });
+  });
+}
+
+async function handleMarkUpcomingPaid(id) {
+  const tx = accountsTransactions.find((t) => t.id === id);
+  if (!tx) return;
+  const ok = await showConfirm({
+    title: "Mark as Paid?",
+    message: `<strong>${escapeHtml(formatINR(tx.amount))}</strong> — ${escapeHtml(tx.projectName || "Uncategorized")}<br><br>This will move it from upcoming to actual expenses with today's date.`,
+    confirmLabel: "✓ Yes, Mark Paid",
+  });
+  if (!ok) return;
+  const todayISO = new Date().toISOString().slice(0, 10);
+  try {
+    await updateAccountsTransaction(id, {
+      isPlanned: false,
+      transactionDate: todayISO,
+    });
+    // Update local state too
+    tx.isPlanned = false;
+    tx.transactionDate = todayISO;
+    render();
+    showToast("Marked as paid — added to expenses.");
+  } catch (err) {
+    showToast(err.message || "Failed to mark paid.", true);
+    await refreshAllData();
+    render();
+  }
+}
+
+function openAccountsUpcomingModal() {
+  // Default to ~30 days in future
+  const future = new Date();
+  future.setDate(future.getDate() + 30);
+  const futureISO = future.toISOString().slice(0, 10);
+  const today = new Date().toISOString().slice(0, 10);
+
+  const allProjects = [...new Set(accountsTransactions.map((t) => t.projectName).filter(Boolean))];
+  const projectOptions = allProjects.map((p) => `<option value="${escapeHtml(p)}"></option>`).join("");
+
+  modal.innerHTML = `
+    <h3>⏳ Add Upcoming Expense</h3>
+    <p class="modal-desc">Planned future outflow. Won't affect current balance until you mark it paid.</p>
+
+    <div class="form-grid">
+      <div class="field full-width">
+        <label>Type</label>
+        <div class="seg-control" id="upcomingTypeSeg">
+          <button type="button" class="seg-btn active" data-type="expense">－ Expense</button>
+          <button type="button" class="seg-btn" data-type="salary">👤 Salary</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="upcAmount">Amount (₹) <span class="required">*</span></label>
+        <input type="number" id="upcAmount" min="0" step="0.01" placeholder="0.00" inputmode="decimal" autocomplete="off" autofocus />
+      </div>
+      <div class="field">
+        <label for="upcDueDate">Expected Date <span class="required">*</span></label>
+        <input type="date" id="upcDueDate" value="${futureISO}" min="${today}" />
+      </div>
+      <div class="field full-width">
+        <label for="upcProject">Project / Description</label>
+        <input type="text" id="upcProject" list="upcProjectList" placeholder="e.g. Q3 Office rent, Salary - Ramesh" autocomplete="off" />
+        <datalist id="upcProjectList">${projectOptions}</datalist>
+      </div>
+      <div class="field full-width">
+        <label for="upcDesc">Notes (optional)</label>
+        <textarea id="upcDesc" rows="2" placeholder="Any additional context..."></textarea>
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-warn" data-act="save">⏳ Add to Upcoming</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+
+  // Type toggle
+  let _upcType = "expense";
+  document.querySelectorAll("#upcomingTypeSeg .seg-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      _upcType = btn.dataset.type;
+      document.querySelectorAll("#upcomingTypeSeg .seg-btn").forEach((b) => {
+        b.classList.toggle("active", b.dataset.type === _upcType);
+      });
+    });
+  });
+
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modal.querySelector('[data-act="save"]').onclick = async () => {
+    const amount = parseFloat(document.getElementById("upcAmount").value);
+    const dueDate = document.getElementById("upcDueDate").value;
+    const projectName = document.getElementById("upcProject").value.trim();
+    const description = document.getElementById("upcDesc").value.trim();
+    if (!amount || amount <= 0) {
+      showToast("Please enter a valid amount.", true);
+      return;
+    }
+    if (!dueDate) {
+      showToast("Please pick an expected date.", true);
+      return;
+    }
+    try {
+      const tx = {
+        id: crypto.randomUUID(),
+        type: _upcType,
+        amount,
+        projectName: projectName || "Uncategorized",
+        description,
+        transactionDate: dueDate,
+        isPlanned: true,
+        createdBy: currentUser || "admin",
+      };
+      const saved = await insertAccountsTransaction(tx);
+      accountsTransactions.unshift({
+        ...tx,
+        ...saved,
+        isPlanned: true,
+      });
+      closeModal();
+      render();
+      showToast("Upcoming expense added.");
+    } catch (err) {
+      showToast(err.message || "Failed to add.", true);
+    }
+  };
+}
+
+function openAccountsTxModal(type) {
+  const today = new Date().toISOString().slice(0, 10);
+  const projOptions = accountsProjects
+    .map((p) => `<option value="${escapeHtml(p.name)}"></option>`)
+    .join("");
+
+  const titles = {
+    opening: "🏁 Set Opening Balance",
+    credit: "＋ Add Credit",
+    expense: "－ Add Expense",
+    salary: "👤 Add Salary",
+  };
+  const hints = {
+    opening: "Aapke paas abhi kitna paisa hai? Iske baad credit/expense add karke balance maintain hoga.",
+    credit: "Kis project se paise mile? Project ka naam type karo, naya bhi add ho jaayega.",
+    expense: "Kis project pe kharch hua? Project select karo aur amount enter karo.",
+    salary: "Kis project ka salary paid? Person ka naam description me likho.",
+  };
+
+  modal.innerHTML = `
+    <h3>${escapeHtml(titles[type])}</h3>
+    <p class="modal-desc">${escapeHtml(hints[type])}</p>
+    <div class="form-grid">
+      <div class="field">
+        <label for="accTxAmount">Amount (₹) <span class="required">*</span></label>
+        <input type="number" id="accTxAmount" required min="0" step="0.01" placeholder="e.g. 5000" inputmode="decimal" autofocus />
+      </div>
+      ${type !== "opening" ? `
+        <div class="field">
+          <label for="accTxProject">Project <span class="required">*</span></label>
+          <input type="text" id="accTxProject" required placeholder="Type project name (or pick from list)" autocomplete="off" list="accProjectsList" />
+          <datalist id="accProjectsList">${projOptions}</datalist>
+          <p class="hint">Naya project name daal sakte ho — automatic add ho jaayega.</p>
+        </div>
+      ` : ""}
+      <div class="field full-width">
+        <label for="accTxDesc">Description / Notes</label>
+        <input type="text" id="accTxDesc" placeholder="e.g. Salary for May / Office supplies / Client payment" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label for="accTxDate">Date</label>
+        <input type="date" id="accTxDate" value="${today}" />
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" data-act="save">Save</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modal.querySelector('[data-act="save"]').onclick = async () => {
+    const amount = parseFloat(document.getElementById("accTxAmount").value);
+    const projInput = document.getElementById("accTxProject");
+    const projectName = projInput ? projInput.value.trim() : "";
+    const description = document.getElementById("accTxDesc").value.trim();
+    const date = document.getElementById("accTxDate").value || today;
+
+    if (!amount || amount <= 0) {
+      showToast("Please enter a valid amount.", true);
+      return;
+    }
+    if (type !== "opening" && !projectName) {
+      showToast("Please enter a project name.", true);
+      return;
+    }
+
+    try {
+      // If new project — create it
+      let projectId = null;
+      if (projectName) {
+        const existing = accountsProjects.find((p) => p.name.toLowerCase() === projectName.toLowerCase());
+        if (existing) {
+          projectId = existing.id;
+        } else {
+          const newProj = await insertAccountsProject({
+            id: "proj-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+            name: projectName,
+            createdBy: currentUser,
+          });
+          accountsProjects.push(newProj);
+          projectId = newProj.id;
+        }
+      }
+      const tx = await insertAccountsTransaction({
+        id: "tx-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        type,
+        amount,
+        projectId,
+        projectName: projectName || null,
+        description,
+        transactionDate: date,
+        createdBy: currentUser,
+      });
+      accountsTransactions = [tx, ...accountsTransactions];
+      closeModal();
+      const labels = { opening: "Opening balance set", credit: "Credit added", expense: "Expense added", salary: "Salary added" };
+      showToast(`✓ ${labels[type]} (${formatINR(amount)})`);
+      render();
+    } catch (err) {
+      console.error("Save transaction failed", err);
+      showToast(err.message || "Failed to save. Database setup incomplete — contact admin.", true);
+    }
+  };
+}
+
+async function handleAccountsDeleteTx(id) {
+  const tx = accountsTransactions.find((t) => t.id === id);
+  if (!tx) return;
+  showModal(
+    `
+    <h3>Delete Transaction?</h3>
+    <p class="modal-desc">${escapeHtml(formatINR(tx.amount))} · ${escapeHtml(tx.projectName || "—")} · ${escapeHtml(tx.description || "")}</p>
+    <p class="modal-desc" style="color:#b91c1c;">This will affect your balance. Continue?</p>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary modal-close">Cancel</button>
+      <button type="button" class="btn btn-danger modal-confirm">Delete</button>
+    </div>
+    `,
+    async () => {
+      try {
+        await deleteAccountsTransaction(id);
+        accountsTransactions = accountsTransactions.filter((t) => t.id !== id);
+        closeModal();
+        showToast("✓ Transaction deleted");
+        render();
+      } catch (err) {
+        showToast(err.message || "Delete failed", true);
+      }
+    }
+  );
+}
+
+// ============================================================
+// USER ACCESS PAGE (v3.1) — Admin manages page permissions
+// ============================================================
+
+function renderUserAccessPage() {
+  const allPages = [
+    { key: "dashboard",     label: "🏠 Home (Admin Dashboard)" },
+    { key: "installations", label: "🚛 Installations" },
+    { key: "repairs",       label: "🛠️ Repair Work" },
+    { key: "pending",       label: "⚙️ Repair Progress" },
+    { key: "sim-db",        label: "📶 SIM Database" },
+    { key: "stock",         label: "📦 Stock" },
+    { key: "accounts",      label: "₹ Accounts" },
+    { key: "timeline",      label: "📅 Vehicle Timeline" },
+    { key: "deletions",     label: "🗑️ Deletion Audit Log" },
+    { key: "user-access",   label: "👥 User Access (admin only)" },
+    { key: "akash-home",    label: "📋 Akash Home (field worker)" },
+    { key: "install",       label: "🆕 New Install (form)" },
+    { key: "repair",        label: "🔧 Report Repair (form)" },
+  ];
+
+  const allUsers = Object.keys(USERS);
+
+  app.innerHTML = `
+    ${renderHeader("User Access", "Manage who can see which pages")}
+    <main class="main">
+      ${renderAdminNav("user-access")}
+      <section class="card">
+        <div class="section-heading">
+          <h2>👥 User Access Control</h2>
+        </div>
+        <p class="hint" style="margin-bottom: 1rem;">Check the pages each user should be able to access. Changes save instantly.</p>
+
+        ${allUsers.map((username) => {
+          const perms = getUserPerms(username) || { displayName: username, isAdmin: false, allowedPages: [] };
+          const isAdminUser = perms.isAdmin || username === "admin";
+          return `
+            <div class="user-access-card">
+              <div class="user-access-head">
+                <div>
+                  <h3 class="user-access-name">${escapeHtml(perms.displayName || username)}</h3>
+                  <code class="user-access-username">@${escapeHtml(username)}</code>
+                </div>
+                ${isAdminUser ? `<span class="badge badge-ok">🛡️ Admin (full access)</span>` : ""}
+              </div>
+              ${isAdminUser ? "" : `
+                <div class="user-access-pages">
+                  ${allPages.map((p) => `
+                    <label class="user-access-page-check">
+                      <input type="checkbox" data-user="${escapeHtml(username)}" data-page="${escapeHtml(p.key)}" ${(perms.allowedPages || []).includes(p.key) ? "checked" : ""} />
+                      <span>${escapeHtml(p.label)}</span>
+                    </label>
+                  `).join("")}
+                </div>
+              `}
+            </div>
+          `;
+        }).join("")}
+      </section>
+    </main>
+  `;
+
+  bindLogout();
+  bindAdminNav();
+
+  document.querySelectorAll(".user-access-page-check input").forEach((cb) => {
+    cb.addEventListener("change", async (e) => {
+      const username = e.target.dataset.user;
+      const page = e.target.dataset.page;
+      const perms = getUserPerms(username) || { ...DEFAULT_PERMISSIONS[username] } || { displayName: username, isAdmin: false, allowedPages: [] };
+      const allowed = new Set(perms.allowedPages || []);
+      if (e.target.checked) allowed.add(page);
+      else allowed.delete(page);
+      const newPerms = {
+        username,
+        displayName: perms.displayName,
+        isAdmin: !!perms.isAdmin,
+        allowedPages: Array.from(allowed),
+        updatedBy: currentUser,
+      };
+      try {
+        await upsertUserPermission(newPerms);
+        userPermissions[username] = newPerms;
+        showToast(`✓ ${username} access updated`);
+      } catch (err) {
+        showToast(err.message || "Failed to save. Run user-permissions-migration.sql first.", true);
+        e.target.checked = !e.target.checked; // revert
+      }
+    });
+  });
+}
+
+// ============================================================
+// BULK STOCK SCAN FLOW (v3.1)
+// Click Add → enter metadata → scan multiple IMEIs → save all
+// ============================================================
+
+let _bulkScanState = {
+  active: false,
+  meta: null,
+  scanned: [], // array of IMEI strings
+  scanner: null,
+};
+
+function openBulkStockAdd() {
+  const isAdmin = currentUser === "admin";
+  const categories = [...new Set(stockItems.map((s) => s.category).filter(Boolean))];
+  const supplierOptions = suppliers.map((s) => `<option value="${escapeHtml(s.name)}"></option>`).join("");
+  const categoryOptions = [...new Set([
+    ...stockCategories.map((c) => c.name),
+    ...categories,
+  ])].map((c) => `<option value="${escapeHtml(c)}"></option>`).join("");
+  // Projects sourced from accounts + existing stock metadata
+  const projectList = [...new Set([
+    ...accountsTransactions.map((t) => t.projectName).filter(Boolean),
+    ...stockItems.map((s) => s.metadata?.project).filter(Boolean),
+  ])];
+  const projectOptions = projectList.map((p) => `<option value="${escapeHtml(p)}"></option>`).join("");
+
+  modal.innerHTML = `
+    <h3>📦 Add Stock Items — Step 1 of 2</h3>
+    <p class="modal-desc">
+      ${isAdmin
+        ? "Enter item details + what kind of code each unit has."
+        : "Item details daalo. Supplier admin baad me add karega."}
+    </p>
+    <div class="form-grid">
+      <div class="field full-width">
+        <label for="bulkItemName">Item Name <span class="required">*</span></label>
+        <input type="text" id="bulkItemName" required placeholder="e.g. GPS Device - Normal" autocomplete="off" autofocus />
+      </div>
+      <div class="field">
+        <label for="bulkItemCategory">Category</label>
+        <input type="text" id="bulkItemCategory" list="bulkCatList" placeholder="e.g. GPS, SIM-JIO, Sensor" autocomplete="off" />
+        <datalist id="bulkCatList">${categoryOptions}</datalist>
+      </div>
+      ${isAdmin ? `
+        <div class="field">
+          <label for="bulkItemSupplier">Supplier</label>
+          <input type="text" id="bulkItemSupplier" list="bulkSupList" placeholder="Supplier name" autocomplete="off" />
+          <datalist id="bulkSupList">${supplierOptions}</datalist>
+        </div>
+      ` : `
+        <div class="field">
+          <label for="bulkItemProject">Project <span class="required">*</span></label>
+          <input type="text" id="bulkItemProject" list="bulkProjList" placeholder="e.g. Bandol, STAREX, Harrai" autocomplete="off" />
+          <datalist id="bulkProjList">${projectOptions}</datalist>
+        </div>
+      `}
+      <div class="field full-width">
+        <label>What code will you scan?</label>
+        <div class="seg-control" id="bulkCodeType">
+          <button type="button" class="seg-btn active" data-type="any">🌀 Any code</button>
+          <button type="button" class="seg-btn" data-type="imei">📡 IMEI only</button>
+          <button type="button" class="seg-btn" data-type="iccid">📶 SIM NO only</button>
+        </div>
+        <p class="hint" id="codeTypeHint">Any mode: koi bhi barcode/QR accept hoga. Filter chahiye to specific mode pick karo.</p>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" data-act="continue">Continue to Scan →</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+
+  // Code-type segmented control wiring
+  let _codeType = "any";
+  const seg = document.getElementById("bulkCodeType");
+  const hint = document.getElementById("codeTypeHint");
+  const hints = {
+    any: "Any mode: koi bhi barcode/QR accept hoga. Filter chahiye to specific mode pick karo.",
+    imei: "IMEI mode: scanner sirf 14-17 digit numbers accept karega. IMSI / SIM NO / QR ignore honge.",
+    iccid: "SIM NO mode: scanner sirf 89... se start hone wale 18-22 digit ICCIDs accept karega. IMSI / QR ignore.",
+  };
+  seg?.querySelectorAll(".seg-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      _codeType = btn.dataset.type;
+      seg.querySelectorAll(".seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.type === _codeType));
+      if (hint) hint.textContent = hints[_codeType];
+    });
+  });
+
+  // Auto-detect from category typing
+  document.getElementById("bulkItemCategory")?.addEventListener("input", (e) => {
+    const v = (e.target.value || "").toLowerCase();
+    let detected = null;
+    if (/sim|iccid/.test(v)) detected = "iccid";
+    else if (/gps|imei|device|tracker/.test(v)) detected = "imei";
+    if (detected && detected !== _codeType) {
+      _codeType = detected;
+      seg?.querySelectorAll(".seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.type === detected));
+      if (hint) hint.textContent = hints[detected];
+    }
+  });
+
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modal.querySelector('[data-act="continue"]').onclick = () => {
+    const name = document.getElementById("bulkItemName").value.trim();
+    const category = document.getElementById("bulkItemCategory").value.trim() || "Uncategorized";
+    const supplier = isAdmin
+      ? (document.getElementById("bulkItemSupplier").value.trim() || "")
+      : ""; // Abhinav doesn't enter supplier — admin fills later
+    const project = !isAdmin
+      ? (document.getElementById("bulkItemProject").value.trim() || "")
+      : "";
+    if (!name) {
+      showToast("Please enter item name.", true);
+      return;
+    }
+    if (!isAdmin && !project) {
+      showToast("Project zaroori hai. Konsa project ke liye stock hai?", true);
+      return;
+    }
+    _bulkScanState = {
+      active: true,
+      meta: { name, category, supplier, project, codeType: _codeType },
+      scanned: [],
+      scanner: null,
+    };
+    openBulkScanModal();
+  };
+}
+
+// ----- Audio + visual feedback helpers (v3.1.1) -----
+let _audioCtx = null;
+function playBeep(frequency = 880, duration = 0.08) {
+  try {
+    if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = _audioCtx.createOscillator();
+    const gain = _audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(_audioCtx.destination);
+    osc.frequency.value = frequency;
+    osc.type = "sine";
+    gain.gain.setValueAtTime(0.25, _audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, _audioCtx.currentTime + duration);
+    osc.start(_audioCtx.currentTime);
+    osc.stop(_audioCtx.currentTime + duration);
+  } catch (e) {}
+}
+
+function flashScanSuccess() {
+  const v = document.querySelector(".bulk-scan-viewfinder");
+  if (v) {
+    v.classList.add("scan-flash-success");
+    setTimeout(() => v.classList.remove("scan-flash-success"), 280);
+  }
+}
+
+function flashScanReject() {
+  const v = document.querySelector(".bulk-scan-viewfinder");
+  if (v) {
+    v.classList.add("scan-flash-reject");
+    setTimeout(() => v.classList.remove("scan-flash-reject"), 280);
+  }
+}
+
+function openBulkScanModal() {
+  const hasNativeDetector =
+    typeof window.BarcodeDetector !== "undefined" &&
+    window.isSecureContext;
+
+  const codeType = _bulkScanState.meta?.codeType || "any";
+  const typeLabels = {
+    imei:  { label: "IMEI", desc: "14-17 digit device serial", icon: "📡" },
+    iccid: { label: "SIM NO", desc: "89… 20-digit ICCID", icon: "📶" },
+    any:   { label: "Any", desc: "any code", icon: "🌀" },
+  };
+  const typeInfo = typeLabels[codeType] || typeLabels.any;
+
+  modal.innerHTML = `
+    <h3>📷 Scan Items — ${escapeHtml(_bulkScanState.meta.name)}</h3>
+    <p class="modal-desc">
+      Looking for: <strong id="scanModeBadge">${typeInfo.icon} ${escapeHtml(typeInfo.label)}</strong>
+      <span style="color:#94a3b8;">(${escapeHtml(typeInfo.desc)})</span>
+    </p>
+
+    <div class="seg-control" id="scanModeSwitcher" style="margin-bottom: 0.7rem;">
+      <button type="button" class="seg-btn ${codeType === 'any' ? 'active' : ''}" data-type="any">🌀 Any</button>
+      <button type="button" class="seg-btn ${codeType === 'imei' ? 'active' : ''}" data-type="imei">📡 IMEI</button>
+      <button type="button" class="seg-btn ${codeType === 'iccid' ? 'active' : ''}" data-type="iccid">📶 SIM NO</button>
+    </div>
+
+    <div class="bulk-scan-stats">
+      <span class="bulk-stat-label">Scanned</span>
+      <span class="bulk-stat-num" id="bulkScanCount">0</span>
+    </div>
+
+    <div class="qr-reader-wrap bulk-scan-viewfinder">
+      <video id="bulkScanVideo" autoplay playsinline muted></video>
+      <div class="qr-scan-line"></div>
+      <div class="qr-controls">
+        <button type="button" class="qr-icon-btn" id="bulkTorchBtn" style="display:none;" aria-label="Torch">🔦</button>
+      </div>
+      <div class="qr-status" id="qrStatus">Initialising camera…</div>
+    </div>
+
+    <div class="manual-entry-block" style="margin-top: 0.7rem;">
+      <div class="input-with-scan">
+        <input type="text" id="bulkManualImei" placeholder="Or type ${escapeHtml(typeInfo.label)} manually" inputmode="numeric" autocomplete="off" />
+        <button type="button" class="btn btn-primary btn-sm" id="bulkManualAdd">+ Add</button>
+      </div>
+    </div>
+
+    <div class="bulk-scanned-list">
+      <h4>Scanned Items <span class="bulk-list-count" id="bulkListCount">(0)</span></h4>
+      <ol id="bulkScannedList" class="bulk-list">
+        <li class="bulk-list-empty">No items scanned yet</li>
+      </ol>
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary btn-block" id="bulkSaveAll" disabled>Save All (0)</button>
+    </div>
+  `;
+  modal.classList.add("modal-wide");
+  modalOverlay.classList.remove("hidden");
+
+  const setStatus = (t) => {
+    const s = document.getElementById("qrStatus");
+    if (s) s.textContent = t;
+  };
+
+  const updateUI = () => {
+    const list = document.getElementById("bulkScannedList");
+    const count = _bulkScanState.scanned.length;
+    const countEl = document.getElementById("bulkScanCount");
+    if (countEl) countEl.textContent = count;
+    const lc = document.getElementById("bulkListCount");
+    if (lc) lc.textContent = `(${count})`;
+    const saveBtn = document.getElementById("bulkSaveAll");
+    if (saveBtn) {
+      saveBtn.disabled = count === 0;
+      saveBtn.textContent = count === 0
+        ? "Save All (0)"
+        : `✓ Save All (${count})`;
+    }
+    if (!list) return;
+    if (!count) {
+      list.innerHTML = `<li class="bulk-list-empty">No items scanned yet</li>`;
+      return;
+    }
+    list.innerHTML = _bulkScanState.scanned
+      .map((imei, idx) => `
+        <li class="bulk-list-item">
+          <span class="bulk-list-num">${idx + 1}.</span>
+          <span class="bulk-list-imei mono">${escapeHtml(imei)}</span>
+          <button type="button" class="bulk-list-remove" data-idx="${idx}" aria-label="Remove">×</button>
+        </li>
+      `).join("");
+    list.querySelectorAll(".bulk-list-remove").forEach((b) => {
+      b.addEventListener("click", () => {
+        const idx = parseInt(b.dataset.idx, 10);
+        _bulkScanState.scanned.splice(idx, 1);
+        updateUI();
+      });
+    });
+    // Auto-scroll list to bottom to show newest
+    list.scrollTop = list.scrollHeight;
+  };
+
+  let lastScannedCode = null;
+  let lastScanTime = 0;
+  let lastRejectedCode = null;
+  let lastRejectedTime = 0;
+
+  // Validates the scanned string against the chosen code type
+  const validateCode = (raw) => {
+    const v = String(raw || "").trim();
+    if (!v) return { ok: false, reason: "" };
+    const digits = v.replace(/\D/g, "");
+    const type = (_bulkScanState.meta && _bulkScanState.meta.codeType) || "any";
+
+    if (type === "iccid") {
+      // SIM NO / ICCID: 18-22 digits starting with 89
+      if (!/^89\d{16,20}$/.test(digits)) {
+        if (/^4\d{13,14}$/.test(digits)) return { ok: false, reason: "IMSI detected — looking for SIM NO (89…)" };
+        return { ok: false, reason: "Not a SIM NO (need 89… 20 digits)" };
+      }
+      return { ok: true, value: digits };
+    }
+
+    if (type === "imei") {
+      // IMEI: 14-17 digits, NOT starting with 89 (that would be ICCID)
+      if (/^89\d/.test(digits)) return { ok: false, reason: "Looks like SIM NO — looking for IMEI" };
+      if (!/^\d{14,17}$/.test(digits)) return { ok: false, reason: "Not an IMEI (need 14-17 digits)" };
+      return { ok: true, value: digits };
+    }
+
+    // 'any' mode — accept as-is
+    return { ok: true, value: v };
+  };
+
+  const addImei = (raw) => {
+    const v = String(raw || "").trim();
+    if (!v) return;
+    const now = Date.now();
+
+    // Format validation — reject wrong-type codes (e.g. IMSI when looking for ICCID)
+    const validation = validateCode(v);
+    if (!validation.ok) {
+      // Throttle rejection feedback (max 1 per 1.5s for same code)
+      if (v === lastRejectedCode && (now - lastRejectedTime) < 1500) return;
+      lastRejectedCode = v;
+      lastRejectedTime = now;
+      playBeep(280, 0.18); // low buzz = rejected
+      try { navigator.vibrate && navigator.vibrate([60, 80, 60]); } catch {}
+      const shortV = v.length > 12 ? v.slice(0, 6) + "…" + v.slice(-6) : v;
+      setStatus(`✗ Detected "${shortV}" — ${validation.reason}. Tap "Any code" mode if needed.`);
+      flashScanReject();
+      return;
+    }
+
+    const value = validation.value;
+
+    // Same code within 1s = ignore (prevents accidental double-scan)
+    if (value === lastScannedCode && (now - lastScanTime) < 1000) return;
+    lastScannedCode = value;
+    lastScanTime = now;
+
+    // Check within current scan session
+    if (_bulkScanState.scanned.includes(value)) {
+      playBeep(400, 0.12);
+      setStatus(`⚠️ ${value.slice(-6)} already scanned in this session`);
+      try { navigator.vibrate && navigator.vibrate([30, 50, 30]); } catch {}
+      flashScanReject();
+      return;
+    }
+
+    // Check across global data (stock + installations + sims) — prevent duplicates
+    const existing = findExistingCode(value);
+    if (existing) {
+      if (value === lastRejectedCode && (now - lastRejectedTime) < 2000) return;
+      lastRejectedCode = value;
+      lastRejectedTime = now;
+      playBeep(220, 0.25); // longer low buzz = rejected harder
+      try { navigator.vibrate && navigator.vibrate([80, 60, 80, 60, 80]); } catch {}
+      const shortV = value.length > 12 ? value.slice(0, 6) + "…" + value.slice(-6) : value;
+      setStatus(`❌ Duplicate! "${shortV}" — ${existing.label}`);
+      flashScanReject();
+      return;
+    }
+
+    _bulkScanState.scanned.push(value);
+    updateUI();
+    playBeep(880, 0.08); // high beep = success
+    flashScanSuccess();
+    try { navigator.vibrate && navigator.vibrate(60); } catch {}
+    setStatus(`✓ Added (${_bulkScanState.scanned.length}). Next item…`);
+    const countEl = document.getElementById("bulkScanCount");
+    if (countEl) {
+      countEl.style.transform = "scale(1.4)";
+      setTimeout(() => { countEl.style.transform = ""; }, 200);
+    }
+  };
+
+  const cleanup = async () => {
+    _bulkScanState.active = false;
+    try {
+      // Stop native video stream
+      const video = document.getElementById("bulkScanVideo");
+      if (video && video.srcObject) {
+        video.srcObject.getTracks().forEach((t) => t.stop());
+        video.srcObject = null;
+      }
+    } catch {}
+    try {
+      if (_bulkScanState.scanner) {
+        await _bulkScanState.scanner.stop().catch(() => {});
+        await _bulkScanState.scanner.clear().catch(() => {});
+      }
+    } catch {}
+    _bulkScanState = { active: false, meta: null, scanned: [], scanner: null };
+    modal.classList.remove("modal-wide");
+    closeModal();
+  };
+
+  // Manual entry
+  const manualBtn = document.getElementById("bulkManualAdd");
+  const manualInput = document.getElementById("bulkManualImei");
+  manualBtn?.addEventListener("click", () => {
+    const v = manualInput.value.trim();
+    if (v) {
+      addImei(v);
+      manualInput.value = "";
+      manualInput.focus();
+    }
+  });
+  manualInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      manualBtn?.click();
+    }
+  });
+
+  modal.querySelector('[data-act="cancel"]').onclick = () => {
+    if (_bulkScanState.scanned.length > 0) {
+      if (!confirm(`Discard ${_bulkScanState.scanned.length} scanned items?`)) return;
+    }
+    cleanup();
+  };
+
+  document.getElementById("bulkSaveAll")?.addEventListener("click", async () => {
+    await saveBulkStockItems();
+  });
+
+  modalOverlay.onclick = null; // disable click-outside-to-close during bulk scan
+
+  _bulkScanState.active = true;
+
+  // In-scanner mode switcher — user can change filter on the fly
+  document.querySelectorAll("#scanModeSwitcher .seg-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const newType = btn.dataset.type;
+      _bulkScanState.meta.codeType = newType;
+      document.querySelectorAll("#scanModeSwitcher .seg-btn").forEach((b) => {
+        b.classList.toggle("active", b.dataset.type === newType);
+      });
+      const labels = {
+        imei:  { label: "IMEI", desc: "14-17 digit", icon: "📡" },
+        iccid: { label: "SIM NO", desc: "89… 20-digit", icon: "📶" },
+        any:   { label: "Any", desc: "any code", icon: "🌀" },
+      };
+      const info = labels[newType];
+      const badge = document.getElementById("scanModeBadge");
+      if (badge) badge.textContent = `${info.icon} ${info.label}`;
+      setStatus(`Mode: ${info.icon} ${info.label} — ${info.desc}`);
+    });
+  });
+
+  // ----- Initialise scanner -----
+  if (hasNativeDetector) {
+    initNativeBulkScanner(addImei, setStatus, cleanup);
+  } else {
+    initFallbackBulkScanner(addImei, setStatus);
+  }
+}
+
+// ===== NATIVE BarcodeDetector — fast + fail-safe =====
+async function initNativeBulkScanner(addImei, setStatus, cleanup) {
+  try {
+    // Get all supported formats — no restriction, max compatibility
+    let formats = [];
+    try {
+      formats = await window.BarcodeDetector.getSupportedFormats();
+    } catch (e) {
+      console.warn("getSupportedFormats failed:", e);
+    }
+    // Create detector with no format restriction (defaults to all)
+    const detector = formats.length
+      ? new window.BarcodeDetector({ formats })
+      : new window.BarcodeDetector();
+
+    const video = document.getElementById("bulkScanVideo");
+    if (!video) {
+      setStatus("Video element not found");
+      return;
+    }
+
+    setStatus("Requesting camera permission…");
+
+    // STRICT: enforce back camera. First try with `ideal`, then `exact`,
+    // then enumerate devices and explicitly pick a back-facing camera by label.
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+        audio: false,
+      });
+    } catch (err) {
+      console.error("getUserMedia ideal-environment failed:", err);
+      // Try exact
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { exact: "environment" } },
+          audio: false,
+        });
+      } catch (err2) {
+        console.warn("getUserMedia exact-environment failed:", err2);
+        // Enumerate devices, find by label
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const cams = devices.filter((d) => d.kind === "videoinput");
+          const back = cams.find((c) => /back|rear|environment|world|wide(?!.*front)/i.test(c.label || ""));
+          if (back) {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: { deviceId: { exact: back.deviceId } },
+              audio: false,
+            });
+          } else {
+            console.error("No back-facing camera found");
+            setStatus("❌ Back camera not found. Use manual entry.");
+            return;
+          }
+        } catch (err3) {
+          console.error("Camera enumeration failed:", err3);
+          setStatus("❌ Camera permission denied or unavailable");
+          return;
+        }
+      }
+    }
+
+    // Verify what we actually got — if it's front, warn
+    try {
+      const track = stream.getVideoTracks()[0];
+      const settings = track.getSettings();
+      if (settings.facingMode === "user") {
+        console.warn("Got front camera despite requesting back");
+        setStatus("⚠️ Front camera active — barcode scan may not work well");
+      }
+    } catch {}
+
+    video.srcObject = stream;
+    video.muted = true;
+    video.setAttribute("playsinline", "");
+    try { await video.play(); } catch (e) { console.warn("video.play failed:", e); }
+
+    setStatus("📷 Scanner ready — point at barcode");
+
+    // Try to apply zoom + focus AFTER stream is working (safe, optional)
+    const track = stream.getVideoTracks()[0];
+    if (track) {
+      try {
+        const capabilities = track.getCapabilities?.() || {};
+        const advanced = [];
+        if (capabilities.focusMode && capabilities.focusMode.includes("continuous")) {
+          advanced.push({ focusMode: "continuous" });
+        }
+        if (capabilities.zoom) {
+          const z = Math.min(Math.max(1.5, capabilities.zoom.min || 1), capabilities.zoom.max || 1);
+          advanced.push({ zoom: z });
+        }
+        if (advanced.length) await track.applyConstraints({ advanced }).catch(() => {});
+
+        // Torch button if supported
+        if (capabilities.torch) {
+          const torchBtn = document.getElementById("bulkTorchBtn");
+          if (torchBtn) {
+            torchBtn.style.display = "flex";
+            let torchOn = false;
+            torchBtn.addEventListener("click", async () => {
+              torchOn = !torchOn;
+              try {
+                await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+                torchBtn.classList.toggle("active", torchOn);
+              } catch (e) {}
+            });
+          }
+        }
+      } catch (e) {
+        console.warn("Advanced camera settings failed (non-fatal):", e);
+      }
+    }
+
+    // ----- Scan loop -----
+    let scanErrCount = 0;
+    const scanLoop = async () => {
+      if (!_bulkScanState.active) return;
+      try {
+        if (video.readyState >= 2 && video.videoWidth > 0) {
+          const barcodes = await detector.detect(video);
+          if (barcodes && barcodes.length > 0) {
+            for (const bc of barcodes) {
+              const value = (bc.rawValue || "").trim();
+              if (value) addImei(value);
+            }
+          }
+        }
+        scanErrCount = 0;
+      } catch (e) {
+        scanErrCount++;
+        if (scanErrCount === 1) console.warn("Detector error (will retry):", e);
+        if (scanErrCount > 30) {
+          setStatus("Scanner having trouble — try manual entry below");
+          return; // stop the loop
+        }
+      }
+      requestAnimationFrame(scanLoop);
+    };
+    scanLoop();
+  } catch (err) {
+    console.error("Native scanner setup failed:", err);
+    setStatus("❌ Camera unavailable — type manually below");
+  }
+}
+
+// ===== Fallback: html5-qrcode if BarcodeDetector unavailable =====
+async function initFallbackBulkScanner(addImei, setStatus) {
+  const HQR = window.Html5Qrcode;
+  if (!HQR) {
+    setStatus("Scanner unavailable — type manually below.");
+    return;
+  }
+  const HQRFormats = window.Html5QrcodeSupportedFormats;
+  const allFormats = HQRFormats ? [
+    HQRFormats.CODE_128, HQRFormats.CODE_39, HQRFormats.CODE_93,
+    HQRFormats.EAN_13, HQRFormats.QR_CODE, HQRFormats.DATA_MATRIX,
+  ] : undefined;
+
+  setTimeout(async () => {
+    try {
+      // Use the video element directly for html5-qrcode... actually it needs its own div
+      // Replace video with a div for html5-qrcode
+      const wrap = document.querySelector(".bulk-scan-viewfinder");
+      if (wrap) {
+        const video = document.getElementById("bulkScanVideo");
+        if (video) video.style.display = "none";
+        const div = document.createElement("div");
+        div.id = "qrReader";
+        div.style.width = "100%";
+        div.style.height = "100%";
+        wrap.insertBefore(div, wrap.firstChild);
+      }
+      _bulkScanState.scanner = new HQR("qrReader", { verbose: false });
+      await _bulkScanState.scanner.start(
+        { facingMode: "environment" },
+        {
+          fps: 20,
+          qrbox: (vw, vh) => ({ width: Math.min(vw * 0.9, 320), height: Math.min(vh * 0.45, 140) }),
+          formatsToSupport: allFormats,
+          experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+          videoConstraints: {
+            facingMode: "environment",
+            width: { ideal: 1920, min: 640 },
+            height: { ideal: 1080, min: 480 },
+            focusMode: "continuous",
+          },
+        },
+        (decodedText) => addImei(decodedText),
+        () => {}
+      );
+      setStatus("📷 Ready — point camera at barcode");
+    } catch (err) {
+      console.warn("Fallback scanner failed:", err);
+      setStatus("Camera unavailable — type manually below.");
+    }
+  }, 100);
+}
+
+async function saveBulkStockItems() {
+  const meta = _bulkScanState.meta;
+  const imeis = [..._bulkScanState.scanned];
+  if (!imeis.length) {
+    showToast("Nothing to save.", true);
+    return;
+  }
+  const saveBtn = document.getElementById("bulkSaveAll");
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = `Saving ${imeis.length}…`;
+  }
+  try {
+    const newItems = [];
+    for (const imei of imeis) {
+      const metadata = { imei };
+      if (meta.project) metadata.project = meta.project;
+      if (!meta.supplier) metadata.needsSupplier = true; // flag for admin review
+      const item = {
+        id: "stock-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        name: meta.name,
+        category: meta.category || "Uncategorized",
+        supplier: meta.supplier || "",
+        quantity: 1,
+        unit: "unit",
+        lowStockThreshold: 1,
+        metadata,
+        createdAt: new Date().toISOString(),
+        createdBy: currentUser,
+        notes: meta.project
+          ? `Project: ${meta.project} · Bulk-added with ${imeis.length - 1} other unit${imeis.length > 2 ? "s" : ""}`
+          : `Bulk-added with ${imeis.length - 1} other unit${imeis.length > 2 ? "s" : ""}`,
+      };
+      const saved = await insertStockItem(item);
+      newItems.push(saved);
+    }
+    stockItems = [...newItems, ...stockItems];
+    // Cleanup state
+    _bulkScanState = { active: false, meta: null, scanned: [], scanner: null };
+    modal.classList.remove("modal-wide");
+    closeModal();
+    showToast(`✓ Added ${imeis.length} stock items`);
+    render();
+  } catch (err) {
+    console.error("Bulk save failed:", err);
+    showToast(err.message || "Save failed", true);
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = `Save All (${imeis.length})`;
+    }
+  }
+}
+
+
+/* ============================================================
+   Notifications — in-app bell + browser OS notifications
+   ============================================================ */
+
+const NOTIF_SOUND_DATA_URI = ""; // (optional — could embed beep data URI)
+const NOTIF_LIMIT = 50;
+
+/** Adds a notification to the in-app list + plays sound + shows OS notification */
+function addNotification({ title, body, type = "info", link = null, vehicleNo = null }) {
+  const notif = {
+    id: "n-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+    title,
+    body,
+    type,
+    timestamp: Date.now(),
+    read: false,
+    link,
+    vehicleNo,
+  };
+  notifications.unshift(notif);
+  // Cap list size
+  if (notifications.length > NOTIF_LIMIT) {
+    notifications = notifications.slice(0, NOTIF_LIMIT);
+  }
+  // Play in-app sound
+  try { playBeep(700, 0.1); setTimeout(() => playBeep(900, 0.1), 110); } catch {}
+  // Vibrate (mobile)
+  try { navigator.vibrate && navigator.vibrate([60, 40, 60]); } catch {}
+  // OS-level notification if permission granted + page not focused
+  showBrowserNotification(notif);
+  // Re-render to update bell badge
+  if (typeof updateNotifBadge === "function") updateNotifBadge();
+}
+
+function showBrowserNotification(notif) {
+  // Skip if user has tab focused and page is visible (in-app is enough)
+  if (document.visibilityState === "visible" && document.hasFocus()) return;
+  if (!("Notification" in window)) return;
+  if (Notification.permission !== "granted") return;
+  try {
+    const n = new Notification(notif.title, {
+      body: notif.body,
+      icon: "/icon-192.png",
+      badge: "/icon-96.png",
+      tag: notif.type, // group similar notifications
+      timestamp: notif.timestamp,
+      vibrate: [60, 40, 60],
+      requireInteraction: false,
+    });
+    n.onclick = () => {
+      window.focus();
+      n.close();
+      // Mark as read + maybe navigate
+      const target = notifications.find((x) => x.id === notif.id);
+      if (target) target.read = true;
+      if (notif.vehicleNo) {
+        searchQuery = notif.vehicleNo;
+        setView("installations");
+      }
+    };
+    // Auto-close after 8s
+    setTimeout(() => { try { n.close(); } catch {} }, 8000);
+  } catch (e) {
+    console.warn("Browser notification failed:", e);
+  }
+}
+
+async function requestNotificationPermission() {
+  if (!("Notification" in window)) {
+    showToast("Browser doesn't support notifications.", true);
+    return false;
+  }
+  if (Notification.permission === "granted") return true;
+  if (Notification.permission === "denied") {
+    showToast("Notifications blocked. Enable in browser settings.", true);
+    return false;
+  }
+  try {
+    const result = await Notification.requestPermission();
+    if (result === "granted") {
+      showToast("✓ Notifications enabled");
+      // Welcome notification
+      try {
+        new Notification("GPS Tracker", {
+          body: "You'll now get notified about new installations.",
+          icon: "/icon-192.png",
+        });
+      } catch {}
+      return true;
+    }
+    showToast("Notifications denied.", true);
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Checks for new installs/repairs in current data vs known set + creates notifications */
+function detectNewActivityAndNotify() {
+  // First-time setup — populate known sets without notifying
+  if (knownInstallIds.size === 0 && knownRepairIds.size === 0) {
+    installations.forEach((i) => knownInstallIds.add(i.id));
+    maintenanceRecords.forEach((m) => knownRepairIds.add(m.id));
+    return;
+  }
+  // Detect new installations
+  for (const inst of installations) {
+    if (knownInstallIds.has(inst.id)) continue;
+    knownInstallIds.add(inst.id);
+    // Skip if created by current user (you don't notify yourself)
+    if (inst.createdBy === currentUser) continue;
+    // Skip if older than app load (was already there)
+    if (new Date(inst.createdAt).getTime() < appLoadedAt - 60000) continue;
+    addNotification({
+      title: `🆕 New Installation: ${inst.vehicleNo}`,
+      body: `${inst.createdBy || "Someone"} created an installation. IMEI: …${(getCurrentImei(inst) || "").slice(-6)}`,
+      type: "install",
+      vehicleNo: inst.vehicleNo,
+    });
+  }
+  // Detect new repairs
+  for (const m of maintenanceRecords) {
+    if (knownRepairIds.has(m.id)) continue;
+    knownRepairIds.add(m.id);
+    if (m.createdBy === currentUser) continue;
+    if (new Date(m.createdAt).getTime() < appLoadedAt - 60000) continue;
+    addNotification({
+      title: `🛠 Repair logged: ${m.vehicleNo}`,
+      body: `${m.createdBy || "Someone"} logged repair work.`,
+      type: "repair",
+      vehicleNo: m.vehicleNo,
+    });
+  }
+}
+
+/** Bell + dropdown rendering */
+function renderNotifBell() {
+  const unreadCount = notifications.filter((n) => !n.read).length;
+  return `
+    <div class="notif-wrap">
+      <button type="button" class="notif-bell" id="notifBellBtn" aria-label="Notifications">
+        🔔
+        ${unreadCount > 0 ? `<span class="notif-badge">${unreadCount > 99 ? "99+" : unreadCount}</span>` : ""}
+      </button>
+      ${notifPanelOpen ? renderNotifPanel() : ""}
+    </div>
+  `;
+}
+
+function renderNotifPanel() {
+  const perm = ("Notification" in window) ? Notification.permission : "unsupported";
+  return `
+    <div class="notif-panel" id="notifPanel">
+      <div class="notif-panel-header">
+        <h3>Notifications</h3>
+        <div class="notif-panel-actions">
+          ${notifications.length > 0 ? `<button type="button" class="notif-clear-all" id="notifClearAll">Clear all</button>` : ""}
+          <button type="button" class="notif-close" id="notifCloseBtn">✕</button>
+        </div>
+      </div>
+      ${perm === "default" ? `
+        <div class="notif-permission-prompt">
+          <p>🔕 OS-level notifications not enabled. Enable to get notified when app is in background.</p>
+          <button type="button" class="btn btn-primary btn-sm" id="notifEnableBtn">Enable Notifications</button>
+        </div>
+      ` : perm === "denied" ? `
+        <div class="notif-permission-prompt notif-perm-denied">
+          <p>🚫 Notifications blocked. Enable in browser settings to get OS-level alerts.</p>
+        </div>
+      ` : ""}
+      <div class="notif-list">
+        ${notifications.length === 0
+          ? `<div class="notif-empty">
+              <div class="notif-empty-icon">🔔</div>
+              <p>No notifications yet</p>
+              <p class="notif-empty-sub">You'll see new installs and repairs here.</p>
+            </div>`
+          : notifications.map((n) => `
+              <div class="notif-item ${n.read ? "notif-read" : ""}" data-notif-id="${escapeHtml(n.id)}" ${n.vehicleNo ? `data-vehicle="${escapeHtml(n.vehicleNo)}"` : ""}>
+                <div class="notif-item-icon">${n.type === "install" ? "🆕" : n.type === "repair" ? "🛠" : n.type === "stock" ? "📦" : "ℹ️"}</div>
+                <div class="notif-item-content">
+                  <div class="notif-item-title">${escapeHtml(n.title)}</div>
+                  <div class="notif-item-body">${escapeHtml(n.body)}</div>
+                  <div class="notif-item-time">${timeAgoShort(n.timestamp)}</div>
+                </div>
+                ${!n.read ? `<span class="notif-item-dot"></span>` : ""}
+              </div>
+            `).join("")
+        }
+      </div>
+    </div>
+  `;
+}
+
+function timeAgoShort(ts) {
+  const diff = Date.now() - ts;
+  if (diff < 60000) return "just now";
+  if (diff < 3600000) return Math.floor(diff / 60000) + "m ago";
+  if (diff < 86400000) return Math.floor(diff / 3600000) + "h ago";
+  return Math.floor(diff / 86400000) + "d ago";
+}
+
+function updateNotifBadge() {
+  const wrap = document.querySelector(".notif-wrap");
+  if (!wrap) return;
+  wrap.outerHTML = renderNotifBell();
+  bindNotifBell();
+}
+
+function bindNotifBell() {
+  document.getElementById("notifBellBtn")?.addEventListener("click", () => {
+    notifPanelOpen = !notifPanelOpen;
+    // Mark all as read when opening
+    if (notifPanelOpen) {
+      notifications.forEach((n) => { n.read = true; });
+    }
+    updateNotifBadge();
+  });
+  document.getElementById("notifCloseBtn")?.addEventListener("click", () => {
+    notifPanelOpen = false;
+    updateNotifBadge();
+  });
+  document.getElementById("notifClearAll")?.addEventListener("click", () => {
+    notifications = [];
+    notifPanelOpen = false;
+    updateNotifBadge();
+  });
+  document.getElementById("notifEnableBtn")?.addEventListener("click", async () => {
+    await requestNotificationPermission();
+    updateNotifBadge();
+  });
+  // Click on individual notification → navigate to vehicle
+  document.querySelectorAll(".notif-item").forEach((el) => {
+    el.addEventListener("click", () => {
+      const vehicleNo = el.dataset.vehicle;
+      if (vehicleNo) {
+        searchQuery = vehicleNo;
+        setView("installations");
+        notifPanelOpen = false;
+      }
+    });
+  });
+  // Click outside closes panel
+  if (notifPanelOpen) {
+    setTimeout(() => {
+      const closer = (e) => {
+        if (!e.target.closest(".notif-wrap")) {
+          notifPanelOpen = false;
+          updateNotifBadge();
+          document.removeEventListener("click", closer);
+        }
+      };
+      document.addEventListener("click", closer);
+    }, 50);
+  }
+}
+
+function setupPullToRefresh() {
+  let pullStartY = 0;
+  let pullCurrentY = 0;
+  let isPulling = false;
+  let isRefreshing = false;
+  const pullThreshold = 75;
+  let indicator = null;
+
+  function ensureIndicator() {
+    if (indicator) return indicator;
+    indicator = document.createElement("div");
+    indicator.id = "ptrIndicator";
+    indicator.className = "ptr-indicator";
+    indicator.innerHTML = `<span class="ptr-icon">↓</span><span class="ptr-label">Pull to refresh</span>`;
+    document.body.appendChild(indicator);
+    return indicator;
+  }
+
+  function updateIndicator(progress) {
+    const el = ensureIndicator();
+    const translateY = Math.min(progress * pullThreshold, pullThreshold);
+    el.style.transform = `translateX(-50%) translateY(${translateY - 60}px)`;
+    el.style.opacity = Math.min(progress * 1.5, 1);
+    const icon = el.querySelector(".ptr-icon");
+    const label = el.querySelector(".ptr-label");
+    if (progress >= 1) {
+      icon.style.transform = "rotate(180deg)";
+      label.textContent = "Release to refresh";
+      el.classList.add("ptr-ready");
+    } else {
+      icon.style.transform = `rotate(${progress * 180}deg)`;
+      label.textContent = "Pull to refresh";
+      el.classList.remove("ptr-ready");
+    }
+  }
+
+  function hideIndicator() {
+    if (!indicator) return;
+    indicator.style.transform = "translateX(-50%) translateY(-100px)";
+    indicator.style.opacity = "0";
+    indicator.classList.remove("ptr-ready", "ptr-loading");
+  }
+
+  function showLoading() {
+    const el = ensureIndicator();
+    el.classList.add("ptr-loading");
+    el.querySelector(".ptr-icon").textContent = "↻";
+    el.querySelector(".ptr-label").textContent = "Refreshing…";
+  }
+
+  document.addEventListener("touchstart", (e) => {
+    if (isRefreshing) return;
+    // Only trigger when at top of scroll
+    if (window.scrollY > 0 || document.documentElement.scrollTop > 0) return;
+    // Skip if inside a modal (modal has its own scroll)
+    if (e.target.closest(".modal-overlay:not(.hidden)")) return;
+    // Skip if inside a scanner video element
+    if (e.target.closest(".bulk-scan-viewfinder")) return;
+    pullStartY = e.touches[0].clientY;
+    isPulling = true;
+  }, { passive: true });
+
+  document.addEventListener("touchmove", (e) => {
+    if (!isPulling || isRefreshing) return;
+    pullCurrentY = e.touches[0].clientY;
+    const delta = pullCurrentY - pullStartY;
+    if (delta > 0 && window.scrollY === 0) {
+      updateIndicator(delta / pullThreshold);
+    } else if (delta < -10) {
+      // User started scrolling up — cancel
+      isPulling = false;
+      hideIndicator();
+    }
+  }, { passive: true });
+
+  document.addEventListener("touchend", async () => {
+    if (!isPulling || isRefreshing) return;
+    const delta = pullCurrentY - pullStartY;
+    if (delta >= pullThreshold) {
+      isRefreshing = true;
+      showLoading();
+      try {
+        await refreshAllData();
+        render();
+        try { navigator.vibrate && navigator.vibrate(40); } catch {}
+        showToast("✓ Refreshed");
+      } catch (err) {
+        showToast("Refresh failed", true);
+      }
+      isRefreshing = false;
+    }
+    hideIndicator();
+    isPulling = false;
+  });
 }
 
 async function initApp() {
-  if (!isSupabaseConfigured()) {
+  if (!isApiConfigured()) {
     renderConfigMissing();
     return;
   }
-
+  // Wire up hardware back button / browser back
+  window.addEventListener("popstate", handlePopState);
+  // Initial history state
+  try {
+    history.replaceState({ view: view || "login" }, "", "#" + encodeURIComponent(view || "login"));
+  } catch (e) {}
+  // Set up pull-to-refresh
+  setupPullToRefresh();
   try {
     initDb();
     render();
+    // Pre-warm BarcodeDetector + enumerate cameras silently on first user gesture
+    // This makes the FIRST scan instant instead of having to wait for camera init
+    const prewarmHandler = () => {
+      try {
+        if (typeof window.BarcodeDetector !== "undefined" && window.BarcodeDetector.getSupportedFormats) {
+          window.BarcodeDetector.getSupportedFormats().catch(() => {});
+        }
+        if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+          navigator.mediaDevices.enumerateDevices().catch(() => {});
+        }
+      } catch {}
+      document.removeEventListener("click", prewarmHandler);
+    };
+    document.addEventListener("click", prewarmHandler, { once: true, passive: true });
   } catch (err) {
+    const isOffline = !navigator.onLine;
+    const errMsg = String(err?.message || "").toLowerCase();
+    // Classify the failure type
+    const isNetworkError =
+      isOffline ||
+      errMsg.includes("backend sdk") ||
+      errMsg.includes("failed to load") ||
+      errMsg.includes("network") ||
+      errMsg.includes("fetch") ||
+      errMsg.includes("timeout") ||
+      errMsg.includes("cdn");
+
+    if (isNetworkError) {
+      app.innerHTML = `
+        ${renderHeader("GPS Maintenance Tracker", "Network issue")}
+        <main class="main centered">
+          <section class="card login-card offline-card">
+            <div class="offline-icon">📡❌</div>
+            <h2>Not connected to network</h2>
+            <p class="login-desc">
+              App start karne ke liye internet zaroori hai.<br>
+              Please apna WiFi ya mobile data check karo.
+            </p>
+            <div class="offline-checklist">
+              <div class="check-item">📶 Mobile data / WiFi ON hai?</div>
+              <div class="check-item">🌐 Any other website open ho raha?</div>
+              <div class="check-item">🚫 Firewall / VPN toh nahi hai on?</div>
+            </div>
+            <button type="button" class="btn btn-primary btn-block" id="retryBtn">🔄 Retry</button>
+            <p class="offline-hint">Ye page automatic reload hogi jab connection wapas aayega.</p>
+          </section>
+        </main>
+      `;
+      // Auto-retry when connection comes back
+      const retry = () => window.location.reload();
+      document.getElementById("retryBtn")?.addEventListener("click", retry);
+      window.addEventListener("online", retry, { once: true });
+    } else {
+      // Non-network error — show technical message
+      app.innerHTML = `
+        ${renderHeader("GPS Maintenance Tracker", "Error")}
+        <main class="main centered">
+          <section class="card login-card">
+            <h2>Could not start app</h2>
+            <p class="login-desc">${escapeHtml(err.message)}</p>
+            <button type="button" class="btn btn-primary btn-block" onclick="window.location.reload()">🔄 Retry</button>
+          </section>
+        </main>
+      `;
+    }
+  }
+}
+
+/* ============================================================
+   v3.8.0 — RENEWAL TRACKER PAGE
+   SIM subscription renewals with 365-day cycle, payment collection,
+   bulk Excel upload, and alert tiers.
+   ============================================================ */
+
+const MS_PER_DAY = 1000 * 60 * 60 * 24;
+const RENEWAL_CYCLE_DAYS = 365;
+
+/**
+ * Calculate renewal status for a vehicle.
+ * Walks through payment history year-by-year to find the current cycle,
+ * respecting each payment's own cycle anchor (last_due_date vs payment_date).
+ * Flags OVERDUE when any past year has no payment but its cycle has ended.
+ *
+ * Returns: {
+ *   currentYear, cycleStart, cycleEnd, daysUntilExpiry, daysOverdue,
+ *   status, paidYears, oldestUnpaidYear, nextExpiryDate (alias cycleEnd)
+ * }
+ * status: "paid" | "active" | "upcoming" | "soon" | "urgent" | "expired" | "overdue"
+ *   - "overdue" = any PAST year unpaid AND that year's cycle already ended
+ *   - "expired" = CURRENT year cycle ended but <=30d old (ambiguous — treated same severity as urgent)
+ */
+function addDaysLocal(date, days) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function computeRenewalStatus(renewal, today = new Date()) {
+  const created = new Date(renewal.createdDate);
+  if (isNaN(created.getTime())) {
+    return { currentYear: 0, status: "unknown", daysUntilExpiry: null, nextExpiryDate: null, paidYears: [] };
+  }
+  created.setHours(0, 0, 0, 0);
+  const now = new Date(today);
+  now.setHours(0, 0, 0, 0);
+
+  // Build map: year -> payment
+  const paymentsByYear = {};
+  (renewal.payments || []).forEach((p) => { if (p.year) paymentsByYear[p.year] = p; });
+  const paidYears = Object.keys(paymentsByYear).map((y) => parseInt(y, 10)).sort((a, b) => a - b);
+
+  // v3.9.13 — Y1 free-trial-days: if set (e.g. 8 days free at install),
+  // the Y1 billing cycle starts N days after the actual created date.
+  // Y2 and beyond chain forward from the shifted Y1 end, so the trial
+  // propagates naturally — no special-casing needed later.
+  const freeTrialDays = Number(renewal.freeTrialDays) || 0;
+  const effectiveStart = freeTrialDays > 0
+    ? addDaysLocal(created, freeTrialDays)
+    : new Date(created);
+
+  // Walk through years, computing cycle boundaries respecting each payment's anchor.
+  // The cycleEndDate of a paid year becomes the cycleStartDate of the next.
+  // For an unpaid year, cycle = previous_end + 365 (default behavior).
+  let cycleStart = new Date(effectiveStart);
+  let year = 1;
+  const MAX_YEARS = 50; // safety
+
+  while (year <= MAX_YEARS) {
+    const payment = paymentsByYear[year];
+    let cycleEnd;
+
+    if (payment) {
+      // Trust the stored cycleEndDate (set at payment time respecting anchor choice)
+      if (payment.cycleEndDate) {
+        cycleEnd = new Date(payment.cycleEndDate);
+      } else {
+        // Legacy payment without cycle metadata — default to cycleStart + 365
+        cycleEnd = addDaysLocal(cycleStart, RENEWAL_CYCLE_DAYS);
+      }
+      cycleEnd.setHours(0, 0, 0, 0);
+      // Move to next year
+      cycleStart = new Date(cycleEnd);
+      year += 1;
+      continue;
+    }
+
+    // Unpaid year — compute hypothetical cycle end
+    cycleEnd = addDaysLocal(cycleStart, RENEWAL_CYCLE_DAYS);
+    cycleEnd.setHours(0, 0, 0, 0);
+
+    const daysUntilExpiry = Math.ceil((cycleEnd - now) / MS_PER_DAY);
+    const daysOverdue = daysUntilExpiry < 0 ? Math.abs(daysUntilExpiry) : 0;
+
+    // Check: is any EARLIER year unpaid too? If so, OVERDUE wins.
+    // (We're already walking in order, so if we reach an unpaid year with daysUntilExpiry < 0,
+    // AND the next year would also be due, we're in overdue territory for the oldest unpaid year.)
+    let status;
+    if (daysUntilExpiry < 0) {
+      // Past due — but is there a later cycle that's also started? If yes, mark overdue (not just expired)
+      // Compute if the "next next" cycle has started
+      const nextNextStart = cycleEnd;
+      const nextNextDaysElapsed = Math.floor((now - nextNextStart) / MS_PER_DAY);
+      if (nextNextDaysElapsed > 0) {
+        // We've entered the following year without paying this one → OVERDUE
+        status = "overdue";
+      } else {
+        // Just expired within current cycle window
+        status = "expired";
+      }
+    } else if (daysUntilExpiry <= 7) status = "urgent";
+    else if (daysUntilExpiry <= 15) status = "soon";
+    else if (daysUntilExpiry <= 30) status = "upcoming";
+    else status = "active";
+
+    return {
+      currentYear: year,
+      oldestUnpaidYear: year,
+      cycleStart: new Date(cycleStart),
+      cycleEnd,
+      nextExpiryDate: cycleEnd, // alias for backwards compat
+      daysUntilExpiry,
+      daysOverdue,
+      status,
+      paidYears,
+      isCurrentYearPaid: false,
+    };
+  }
+
+  // All years in loop paid up — means they're paid into the future.
+  // Current status is "paid" for the latest paid cycle.
+  return {
+    currentYear: year - 1,
+    oldestUnpaidYear: null,
+    cycleStart: new Date(cycleStart),
+    cycleEnd: new Date(cycleStart), // no next unpaid cycle
+    nextExpiryDate: new Date(cycleStart),
+    daysUntilExpiry: Math.ceil((cycleStart - now) / MS_PER_DAY),
+    daysOverdue: 0,
+    status: "paid",
+    paidYears,
+    isCurrentYearPaid: true,
+  };
+}
+
+function renewalStatusMeta(status) {
+  const metas = {
+    overdue:  { icon: "🚨", label: "OVERDUE",       pillClass: "status-overdue",  priority: 0 },
+    expired:  { icon: "🔴", label: "EXPIRED",       pillClass: "status-expired",  priority: 1 },
+    urgent:   { icon: "⚠️", label: "Urgent (≤7d)",  pillClass: "status-urgent",   priority: 2 },
+    soon:     { icon: "⚠️", label: "Soon (≤15d)",   pillClass: "status-soon",     priority: 3 },
+    upcoming: { icon: "🔔", label: "Upcoming (≤30d)",pillClass: "status-upcoming",priority: 4 },
+    active:   { icon: "🟢", label: "Active",        pillClass: "status-active",   priority: 5 },
+    paid:     { icon: "✅", label: "Paid",          pillClass: "status-paid",     priority: 6 },
+    unknown:  { icon: "❓", label: "Unknown",       pillClass: "status-unknown",  priority: 7 },
+  };
+  return metas[status] || metas.unknown;
+}
+
+function formatYMD(d) {
+  if (!d) return "";
+  const dt = (d instanceof Date) ? d : new Date(d);
+  if (isNaN(dt.getTime())) return "";
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
+function formatDateIndian(d) {
+  if (!d) return "—";
+  const dt = (d instanceof Date) ? d : new Date(d);
+  if (isNaN(dt.getTime())) return "—";
+  return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function totalCollected(renewals) {
+  let total = 0;
+  for (const r of renewals) {
+    for (const p of (r.payments || [])) {
+      total += Number(p.amount) || 0;
+    }
+  }
+  return total;
+}
+
+function renderRenewalsPage() {
+  // Sub-tab routing
+  if (renewalSubView === "accounts") { renderRenewalAccountsSubPage(); return; }
+  if (renewalSubView === "documents") { renderRenewalDocumentsSubPage(); return; }
+  if (renewalSubView === "settings") { renderRenewalSettingsSubPage(); return; }
+  // Default: vehicles list
+  if (!renewalsTableReady) {
     app.innerHTML = `
-      ${renderHeader("GPS Maintenance Tracker", "Error")}
-      <main class="main centered">
-        <section class="card login-card">
-          <h2>Could not start app</h2>
-          <p class="login-desc">${escapeHtml(err.message)}</p>
+      ${renderHeader("Renewal Tracker", "Setup required")}
+      <main class="main">
+        ${renderAdminNav("renewals")}
+        <section class="card">
+          <h2>⚠️ Database setup needed</h2>
+          <p>The <code>renewals</code> table doesn't exist yet. Admin ko ye SQL migration Supabase SQL Editor me run karni hai:</p>
+          <p style="margin-top: 0.5rem;"><strong>File:</strong> <code>renewals-migration.sql</code></p>
+          <p style="margin-top: 0.5rem; color: #64748b;">Fir page refresh karo.</p>
         </section>
       </main>
     `;
+    bindAdminNav();
+    bindLogout();
+    return;
   }
+
+  const today = new Date();
+  // Decorate each renewal with status
+  const decorated = renewals.map((r) => ({
+    renewal: r,
+    status: computeRenewalStatus(r, today),
+  }));
+
+  // Stats
+  const stats = {
+    total: decorated.length,
+    overdue: decorated.filter((d) => d.status.status === "overdue").length,
+    expired: decorated.filter((d) => d.status.status === "expired").length,
+    urgent: decorated.filter((d) => d.status.status === "urgent").length,
+    soon: decorated.filter((d) => d.status.status === "soon").length,
+    upcoming: decorated.filter((d) => d.status.status === "upcoming").length,
+    active: decorated.filter((d) => d.status.status === "active").length,
+    paid: decorated.filter((d) => d.status.status === "paid").length,
+  };
+  const totalReceived = totalCollected(renewals);
+
+  // Companies for filter
+  const companySet = new Set();
+  renewals.forEach((r) => { if (r.company) companySet.add(r.company); });
+  const companies = Array.from(companySet).sort();
+
+  // Apply filters
+  let filtered = decorated;
+  if (renewalsCompanyFilter !== "all") {
+    filtered = filtered.filter((d) => d.renewal.company === renewalsCompanyFilter);
+  }
+  if (renewalsStatusFilter !== "all") {
+    filtered = filtered.filter((d) => d.status.status === renewalsStatusFilter);
+  }
+  if (renewalsYearFilter !== "all") {
+    const y = parseInt(renewalsYearFilter, 10);
+    filtered = filtered.filter((d) => d.status.currentYear === y);
+  }
+  if (renewalsQuery) {
+    const q = renewalsQuery.toLowerCase();
+    filtered = filtered.filter((d) => {
+      const r = d.renewal;
+      const hay = `${r.plateNumber} ${r.vehicleName} ${r.company} ${r.imei} ${r.simNumber} ${r.simProvider} ${r.branch}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }
+
+  // Sort by priority then by daysUntilExpiry
+  filtered.sort((a, b) => {
+    const pa = renewalStatusMeta(a.status.status).priority;
+    const pb = renewalStatusMeta(b.status.status).priority;
+    if (pa !== pb) return pa - pb;
+    const da = a.status.daysUntilExpiry ?? 99999;
+    const db = b.status.daysUntilExpiry ?? 99999;
+    return da - db;
+  });
+
+  const perms = getUserPerms(currentUser);
+  const isAdmin = perms?.isAdmin;
+  const isCollector = currentUser === "collector" || perms?.allowedPages?.includes("renewals");
+
+  // For collector-only view, we want a cleaner header
+  const headerSubtitle = `Track SIM subscription renewals · ${stats.total} vehicles`;
+
+  const activeStat = renewalsStatusFilter; // used to highlight active box
+  const boxClass = (s) => `summary-box clickable-stat ${activeStat === s ? 'stat-active' : ''}`;
+
+  app.innerHTML = `
+    ${renderHeader("Renewal Tracker", headerSubtitle)}
+    <main class="main">
+      ${isAdmin ? renderAdminNav("renewals") : ""}
+
+      ${renderRenewalSubNav("vehicles", isAdmin)}
+
+      <div class="summary-grid renewal-stats">
+        <div class="${boxClass('all')}" data-stat-filter="all"><strong>${stats.total}</strong><span>Total</span></div>
+        <div class="${boxClass('overdue')} summary-critical" data-stat-filter="overdue"><strong>${stats.overdue}</strong><span>🚨 OVERDUE</span></div>
+        <div class="${boxClass('expired')} summary-danger" data-stat-filter="expired"><strong>${stats.expired}</strong><span>🔴 Expired</span></div>
+        <div class="${boxClass('urgent')} summary-warn" data-stat-filter="urgent"><strong>${stats.urgent}</strong><span>⚠️ Urgent (≤7d)</span></div>
+        <div class="${boxClass('soon')} summary-warn" data-stat-filter="soon"><strong>${stats.soon}</strong><span>⚠️ Soon (≤15d)</span></div>
+        <div class="${boxClass('upcoming')}" data-stat-filter="upcoming"><strong>${stats.upcoming}</strong><span>🔔 Upcoming (≤30d)</span></div>
+        <div class="${boxClass('active')} summary-ok" data-stat-filter="active"><strong>${stats.active}</strong><span>🟢 Active</span></div>
+        <div class="${boxClass('paid')} summary-purple" data-stat-filter="paid"><strong>${stats.paid}</strong><span>✅ Paid (current)</span></div>
+        <div class="summary-box summary-info"><strong>₹${totalReceived.toLocaleString("en-IN")}</strong><span>💰 Collected</span></div>
+      </div>
+
+      ${selectedVehicleIds.size > 0 ? renderBulkActionBar(decorated) : ""}
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>Renewals ${filtered.length !== decorated.length
+              ? `<span class="filter-count">(${filtered.length} of ${decorated.length})</span>`
+              : `(${decorated.length})`}</h2>
+            <p class="section-subtitle">SIM subscription cycle = 365 days from Created Date. Mark payment when collected.</p>
+          </div>
+          <div class="bulk-actions">
+            <button type="button" class="btn btn-outline btn-sm" id="renewalExportBtn">↓ Export Excel</button>
+            <button type="button" class="btn btn-primary btn-sm" id="renewalUploadBtn">↑ Upload Excel</button>
+            <input type="file" id="renewalFileInput" accept=".xlsx,.xls" class="hidden" />
+          </div>
+        </div>
+
+        <input type="search" class="sticky-search" id="renewalsSearch" placeholder="Search plate, IMEI, SIM, company, branch..." value="${escapeHtml(renewalsQuery)}" autocomplete="off" />
+
+        <div class="filter-row" style="margin-top: 0.7rem;">
+          <label class="filter-group">
+            <span class="filter-label">Status:</span>
+            <select id="renewalStatusFilter">
+              <option value="all" ${renewalsStatusFilter === "all" ? "selected" : ""}>All</option>
+              <option value="overdue" ${renewalsStatusFilter === "overdue" ? "selected" : ""}>🚨 OVERDUE (${stats.overdue})</option>
+              <option value="expired" ${renewalsStatusFilter === "expired" ? "selected" : ""}>🔴 Expired (${stats.expired})</option>
+              <option value="urgent" ${renewalsStatusFilter === "urgent" ? "selected" : ""}>⚠️ Urgent (${stats.urgent})</option>
+              <option value="soon" ${renewalsStatusFilter === "soon" ? "selected" : ""}>⚠️ Soon (${stats.soon})</option>
+              <option value="upcoming" ${renewalsStatusFilter === "upcoming" ? "selected" : ""}>🔔 Upcoming (${stats.upcoming})</option>
+              <option value="active" ${renewalsStatusFilter === "active" ? "selected" : ""}>🟢 Active (${stats.active})</option>
+              <option value="paid" ${renewalsStatusFilter === "paid" ? "selected" : ""}>✅ Paid (${stats.paid})</option>
+            </select>
+          </label>
+
+          <label class="filter-group">
+            <span class="filter-label">Company:</span>
+            <select id="renewalCompanyFilter">
+              <option value="all" ${renewalsCompanyFilter === "all" ? "selected" : ""}>All companies</option>
+              ${companies.map((c) => {
+                const count = renewals.filter((r) => r.company === c).length;
+                return `<option value="${escapeHtml(c)}" ${renewalsCompanyFilter === c ? "selected" : ""}>${escapeHtml(c)} (${count})</option>`;
+              }).join("")}
+            </select>
+          </label>
+
+          <label class="filter-group">
+            <span class="filter-label">Year:</span>
+            <select id="renewalYearFilter">
+              <option value="all" ${renewalsYearFilter === "all" ? "selected" : ""}>All years</option>
+              ${[1,2,3,4,5].map((y) => {
+                const count = decorated.filter((d) => d.status.currentYear === y).length;
+                return `<option value="${y}" ${renewalsYearFilter === String(y) ? "selected" : ""}>Year ${y} (${count})</option>`;
+              }).join("")}
+            </select>
+          </label>
+
+          ${(renewalsStatusFilter !== "all" || renewalsCompanyFilter !== "all" || renewalsYearFilter !== "all" || renewalsQuery) ? `
+            <button type="button" class="btn btn-secondary btn-sm" id="clearRenewalFilters">✕ Clear</button>
+          ` : ""}
+        </div>
+
+        <!-- Desktop table -->
+        <div class="table-wrap renewal-table-desktop" style="margin-top: 1rem;">
+          <table>
+            <thead>
+              <tr>
+                <th class="checkbox-col"><input type="checkbox" id="selectAllRenewals" ${filtered.length > 0 && filtered.every(d => selectedVehicleIds.has(d.renewal.id)) ? 'checked' : ''} title="Select all filtered"></th>
+                <th>Status</th>
+                <th>Plate / Vehicle</th>
+                <th>Company</th>
+                <th>IMEI</th>
+                <th>SIM / Doc</th>
+                <th>Created</th>
+                <th>Expiry</th>
+                <th>Year</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filtered.length === 0 ? `
+                <tr class="empty-row"><td colspan="10">${decorated.length === 0 ? "No renewals yet. Click ↑ Upload Excel." : "No renewals match your filters."}</td></tr>
+              ` : filtered.map(({ renewal: r, status }) => {
+                const meta = renewalStatusMeta(status.status);
+                const isOverdue = status.status === "overdue";
+                const isSelected = selectedVehicleIds.has(r.id);
+                const latestDoc = latestDocForVehicle(r.id);
+                const daysText = status.daysUntilExpiry === null ? "—"
+                  : isOverdue ? `overdue by ${status.daysOverdue} days`
+                  : status.daysUntilExpiry < 0 ? `${Math.abs(status.daysUntilExpiry)} days ago`
+                  : status.daysUntilExpiry === 0 ? "Today"
+                  : `in ${status.daysUntilExpiry} days`;
+                const payYear = status.oldestUnpaidYear || status.currentYear;
+                return `
+                  <tr class="${isOverdue ? 'row-overdue' : ''} ${isSelected ? 'row-selected' : ''}">
+                    <td class="checkbox-col"><input type="checkbox" class="vehicle-select" data-id="${escapeHtml(r.id)}" ${isSelected ? 'checked' : ''}></td>
+                    <td><span class="status-pill ${meta.pillClass}">${meta.icon} ${escapeHtml(meta.label.split(" ")[0])}</span></td>
+                    <td>
+                      <strong>${escapeHtml(r.plateNumber || "—")}</strong><br>
+                      <span style="font-size:0.78rem; color:#64748b;">${escapeHtml(r.vehicleName || "")}</span>
+                    </td>
+                    <td>
+                      ${escapeHtml(r.company || "—")}
+                      ${r.branch ? `<br><span style="font-size:0.75rem; color:#94a3b8;">${escapeHtml(r.branch)}</span>` : ""}
+                    </td>
+                    <td class="mono">${escapeHtml(r.imei)}</td>
+                    <td class="mono">
+                      ${escapeHtml(r.simNumber || "—")}
+                      ${r.simProvider ? `<br><span style="font-size:0.72rem; color:#64748b;">${escapeHtml(r.simProvider)}</span>` : ""}
+                      ${latestDoc ? renderDocBadge(latestDoc) : ""}
+                    </td>
+                    <td class="date-cell">
+                      ${isAdmin
+                        ? `<a href="#" class="edit-created-date-link" data-id="${escapeHtml(r.id)}" title="Admin: edit installation date">${formatDateIndian(r.createdDate)}</a>`
+                        : formatDateIndian(r.createdDate)}
+                      ${(r.freeTrialDays || 0) > 0 ? `<br><span class="trial-badge" title="Y1 billing cycle shifted by ${r.freeTrialDays} days">⏱ +${r.freeTrialDays}d trial</span>` : ""}
+                    </td>
+                    <td class="date-cell">
+                      ${formatDateIndian(status.nextExpiryDate)}<br>
+                      <span style="font-size:0.72rem; font-weight:${isOverdue ? '700' : '400'}; color:${(isOverdue || status.daysUntilExpiry < 0) ? '#dc2626' : '#64748b'};">${daysText}</span>
+                    </td>
+                    <td>Y${status.currentYear}</td>
+                    <td class="row-actions">
+                      ${status.status === "paid" ? `
+                        <button type="button" class="btn btn-outline btn-sm view-payments-btn" data-id="${escapeHtml(r.id)}" title="View payments">💰 Paid Y${status.currentYear}</button>
+                      ` : `
+                        <button type="button" class="btn btn-primary btn-sm collect-payment-btn ${isOverdue ? 'btn-critical' : ''}" data-id="${escapeHtml(r.id)}" data-year="${payYear}">💰 Pay Year ${payYear}</button>
+                      `}
+                      ${(status.currentYear === 1 && !status.isCurrentYearPaid) ? `
+                        <button type="button" class="btn btn-outline btn-sm renewal-trial-btn ${(r.freeTrialDays || 0) > 0 ? 'is-active' : ''}" data-id="${escapeHtml(r.id)}" title="Y1 free trial settings">⏱</button>
+                      ` : ""}
+                      <button type="button" class="btn btn-outline btn-sm renewal-history-btn" data-id="${escapeHtml(r.id)}" title="Payment history">📋</button>
+                      ${isAdmin ? `<button type="button" class="btn btn-outline btn-sm renewal-delete-btn" data-id="${escapeHtml(r.id)}" title="Delete">🗑</button>` : ""}
+                    </td>
+                  </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Mobile card grid -->
+        <div class="renewal-card-grid">
+          ${filtered.length === 0 ? `
+            <div class="entry-empty">
+              <div class="entry-empty-icon">📅</div>
+              <h3>No renewals</h3>
+              <p>${decorated.length === 0 ? "Click ↑ Upload Excel to add vehicles." : "Try different filters."}</p>
+            </div>
+          ` : filtered.map(({ renewal: r, status }) => {
+            const meta = renewalStatusMeta(status.status);
+            const isOverdue = status.status === "overdue";
+            const daysText = status.daysUntilExpiry === null ? "—"
+              : isOverdue ? `overdue by ${status.daysOverdue}d`
+              : status.daysUntilExpiry < 0 ? `expired ${Math.abs(status.daysUntilExpiry)}d ago`
+              : status.daysUntilExpiry === 0 ? "today"
+              : `in ${status.daysUntilExpiry}d`;
+            const payYear = status.oldestUnpaidYear || status.currentYear;
+            return `
+              <article class="tk-card renewal-card ${meta.pillClass}-card">
+                <div class="tk-card-head">
+                  <span class="status-pill ${meta.pillClass}">${meta.icon} ${escapeHtml(meta.label)}</span>
+                  <span class="tk-chip">Y${status.currentYear}</span>
+                </div>
+                <div class="renewal-card-body">
+                  <div><strong>${escapeHtml(r.plateNumber || "—")}</strong> · ${escapeHtml(r.vehicleName || "")}</div>
+                  <div style="font-size:0.78rem; color:#64748b;">${escapeHtml(r.company || "—")}${r.branch ? ` · ${escapeHtml(r.branch)}` : ""}</div>
+                  <div class="mono" style="font-size:0.75rem;">IMEI: ${escapeHtml(r.imei)}</div>
+                  <div class="mono" style="font-size:0.75rem;">SIM: ${escapeHtml(r.simNumber || "—")} ${r.simProvider ? `(${escapeHtml(r.simProvider)})` : ""}</div>
+                  ${(() => { const d = latestDocForVehicle(r.id); return d ? renderDocBadge(d) : ''; })()}
+                  <div style="font-size:0.78rem; margin-top:0.3rem;">
+                    Expiry: <strong>${formatDateIndian(status.nextExpiryDate)}</strong>
+                    <span style="font-weight:${isOverdue ? '700' : '400'}; color:${(isOverdue || status.daysUntilExpiry < 0) ? '#dc2626' : '#64748b'};">(${daysText})</span>
+                  </div>
+                </div>
+                <div class="tk-actions">
+                  ${status.status === "paid" ? `
+                    <button type="button" class="btn btn-outline btn-sm view-payments-btn" data-id="${escapeHtml(r.id)}">💰 Paid Y${status.currentYear}</button>
+                  ` : `
+                    <button type="button" class="btn btn-primary btn-sm collect-payment-btn ${isOverdue ? 'btn-critical' : ''}" data-id="${escapeHtml(r.id)}" data-year="${payYear}">💰 Pay Year ${payYear}</button>
+                  `}
+                  ${(status.currentYear === 1 && !status.isCurrentYearPaid) ? `
+                    <button type="button" class="btn btn-outline btn-sm renewal-trial-btn ${(r.freeTrialDays || 0) > 0 ? 'is-active' : ''}" data-id="${escapeHtml(r.id)}">⏱ Trial${(r.freeTrialDays || 0) > 0 ? ` +${r.freeTrialDays}d` : ''}</button>
+                  ` : ""}
+                  <button type="button" class="btn btn-outline btn-sm renewal-history-btn" data-id="${escapeHtml(r.id)}">📋 History</button>
+                  ${isAdmin ? `<button type="button" class="btn btn-outline btn-sm edit-created-date-btn" data-id="${escapeHtml(r.id)}" title="Edit install date">📅 Edit Date</button>` : ""}
+                  ${isAdmin ? `<button type="button" class="btn btn-outline btn-sm renewal-delete-btn" data-id="${escapeHtml(r.id)}">🗑</button>` : ""}
+                </div>
+              </article>
+            `;
+          }).join("")}
+        </div>
+      </section>
+    </main>
+  `;
+
+  if (isAdmin) bindAdminNav();
+  bindLogout();
+  bindRenewalSubNav();
+
+  // Clickable stat boxes
+  app.querySelectorAll(".clickable-stat[data-stat-filter]").forEach((box) => {
+    box.addEventListener("click", () => {
+      const f = box.dataset.statFilter;
+      renewalsStatusFilter = (renewalsStatusFilter === f) ? "all" : f;
+      render();
+    });
+  });
+
+  // Select all checkbox
+  document.getElementById("selectAllRenewals")?.addEventListener("change", (e) => {
+    const checked = e.target.checked;
+    if (checked) {
+      filtered.forEach((d) => selectedVehicleIds.add(d.renewal.id));
+    } else {
+      filtered.forEach((d) => selectedVehicleIds.delete(d.renewal.id));
+    }
+    render();
+  });
+
+  // Row checkboxes
+  app.querySelectorAll(".vehicle-select").forEach((cb) => {
+    cb.addEventListener("change", (e) => {
+      const id = e.target.dataset.id;
+      if (e.target.checked) selectedVehicleIds.add(id);
+      else selectedVehicleIds.delete(id);
+      render();
+    });
+  });
+
+  // Bulk action bar handlers
+  document.getElementById("bulkClearBtn")?.addEventListener("click", () => {
+    selectedVehicleIds.clear();
+    render();
+  });
+  document.getElementById("bulkCreatePIBtn")?.addEventListener("click", () => openDocGenerationModal("PI"));
+  document.getElementById("bulkCreateInvoiceBtn")?.addEventListener("click", () => openDocGenerationModal("INV"));
+  document.getElementById("bulkCreateReceiptBtn")?.addEventListener("click", () => openDocGenerationModal("R"));
+
+  // Click doc badges in SIM column to re-open doc
+  app.querySelectorAll(".reopen-doc-badge").forEach((badge) => {
+    badge.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const docId = badge.dataset.docId;
+      const doc = renewalDocuments.find((d) => d.id === docId);
+      if (doc?.htmlSnapshot) openDocumentPrintWindow(doc.htmlSnapshot, doc.docNumber);
+      else showToast("Document HTML not saved.", true);
+    });
+  });
+
+  // Wire handlers
+  document.getElementById("renewalsSearch")?.addEventListener("input", (e) => {
+    renewalsQuery = e.target.value;
+    render();
+  });
+  document.getElementById("renewalStatusFilter")?.addEventListener("change", (e) => {
+    renewalsStatusFilter = e.target.value;
+    render();
+  });
+  document.getElementById("renewalCompanyFilter")?.addEventListener("change", (e) => {
+    renewalsCompanyFilter = e.target.value;
+    render();
+  });
+  document.getElementById("renewalYearFilter")?.addEventListener("change", (e) => {
+    renewalsYearFilter = e.target.value;
+    render();
+  });
+  document.getElementById("clearRenewalFilters")?.addEventListener("click", () => {
+    renewalsQuery = "";
+    renewalsStatusFilter = "all";
+    renewalsCompanyFilter = "all";
+    renewalsYearFilter = "all";
+    render();
+  });
+
+  // Upload
+  document.getElementById("renewalUploadBtn")?.addEventListener("click", () => {
+    document.getElementById("renewalFileInput")?.click();
+  });
+  document.getElementById("renewalFileInput")?.addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    await handleRenewalExcelUpload(file);
+  });
+
+  // Export
+  document.getElementById("renewalExportBtn")?.addEventListener("click", () => {
+    exportRenewalsToExcel(filtered.map((d) => ({ ...d.renewal, _status: d.status })));
+  });
+
+  // Row actions
+  app.querySelectorAll(".collect-payment-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.id;
+      const year = parseInt(btn.dataset.year, 10);
+      openCollectPaymentModal(id, year);
+    });
+  });
+  app.querySelectorAll(".view-payments-btn, .renewal-history-btn").forEach((btn) => {
+    btn.addEventListener("click", () => openPaymentHistoryModal(btn.dataset.id));
+  });
+  app.querySelectorAll(".renewal-delete-btn").forEach((btn) => {
+    btn.addEventListener("click", () => deleteRenewalConfirm(btn.dataset.id));
+  });
+  app.querySelectorAll(".renewal-trial-btn").forEach((btn) => {
+    btn.addEventListener("click", () => openFreeTrialModal(btn.dataset.id));
+  });
+  // v3.9.14 — Admin: edit installation (created) date
+  app.querySelectorAll(".edit-created-date-link, .edit-created-date-btn").forEach((el) => {
+    el.addEventListener("click", (e) => {
+      e.preventDefault();
+      openEditCreatedDateModal(el.dataset.id);
+    });
+  });
+}
+
+/* ============================================================
+   v3.9.13 — Y1 FREE TRIAL MODAL
+   ============================================================ */
+const FREE_TRIAL_DAYS = 8; // business rule: 8 days free trial on first subscription
+
+/* ============================================================
+   v3.9.14 — Admin: EDIT INSTALLATION / CREATED DATE
+   ============================================================ */
+function openEditCreatedDateModal(renewalId) {
+  if (!getUserPerms(currentUser)?.isAdmin) {
+    showToast("Only admin can edit installation date.", true);
+    return;
+  }
+  const r = renewals.find((x) => x.id === renewalId);
+  if (!r) { showToast("Vehicle not found.", true); return; }
+
+  const currentDate = r.createdDate;
+  const status = computeRenewalStatus(r);
+  const paymentCount = (r.payments || []).length;
+
+  modal.innerHTML = `
+    <div class="trial-modal-head">
+      <h3>📅 Edit Installation Date</h3>
+      <p class="modal-desc"><strong>${escapeHtml(r.plateNumber)}</strong> · ${escapeHtml(r.vehicleName || '')}</p>
+    </div>
+
+    <div class="trial-info-box">
+      <div class="trial-info-row"><span>Current Installation Date:</span><strong>${formatDateIndian(currentDate)}</strong></div>
+      <div class="trial-info-row"><span>Current Status:</span><strong>Y${status.currentYear} · ${status.status}</strong></div>
+      <div class="trial-info-row"><span>Payments Recorded:</span><strong>${paymentCount}</strong></div>
+    </div>
+
+    <div class="form-row" style="margin-bottom:1rem;">
+      <label>New Installation Date <span class="required">*</span></label>
+      <input type="date" id="newCreatedDate" value="${currentDate}" max="${formatYMD(new Date())}" />
+    </div>
+
+    <div id="dateChangePreview" class="trial-preview">
+      <div class="trial-preview-title">📅 New Y1 Cycle Preview</div>
+      <div class="trial-preview-grid">
+        <div class="trial-preview-col active" id="newCycleCol">
+          <div class="trial-preview-head">New Y1 Window</div>
+          <div class="trial-preview-dates">
+            <span id="newY1Start">${formatDateIndian(currentDate)}</span>
+            <span class="arrow">→</span>
+            <span id="newY1End">${formatDateIndian(addDaysLocal(new Date(currentDate), RENEWAL_CYCLE_DAYS))}</span>
+          </div>
+        </div>
+      </div>
+      <p class="trial-note" style="color:#991b1b;">
+        <strong>⚠️ Warning:</strong> Changing this date will shift <strong>all future cycles</strong>
+        (Y1, Y2, Y3…) ${paymentCount > 0 ? `and recalculate the <strong>${paymentCount} existing payment's cycle windows</strong>.` : ''}
+        Use only for genuine data corrections.
+      </p>
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary modal-confirm">💾 Save New Date</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) closeModal(); };
+
+  // Live preview — update Y1 window as user picks a new date
+  const dateInput = document.getElementById("newCreatedDate");
+  const y1Start = document.getElementById("newY1Start");
+  const y1End = document.getElementById("newY1End");
+  const trialDays = Number(r.freeTrialDays) || 0;
+  dateInput.addEventListener("input", () => {
+    const val = dateInput.value;
+    if (!val) return;
+    const d = new Date(val);
+    d.setHours(0, 0, 0, 0);
+    const effective = trialDays > 0 ? addDaysLocal(d, trialDays) : d;
+    y1Start.textContent = formatDateIndian(effective);
+    y1End.textContent = formatDateIndian(addDaysLocal(effective, RENEWAL_CYCLE_DAYS));
+  });
+
+  const confirmBtn = modal.querySelector(".modal-confirm");
+  confirmBtn.addEventListener("click", async () => {
+    const newDate = document.getElementById("newCreatedDate").value;
+    if (!newDate) { showToast("Pick a valid date.", true); return; }
+    if (newDate === currentDate) { showToast("Date is unchanged.", true); return; }
+
+    const confirmMsg = paymentCount > 0
+      ? `This will shift all cycles AND recalculate ${paymentCount} payment cycle windows. Continue?`
+      : `Change installation date from ${formatDateIndian(currentDate)} to ${formatDateIndian(newDate)}?`;
+    if (!confirm(confirmMsg)) return;
+
+    await runWithBusyButton(confirmBtn, async () => {
+      try {
+        const updated = await updateRenewalCreatedDate(renewalId, newDate);
+        const idx = renewals.findIndex((x) => x.id === renewalId);
+        if (idx >= 0) renewals[idx] = updated;
+        closeModal();
+        showToast(`✓ Installation date updated to ${formatDateIndian(newDate)}`);
+        render();
+      } catch (err) {
+        showToast(err.message || "Save failed.", true);
+      }
+    }, "Saving…");
+  });
+}
+
+function openFreeTrialModal(renewalId) {
+  const r = renewals.find((x) => x.id === renewalId);
+  if (!r) { showToast("Vehicle not found.", true); return; }
+
+  const status = computeRenewalStatus(r);
+  if (status.currentYear > 1 || status.isCurrentYearPaid) {
+    showToast("Free trial can only be set before Y1 is paid.", true);
+    return;
+  }
+
+  const currentTrialDays = Number(r.freeTrialDays) || 0;
+  const createdDateStr = formatDateIndian(r.createdDate);
+
+  // Preview computed Y1 window for the user
+  const createdObj = new Date(r.createdDate);
+  createdObj.setHours(0, 0, 0, 0);
+  const previewStartWith  = addDaysLocal(createdObj, FREE_TRIAL_DAYS);
+  const previewEndWith    = addDaysLocal(previewStartWith, RENEWAL_CYCLE_DAYS);
+  const previewStartNo    = new Date(createdObj);
+  const previewEndNo      = addDaysLocal(previewStartNo, RENEWAL_CYCLE_DAYS);
+
+  modal.innerHTML = `
+    <div class="trial-modal-head">
+      <h3>⏱ Y1 Free Trial Settings</h3>
+      <p class="modal-desc"><strong>${escapeHtml(r.plateNumber)}</strong> · ${escapeHtml(r.vehicleName || '')}</p>
+    </div>
+
+    <div class="trial-info-box">
+      <div class="trial-info-row"><span>Actual Installation Date:</span><strong>${createdDateStr}</strong></div>
+    </div>
+
+    <label class="doc-toggle trial-toggle">
+      <input type="checkbox" id="trialCheckbox" ${currentTrialDays > 0 ? 'checked' : ''} />
+      <span class="doc-toggle-track"><span class="doc-toggle-thumb"></span></span>
+      <span class="doc-toggle-label">Apply <strong>${FREE_TRIAL_DAYS} days free trial</strong> on Y1</span>
+    </label>
+
+    <div class="trial-preview">
+      <div class="trial-preview-title">📅 Y1 Billing Cycle Preview</div>
+      <div class="trial-preview-grid">
+        <div class="trial-preview-col ${currentTrialDays === 0 ? 'active' : ''}" id="trialPreviewNo">
+          <div class="trial-preview-head">Without trial</div>
+          <div class="trial-preview-dates">
+            <span>${formatDateIndian(previewStartNo)}</span>
+            <span class="arrow">→</span>
+            <span>${formatDateIndian(previewEndNo)}</span>
+          </div>
+        </div>
+        <div class="trial-preview-col ${currentTrialDays > 0 ? 'active' : ''}" id="trialPreviewWith">
+          <div class="trial-preview-head">With +${FREE_TRIAL_DAYS}d trial</div>
+          <div class="trial-preview-dates">
+            <span>${formatDateIndian(previewStartWith)}</span>
+            <span class="arrow">→</span>
+            <span>${formatDateIndian(previewEndWith)}</span>
+          </div>
+        </div>
+      </div>
+      <p class="trial-note">
+        <strong>Note:</strong> Trial only applies to Y1. Y2, Y3 and later chain forward from Y1's shifted end date.
+        PI / Tax Invoice / Receipt for this vehicle will show the selected period.
+      </p>
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary modal-confirm">💾 Save Trial Setting</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) closeModal(); };
+
+  // Live preview toggle highlight
+  const ck = document.getElementById("trialCheckbox");
+  const colNo = document.getElementById("trialPreviewNo");
+  const colWith = document.getElementById("trialPreviewWith");
+  ck.addEventListener("change", () => {
+    colNo.classList.toggle("active", !ck.checked);
+    colWith.classList.toggle("active", ck.checked);
+  });
+
+  const confirmBtn = modal.querySelector(".modal-confirm");
+  confirmBtn.addEventListener("click", async () => {
+    const checked = document.getElementById("trialCheckbox").checked;
+    const newDays = checked ? FREE_TRIAL_DAYS : 0;
+    await runWithBusyButton(confirmBtn, async () => {
+      try {
+        const updated = await updateRenewalFreeTrialDays(renewalId, newDays);
+        const idx = renewals.findIndex((x) => x.id === renewalId);
+        if (idx >= 0) renewals[idx] = updated;
+        closeModal();
+        showToast(checked
+          ? `✓ ${FREE_TRIAL_DAYS}-day trial applied — Y1 starts ${formatDateIndian(previewStartWith)}`
+          : `✓ Trial removed — Y1 starts ${formatDateIndian(previewStartNo)}`);
+        render();
+      } catch (err) {
+        showToast(err.message || "Save failed.", true);
+      }
+    }, "Saving…");
+  });
+}
+
+/* ---------- Payment collection modal ---------- */
+/**
+ * Computes the "last due date" for a year — the end of the previous year's cycle,
+ * respecting any stored anchor choices from earlier payments.
+ */
+function computeLastDueDateForYear(renewal, forYear) {
+  const created = new Date(renewal.createdDate);
+  created.setHours(0, 0, 0, 0);
+  // v3.9.13 — apply Y1 free-trial-days shift to the effective start date
+  const freeTrialDays = Number(renewal.freeTrialDays) || 0;
+  const effectiveStart = freeTrialDays > 0 ? addDaysLocal(created, freeTrialDays) : new Date(created);
+  if (forYear === 1) return new Date(effectiveStart); // Year 1 cycle starts after trial
+
+  const paymentsByYear = {};
+  (renewal.payments || []).forEach((p) => { if (p.year) paymentsByYear[p.year] = p; });
+
+  let cycleStart = new Date(effectiveStart);
+  for (let y = 1; y < forYear; y++) {
+    const p = paymentsByYear[y];
+    if (p && p.cycleEndDate) {
+      cycleStart = new Date(p.cycleEndDate);
+    } else {
+      cycleStart = addDaysLocal(cycleStart, RENEWAL_CYCLE_DAYS);
+    }
+    cycleStart.setHours(0, 0, 0, 0);
+  }
+  return cycleStart; // this is where the FOR-YEAR cycle starts (= last due date)
+}
+
+function openCollectPaymentModal(renewalId, year) {
+  const r = renewals.find((x) => x.id === renewalId);
+  if (!r) return;
+  const perms = getUserPerms(currentUser);
+  const isAdmin = perms?.isAdmin;
+  const today = formatYMD(new Date());
+  const todayDate = new Date();
+  todayDate.setHours(0, 0, 0, 0);
+
+  // The "last due date" for THIS year = end of previous year's cycle (= where this year started)
+  const lastDueDate = computeLastDueDateForYear(r, year);
+  const lastDueDateYMD = formatYMD(lastDueDate);
+
+  // Compute both expiry options for preview
+  const nextExpiryFromLastDue = addDaysLocal(lastDueDate, RENEWAL_CYCLE_DAYS);
+  const nextExpiryFromToday = addDaysLocal(todayDate, RENEWAL_CYCLE_DAYS);
+
+  // Status check for banner
+  const status = computeRenewalStatus(r);
+  const isOverdue = status.status === "overdue";
+
+  modal.innerHTML = `
+    <h3>💰 Record Payment — Year ${year}</h3>
+    <p class="modal-desc">
+      <strong>${escapeHtml(r.plateNumber)}</strong> · ${escapeHtml(r.vehicleName || "")}<br>
+      <span style="color:#64748b;">${escapeHtml(r.company || "—")} · IMEI: ${escapeHtml(r.imei)}</span>
+    </p>
+
+    ${isOverdue ? `
+      <div class="overdue-notice">
+        🚨 <strong>Year ${year} is OVERDUE by ${status.daysOverdue} days.</strong> Collect this year first.
+      </div>
+    ` : ""}
+
+    <div class="payment-form">
+      <div class="form-row-grid">
+        <div class="form-row">
+          <label>Year (auto-locked)</label>
+          <input type="number" id="payYear" value="${year}" min="1" max="20" readonly class="input-sm input-locked" />
+        </div>
+        <div class="form-row">
+          <label>Last Due Date</label>
+          <input type="text" value="${formatDateIndian(lastDueDate)}" readonly class="input-locked" />
+        </div>
+      </div>
+
+      <div class="form-row">
+        <label>Collection Date <span class="required">*</span></label>
+        <input type="date" id="payDate" value="${today}" required />
+      </div>
+      <div class="form-row">
+        <label>Amount (₹) <span class="required">*</span></label>
+        <input type="number" id="payAmount" placeholder="e.g. 500" min="0" step="1" required />
+      </div>
+      <div class="form-row">
+        <label>Receipt Number</label>
+        <input type="text" id="payReceipt" placeholder="e.g. R-2026-001" />
+      </div>
+      <div class="form-row">
+        <label>Payment Mode <span class="required">*</span></label>
+        <select id="payMode" required>
+          <option value="cash">💵 Cash</option>
+          <option value="upi">📱 UPI</option>
+          <option value="bank">🏦 Bank Transfer</option>
+          <option value="cheque">📄 Cheque</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+
+      <!-- Cycle anchor choice -->
+      <div class="form-row">
+        <label>Next cycle starts from: <span class="required">*</span></label>
+        <div class="anchor-choices">
+          <label class="anchor-option">
+            <input type="radio" name="cycleAnchor" value="last_due_date" checked />
+            <div class="anchor-body">
+              <div class="anchor-title">📅 From last due date <span class="badge-default">DEFAULT</span></div>
+              <div class="anchor-desc">
+                Standard renewal — cycle starts <strong>${formatDateIndian(lastDueDate)}</strong>.
+                Year ${year + 1} will expire <strong>${formatDateIndian(nextExpiryFromLastDue)}</strong>.
+              </div>
+            </div>
+          </label>
+          <label class="anchor-option ${!isAdmin ? 'anchor-disabled' : ''}">
+            <input type="radio" name="cycleAnchor" value="payment_date" ${!isAdmin ? 'disabled' : ''} />
+            <div class="anchor-body">
+              <div class="anchor-title">💳 From payment date ${!isAdmin ? '<span class="badge-locked">🔒 Admin only</span>' : '<span class="badge-special">SPECIAL</span>'}</div>
+              <div class="anchor-desc">
+                Grants extra days — cycle starts <strong>${formatDateIndian(todayDate)}</strong>.
+                Year ${year + 1} will expire <strong>${formatDateIndian(nextExpiryFromToday)}</strong>.
+                ${!isAdmin ? '<br><em style="color:#dc2626;">Collector cannot select this. Ask admin to record if customer needs extra days.</em>' : ''}
+              </div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <label>Notes (optional)</label>
+        <textarea id="payNotes" rows="2" placeholder="Any additional details..."></textarea>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary modal-confirm">Save Payment</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) closeModal(); };
+
+  // Live preview update when anchor changes (payment date changes from today's default)
+  const payDateInput = document.getElementById("payDate");
+  const anchorPaymentOption = modal.querySelector('input[value="payment_date"]');
+  const paymentOptionDesc = anchorPaymentOption?.closest(".anchor-option")?.querySelector(".anchor-desc");
+
+  const refreshPreview = () => {
+    if (!paymentOptionDesc) return;
+    const d = payDateInput.value;
+    if (!d) return;
+    const payDate = new Date(d);
+    payDate.setHours(0, 0, 0, 0);
+    const nextFromPay = addDaysLocal(payDate, RENEWAL_CYCLE_DAYS);
+    // Only update if admin can see it
+    const existingText = paymentOptionDesc.innerHTML;
+    if (!existingText.includes('Admin only')) {
+      paymentOptionDesc.innerHTML = `
+        Grants extra days — cycle starts <strong>${formatDateIndian(payDate)}</strong>.
+        Year ${year + 1} will expire <strong>${formatDateIndian(nextFromPay)}</strong>.
+      `;
+    }
+  };
+  payDateInput?.addEventListener("change", refreshPreview);
+
+  const confirmBtn = modal.querySelector(".modal-confirm");
+  confirmBtn.addEventListener("click", async () => {
+    if (confirmBtn.dataset.busy === "1") return;
+    const payYear = parseInt(document.getElementById("payYear").value, 10);
+    const date = document.getElementById("payDate").value;
+    const amount = parseFloat(document.getElementById("payAmount").value);
+    const receipt = document.getElementById("payReceipt").value.trim();
+    const mode = document.getElementById("payMode").value;
+    const notes = document.getElementById("payNotes").value.trim();
+    const anchorChoice = modal.querySelector('input[name="cycleAnchor"]:checked')?.value || "last_due_date";
+
+    if (!date || !amount || amount <= 0 || !mode || isNaN(payYear) || payYear < 1) {
+      showToast("Please fill Date, Amount, and Mode.", true);
+      return;
+    }
+
+    // Enforce: collector cannot pick payment_date
+    if (anchorChoice === "payment_date" && !isAdmin) {
+      showToast("Only admin can shift cycle to payment date. Selected default instead.", true);
+      return;
+    }
+
+    // Compute the actual cycle end date based on anchor choice
+    let cycleStartDate;
+    if (anchorChoice === "payment_date") {
+      cycleStartDate = new Date(date);
+    } else {
+      cycleStartDate = new Date(lastDueDate);
+    }
+    cycleStartDate.setHours(0, 0, 0, 0);
+    const cycleEndDate = addDaysLocal(cycleStartDate, RENEWAL_CYCLE_DAYS);
+
+    await runWithBusyButton(confirmBtn, async () => {
+      try {
+        const current = renewals.find((x) => x.id === renewalId);
+        if (!current) throw new Error("Renewal not found.");
+        const payments = [...(current.payments || [])];
+        payments.push({
+          year: payYear,
+          date,
+          amount,
+          receiptNumber: receipt || null,
+          mode,
+          notes: notes || null,
+          collectedBy: currentUser,
+          collectedAt: new Date().toISOString(),
+          // v3.8.1 cycle metadata
+          cycleAnchorMode: anchorChoice,
+          cycleStartDate: formatYMD(cycleStartDate),
+          cycleEndDate: formatYMD(cycleEndDate),
+          approvedBy: anchorChoice === "payment_date" ? currentUser : null,
+        });
+        const updated = await updateRenewalPayments(renewalId, payments);
+        const idx = renewals.findIndex((x) => x.id === renewalId);
+        if (idx >= 0) renewals[idx] = updated;
+        closeModal();
+        showToast(`✓ Payment saved · Year ${payYear + 1} will expire ${formatDateIndian(cycleEndDate)}`);
+        render();
+      } catch (err) {
+        showToast(err.message || "Failed to save payment.", true);
+      }
+    }, "Saving…");
+  });
+}
+
+/* ---------- Payment history modal ---------- */
+function openPaymentHistoryModal(renewalId) {
+  const r = renewals.find((x) => x.id === renewalId);
+  if (!r) return;
+  const payments = (r.payments || []).slice().sort((a, b) => (a.year || 0) - (b.year || 0));
+  const status = computeRenewalStatus(r);
+  const totalPaid = payments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  const perms = getUserPerms(currentUser);
+  const isAdmin = perms?.isAdmin;
+
+  modal.innerHTML = `
+    <h3>📋 Payment History</h3>
+    <p class="modal-desc">
+      <strong>${escapeHtml(r.plateNumber)}</strong> · ${escapeHtml(r.vehicleName || "")}<br>
+      <span style="color:#64748b;">${escapeHtml(r.company || "")} · Created: ${formatDateIndian(r.createdDate)} · Current Year: ${status.currentYear}</span>
+    </p>
+    <div class="payment-history-list">
+      ${payments.length === 0 ? `
+        <div class="entry-empty"><p>No payments recorded yet.</p></div>
+      ` : payments.map((p) => {
+        const anchorText = p.cycleAnchorMode === "payment_date"
+          ? `<span class="phi-anchor phi-anchor-special">💳 From payment date</span>`
+          : p.cycleAnchorMode === "last_due_date"
+          ? `<span class="phi-anchor phi-anchor-default">📅 From last due date</span>`
+          : "";
+        return `
+        <div class="payment-history-item">
+          <div class="phi-head">
+            <span class="phi-year">Year ${p.year}</span>
+            <span class="phi-amount">₹${Number(p.amount || 0).toLocaleString("en-IN")}</span>
+            ${isAdmin ? `<button type="button" class="btn-icon-sm delete-payment-btn" data-year="${p.year}" title="Delete payment">🗑</button>` : ""}
+          </div>
+          <div class="phi-body">
+            <div>📅 ${formatDateIndian(p.date)} · ${escapeHtml(p.mode || "")}</div>
+            ${p.receiptNumber ? `<div>🧾 ${escapeHtml(p.receiptNumber)}</div>` : ""}
+            ${p.cycleEndDate ? `<div>🔁 Next cycle expires: <strong>${formatDateIndian(p.cycleEndDate)}</strong> ${anchorText}</div>` : ""}
+            <div style="font-size:0.72rem; color:#94a3b8;">By ${escapeHtml(p.collectedBy || "?")} on ${p.collectedAt ? new Date(p.collectedAt).toLocaleString("en-IN") : "?"}</div>
+            ${p.notes ? `<div style="font-size:0.78rem; color:#64748b; margin-top:0.3rem;">${escapeHtml(p.notes)}</div>` : ""}
+          </div>
+        </div>`;
+      }).join("")}
+    </div>
+    <div class="payment-total">Total collected: <strong>₹${totalPaid.toLocaleString("en-IN")}</strong></div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Close</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) closeModal(); };
+
+  // Admin can delete individual payments
+  if (isAdmin) {
+    modal.querySelectorAll(".delete-payment-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const year = parseInt(btn.dataset.year, 10);
+        if (!confirm(`Delete Year ${year} payment record? This cannot be undone.`)) return;
+        const current = renewals.find((x) => x.id === renewalId);
+        const newPayments = (current.payments || []).filter((p) => p.year !== year);
+        try {
+          const updated = await updateRenewalPayments(renewalId, newPayments);
+          const idx = renewals.findIndex((x) => x.id === renewalId);
+          if (idx >= 0) renewals[idx] = updated;
+          closeModal();
+          showToast(`✓ Year ${year} payment removed.`);
+          render();
+        } catch (err) {
+          showToast(err.message || "Delete failed.", true);
+        }
+      });
+    });
+  }
+}
+
+/* ---------- Delete renewal ---------- */
+async function deleteRenewalConfirm(id) {
+  const r = renewals.find((x) => x.id === id);
+  if (!r) return;
+  if (!confirm(`Delete renewal record for ${r.plateNumber}? This also removes payment history. Cannot be undone.`)) return;
+  try {
+    await deleteRenewal(id);
+    renewals = renewals.filter((x) => x.id !== id);
+    showToast(`✓ Deleted ${r.plateNumber}`);
+    render();
+  } catch (err) {
+    showToast(err.message || "Delete failed.", true);
+  }
+}
+
+/* ---------- Excel upload ---------- */
+async function handleRenewalExcelUpload(file) {
+  renderLoading("Reading Excel file...");
+  try {
+    const XLSX = window.XLSX;
+    if (!XLSX) throw new Error("Excel library not loaded.");
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: "array", cellDates: true });
+
+    // Try each sheet, accept any that has the expected columns
+    const parsed = [];
+    const errors = [];
+    for (const sheetName of wb.SheetNames) {
+      const ws = wb.Sheets[sheetName];
+      // Read with header: 1 to get raw rows
+      const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: false });
+
+      // Find the header row — look for row containing "Plate Number" or "IMEI Number"
+      let headerRowIdx = -1;
+      for (let i = 0; i < Math.min(10, raw.length); i++) {
+        const row = raw[i] || [];
+        const joined = row.map((c) => String(c || "").toLowerCase()).join("|");
+        if (joined.includes("plate number") || joined.includes("imei number")) {
+          headerRowIdx = i;
+          break;
+        }
+      }
+      if (headerRowIdx < 0) continue;
+
+      const headers = raw[headerRowIdx].map((h) => String(h || "").trim());
+      const colMap = {};
+      headers.forEach((h, i) => {
+        const key = h.toLowerCase();
+        if (key === "reseller name") colMap.reseller = i;
+        else if (key === "company") colMap.company = i;
+        else if (key === "branch") colMap.branch = i;
+        else if (key === "object name" || key === "vehicle name") colMap.vehicleName = i;
+        else if (key === "plate number") colMap.plateNumber = i;
+        else if (key === "imei number") colMap.imei = i;
+        else if (key === "sim number") colMap.simNumber = i;
+        else if (key === "sim provider") colMap.simProvider = i;
+        else if (key === "secondary sim number") colMap.secondarySim = i;
+        else if (key === "secondary sim provider") colMap.secondarySimProvider = i;
+        else if (key === "gps device type") colMap.gpsDeviceType = i;
+        else if (key === "created date") colMap.createdDate = i;
+      });
+
+      if (colMap.imei == null || colMap.createdDate == null) {
+        errors.push(`Sheet "${sheetName}": missing required columns (IMEI Number / Created Date).`);
+        continue;
+      }
+
+      // Parse data rows
+      for (let i = headerRowIdx + 1; i < raw.length; i++) {
+        const row = raw[i] || [];
+        const imei = row[colMap.imei];
+        if (!imei || String(imei).trim() === "" || String(imei).trim() === "--") continue;
+
+        const createdRaw = row[colMap.createdDate];
+        const createdDate = parseExcelDate(createdRaw);
+        if (!createdDate) {
+          errors.push(`Row ${i + 1}: invalid Created Date (${createdRaw}) for IMEI ${imei}`);
+          continue;
+        }
+
+        const cleanVal = (v) => {
+          if (v == null) return "";
+          const s = String(v).trim();
+          return (s === "" || s === "--") ? "" : s;
+        };
+
+        parsed.push({
+          plateNumber: cleanVal(row[colMap.plateNumber]) || "—",
+          vehicleName: cleanVal(row[colMap.vehicleName]),
+          company: cleanVal(row[colMap.company]),
+          branch: cleanVal(row[colMap.branch]),
+          reseller: cleanVal(row[colMap.reseller]),
+          imei: String(imei).trim(),
+          simNumber: cleanVal(row[colMap.simNumber]),
+          simProvider: cleanVal(row[colMap.simProvider]),
+          secondarySim: cleanVal(row[colMap.secondarySim]),
+          secondarySimProvider: cleanVal(row[colMap.secondarySimProvider]),
+          gpsDeviceType: cleanVal(row[colMap.gpsDeviceType]),
+          createdDate: formatYMD(createdDate),
+          lastUploadedAt: new Date().toISOString(),
+          lastUploadedBy: currentUser,
+          payments: [], // will be preserved by DB upsert for existing rows via merge logic
+        });
+      }
+    }
+
+    if (parsed.length === 0) {
+      renderCurrent();
+      showToast(`No valid rows found. ${errors.length ? errors[0] : "Check Excel format."}`, true);
+      return;
+    }
+
+    renderLoading(`Uploading ${parsed.length} vehicles...`);
+
+    // IMPORTANT: for existing IMEIs, preserve their payments.
+    // Build a map of existing payments by IMEI
+    const existingByImei = {};
+    renewals.forEach((r) => { existingByImei[r.imei] = r; });
+
+    // Merge: use existing payments for rows where IMEI already in DB
+    const toUpsert = parsed.map((p) => {
+      const existing = existingByImei[p.imei];
+      if (existing) {
+        return {
+          ...p,
+          id: existing.id,  // keep same id
+          payments: existing.payments || [],  // KEEP payment history
+          notes: existing.notes || "",
+        };
+      }
+      return p;
+    });
+
+    // Count stats
+    let inserted = 0, updated = 0;
+    toUpsert.forEach((p) => {
+      if (existingByImei[p.imei]) updated++;
+      else inserted++;
+    });
+
+    await bulkUpsertRenewals(toUpsert);
+    await refreshAllData();
+
+    const summary = `✓ Upload complete: ${inserted} new, ${updated} updated.${errors.length ? ` ${errors.length} rows skipped.` : ""}`;
+    showToast(summary);
+    if (errors.length > 0) {
+      console.warn("Renewal upload errors:", errors);
+    }
+    render();
+  } catch (err) {
+    renderCurrent();
+    showToast(err.message || "Upload failed.", true);
+    console.error(err);
+  }
+}
+
+function renderCurrent() {
+  try { render(); } catch {}
+}
+
+function parseExcelDate(val) {
+  if (val == null) return null;
+  if (val instanceof Date) return isNaN(val.getTime()) ? null : val;
+  const s = String(val).trim();
+  if (!s || s === "--") return null;
+  // Try DD-MM-YYYY (common Indian format)
+  let m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})/);
+  if (m) {
+    const d = new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
+    return isNaN(d.getTime()) ? null : d;
+  }
+  // YYYY-MM-DD
+  m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+  if (m) {
+    const d = new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+    return isNaN(d.getTime()) ? null : d;
+  }
+  // Fallback: Date parse
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/* ---------- Export ---------- */
+function exportRenewalsToExcel(list) {
+  const XLSX = window.XLSX;
+  if (!XLSX) { showToast("Excel library not loaded.", true); return; }
+
+  const rows = list.map((r) => {
+    const status = r._status || computeRenewalStatus(r);
+    const totalPaid = (r.payments || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
+    const paidYears = (r.payments || []).map((p) => p.year).sort().join(", ");
+    const specialAnchors = (r.payments || []).filter((p) => p.cycleAnchorMode === "payment_date").length;
+    return {
+      "Plate Number": r.plateNumber,
+      "Vehicle Name": r.vehicleName,
+      "Company": r.company,
+      "Branch": r.branch,
+      "IMEI": r.imei,
+      "SIM Number": r.simNumber,
+      "SIM Provider": r.simProvider,
+      "Secondary SIM": r.secondarySim,
+      "GPS Device": r.gpsDeviceType,
+      "Created Date": r.createdDate,
+      "Current Year": status.currentYear,
+      "Next Expiry": formatYMD(status.nextExpiryDate),
+      "Days to Expiry": status.daysUntilExpiry,
+      "Overdue Days": status.daysOverdue || 0,
+      "Status": renewalStatusMeta(status.status).label,
+      "Years Paid": paidYears,
+      "Special Cycle Shifts": specialAnchors,
+      "Total Collected (₹)": totalPaid,
+    };
+  });
+
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Renewals");
+  const fname = `renewals-export-${formatYMD(new Date())}.xlsx`;
+  XLSX.writeFile(wb, fname);
+  showToast(`✓ Exported ${rows.length} rows`);
+}
+
+/* ============================================================
+   v3.9.0+ — SUB-NAV, ACCOUNTS, SETTINGS, DOCUMENTS
+   ============================================================ */
+
+/**
+ * Find the latest document that includes this vehicle.
+ * Returns null if no doc exists for this renewal.
+ */
+function latestDocForVehicle(renewalId) {
+  if (!renewalDocuments || renewalDocuments.length === 0) return null;
+  for (const d of renewalDocuments) {
+    const vehicles = d.vehicles || [];
+    if (vehicles.some((v) => v.renewalId === renewalId)) {
+      return d;  // renewalDocuments is already sorted desc by date
+    }
+  }
+  return null;
+}
+
+/**
+ * Render a small badge indicating a doc exists for this vehicle.
+ * Clickable to re-open the doc print view.
+ */
+function renderDocBadge(doc) {
+  const typeLabel = { PI: "PI", INV: "INV", R: "RCT" }[doc.docType] || doc.docType;
+  const cls = `doc-badge-${doc.docType.toLowerCase()}`;
+  return `
+    <div class="doc-badge ${cls} reopen-doc-badge" data-doc-id="${escapeHtml(doc.id)}" title="Click to reopen ${escapeHtml(doc.docNumber)}">
+      📄 ${typeLabel} ${escapeHtml(doc.docNumber)}
+    </div>
+  `;
+}
+
+// Theme presets for documents
+// v3.9.7 — All LIGHT pastel themes.
+// primary = soft pastel used for backgrounds / banners (readable with dark fg text)
+// accent  = dark readable tone used for text, borders, dividers
+// fg      = dark text color used on top of light primary backgrounds
+// v3.9.9 — Added Amber (gold/bronze) theme.
+const DOC_THEMES = {
+  classic:  { label: "Classic",  primary: "#f1f5f9", accent: "#334155", fg: "#0f172a" }, // slate
+  teal:     { label: "Teal",     primary: "#cffafe", accent: "#0e7490", fg: "#0f172a" }, // cyan
+  blue:     { label: "Blue",     primary: "#dbeafe", accent: "#1d4ed8", fg: "#0f172a" }, // blue
+  burgundy: { label: "Burgundy", primary: "#fee2e2", accent: "#9f1239", fg: "#0f172a" }, // rose
+  green:    { label: "Green",    primary: "#d1fae5", accent: "#166534", fg: "#0f172a" }, // emerald
+  purple:   { label: "Purple",   primary: "#ede9fe", accent: "#6d28d9", fg: "#0f172a" }, // violet
+  amber:    { label: "Amber",    primary: "#fef3c7", accent: "#b45309", fg: "#0f172a" }, // gold / bronze
+};
+
+function renderRenewalSubNav(activeKey, isAdmin) {
+  const items = [
+    { key: "vehicles",  label: "🚗 Vehicles", show: true },
+    { key: "accounts",  label: "🏢 Accounts", show: true },
+    { key: "documents", label: "📄 Documents", show: true },
+    { key: "settings",  label: "⚙️ Settings", show: !!isAdmin },
+  ].filter((x) => x.show);
+  return `
+    <div class="sub-nav">
+      ${items.map((it) => `
+        <button type="button" class="sub-nav-chip ${activeKey === it.key ? 'active' : ''}" data-sub-nav="${it.key}">${it.label}</button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function bindRenewalSubNav() {
+  app.querySelectorAll("[data-sub-nav]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      renewalSubView = btn.dataset.subNav;
+      selectedVehicleIds.clear();
+      render();
+    });
+  });
+}
+
+function renderBulkActionBar(decorated) {
+  const count = selectedVehicleIds.size;
+  const selectedList = Array.from(selectedVehicleIds)
+    .map((id) => decorated.find((d) => d.renewal.id === id))
+    .filter(Boolean);
+  // Group by account
+  const accountSet = new Set();
+  selectedList.forEach((d) => {
+    const r = d.renewal;
+    if (r.accountId) accountSet.add(r.accountId);
+    else accountSet.add("UNASSIGNED");
+  });
+  const multipleAccounts = accountSet.size > 1;
+  const hasUnassigned = accountSet.has("UNASSIGNED");
+
+  return `
+    <div class="bulk-action-bar">
+      <div class="bulk-left">
+        <strong>${count}</strong> selected
+      </div>
+      <div class="bulk-actions">
+        <button type="button" class="btn btn-primary btn-sm" id="bulkCreatePIBtn">📝 Create PI</button>
+        <button type="button" class="btn btn-primary btn-sm" id="bulkCreateInvoiceBtn">🧾 Tax Invoice</button>
+        <button type="button" class="btn btn-primary btn-sm" id="bulkCreateReceiptBtn">🧾 Receipt</button>
+        <button type="button" class="btn btn-outline btn-sm" id="bulkClearBtn">✕ Clear</button>
+      </div>
+    </div>
+  `;
+}
+
+/* ============================================================
+   SUB-PAGE: ACCOUNTS
+   ============================================================ */
+function renderRenewalAccountsSubPage() {
+  const perms = getUserPerms(currentUser);
+  const isAdmin = perms?.isAdmin;
+
+  if (!renewalAccountsTableReady) {
+    app.innerHTML = `
+      ${renderHeader("Renewal Tracker — Accounts", "Setup required")}
+      <main class="main">
+        ${isAdmin ? renderAdminNav("renewals") : ""}
+        ${renderRenewalSubNav("accounts", isAdmin)}
+        <section class="card">
+          <h2>⚠️ Database setup needed</h2>
+          <p>Run <code>renewal-documents-migration.sql</code> in Supabase SQL Editor to enable accounts.</p>
+        </section>
+      </main>
+    `;
+    if (isAdmin) bindAdminNav();
+    bindRenewalSubNav();
+    bindLogout();
+    return;
+  }
+
+  const sorted = [...renewalAccounts].sort((a, b) => a.name.localeCompare(b.name));
+
+  app.innerHTML = `
+    ${renderHeader("Renewal Tracker — Accounts", `${sorted.length} customer accounts`)}
+    <main class="main">
+      ${isAdmin ? renderAdminNav("renewals") : ""}
+      ${renderRenewalSubNav("accounts", isAdmin)}
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>Customer Accounts</h2>
+            <p class="section-subtitle">Add GST details, pricing, HSN code per customer account. Vehicles link to accounts.</p>
+          </div>
+          <div class="bulk-actions">
+            <button type="button" class="btn btn-primary btn-sm" id="addAccountBtn">+ Add Account</button>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>GST?</th>
+                <th>GSTIN</th>
+                <th>State</th>
+                <th>Rate ₹/yr</th>
+                <th>HSN</th>
+                <th>Vehicles</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${sorted.length === 0 ? `
+                <tr class="empty-row"><td colspan="8">No accounts yet. Click + Add Account to create first.</td></tr>
+              ` : sorted.map((a) => {
+                const vehCount = renewals.filter((r) => r.accountId === a.id || (!r.accountId && r.company === a.name)).length;
+                return `
+                  <tr>
+                    <td><strong>${escapeHtml(a.name)}</strong>${a.contactPerson ? `<br><span style="font-size:0.75rem; color:#64748b;">${escapeHtml(a.contactPerson)}</span>` : ""}</td>
+                    <td>${a.isGstRegistered ? '<span class="gst-badge">GST</span>' : '<span class="nongst-badge">Non-GST</span>'}</td>
+                    <td class="mono">${escapeHtml(a.gstin || "—")}</td>
+                    <td>${escapeHtml(a.state || "—")}${a.stateCode ? ` (${escapeHtml(a.stateCode)})` : ""}</td>
+                    <td>₹${a.defaultRatePerYear.toLocaleString("en-IN")}</td>
+                    <td class="mono">${escapeHtml(a.hsnCode)}</td>
+                    <td>${vehCount}</td>
+                    <td class="row-actions">
+                      <button type="button" class="btn btn-outline btn-sm edit-account-btn" data-id="${escapeHtml(a.id)}">✎ Edit</button>
+                      ${isAdmin ? `<button type="button" class="btn btn-outline btn-sm delete-account-btn" data-id="${escapeHtml(a.id)}">🗑</button>` : ""}
+                    </td>
+                  </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+
+        ${renewals.filter(r => !r.accountId && r.company).length > 0 ? `
+          <div class="info-banner" style="margin-top: 1rem;">
+            💡 <strong>${renewals.filter(r => !r.accountId && r.company).length} vehicles</strong> have company names from Excel but aren't linked to accounts yet.
+            <button type="button" class="btn btn-outline btn-sm" id="autoCreateAccountsBtn">⚡ Auto-create accounts from company names</button>
+          </div>
+        ` : ""}
+      </section>
+    </main>
+  `;
+
+  if (isAdmin) bindAdminNav();
+  bindRenewalSubNav();
+  bindLogout();
+
+  document.getElementById("addAccountBtn")?.addEventListener("click", () => openAccountFormModal(null));
+  app.querySelectorAll(".edit-account-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const a = renewalAccounts.find((x) => x.id === btn.dataset.id);
+      if (a) openAccountFormModal(a);
+    });
+  });
+  app.querySelectorAll(".delete-account-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const a = renewalAccounts.find((x) => x.id === btn.dataset.id);
+      if (!a) return;
+      if (!confirm(`Delete account "${a.name}"? Vehicles will become unassigned. Cannot be undone.`)) return;
+      try {
+        await deleteRenewalAccount(a.id);
+        renewalAccounts = renewalAccounts.filter((x) => x.id !== a.id);
+        showToast(`✓ Deleted ${a.name}`);
+        render();
+      } catch (err) {
+        showToast(err.message || "Delete failed.", true);
+      }
+    });
+  });
+  document.getElementById("autoCreateAccountsBtn")?.addEventListener("click", async () => {
+    const uniqueCompanies = new Set();
+    renewals.forEach((r) => {
+      if (r.company && !r.accountId && !renewalAccounts.find((a) => a.name === r.company)) {
+        uniqueCompanies.add(r.company);
+      }
+    });
+    if (uniqueCompanies.size === 0) {
+      showToast("No new company names to add.", true);
+      return;
+    }
+    if (!confirm(`Auto-create ${uniqueCompanies.size} accounts from company names? You can fill GST details later.`)) return;
+    try {
+      for (const name of uniqueCompanies) {
+        await upsertRenewalAccount({ name, isGstRegistered: false, defaultRatePerYear: 500 });
+      }
+      await refreshAllData();
+      showToast(`✓ Created ${uniqueCompanies.size} accounts`);
+      render();
+    } catch (err) {
+      showToast(err.message || "Auto-create failed.", true);
+    }
+  });
+}
+
+function openAccountFormModal(existing) {
+  const a = existing || { name: "", isGstRegistered: false, defaultRatePerYear: 500, hsnCode: "998412", gstRate: 18 };
+  modal.innerHTML = `
+    <h3>${existing ? "Edit" : "Add"} Account</h3>
+    <div class="payment-form">
+      <div class="form-row">
+        <label>Account Name <span class="required">*</span></label>
+        <input type="text" id="acctName" value="${escapeHtml(a.name || '')}" required placeholder="e.g. NAGESHWAR" />
+      </div>
+      <div class="form-row">
+        <label>
+          <input type="checkbox" id="acctIsGst" ${a.isGstRegistered ? 'checked' : ''} />
+          GST Registered customer
+        </label>
+      </div>
+      <div class="form-row">
+        <label>GSTIN</label>
+        <input type="text" id="acctGstin" value="${escapeHtml(a.gstin || '')}" placeholder="22AAAAA0000A1Z5" maxlength="15" />
+      </div>
+      <div class="form-row-grid">
+        <div class="form-row">
+          <label>PAN</label>
+          <input type="text" id="acctPan" value="${escapeHtml(a.pan || '')}" placeholder="AAAAA0000A" maxlength="10" />
+        </div>
+        <div class="form-row">
+          <label>Phone</label>
+          <input type="text" id="acctPhone" value="${escapeHtml(a.phone || '')}" />
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Address</label>
+        <textarea id="acctAddress" rows="2">${escapeHtml(a.address || '')}</textarea>
+      </div>
+      <div class="form-row-grid">
+        <div class="form-row">
+          <label>City</label>
+          <input type="text" id="acctCity" value="${escapeHtml(a.city || '')}" />
+        </div>
+        <div class="form-row">
+          <label>Pincode</label>
+          <input type="text" id="acctPincode" value="${escapeHtml(a.pincode || '')}" />
+        </div>
+      </div>
+      <div class="form-row-grid">
+        <div class="form-row">
+          <label>State</label>
+          <input type="text" id="acctState" value="${escapeHtml(a.state || '')}" placeholder="e.g. Chhattisgarh" />
+        </div>
+        <div class="form-row">
+          <label>State Code <span class="required">*</span></label>
+          <input type="text" id="acctStateCode" value="${escapeHtml(a.stateCode || '')}" placeholder="22" maxlength="2" />
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Contact Person</label>
+        <input type="text" id="acctContact" value="${escapeHtml(a.contactPerson || '')}" />
+      </div>
+      <div class="form-row">
+        <label>Email</label>
+        <input type="email" id="acctEmail" value="${escapeHtml(a.email || '')}" />
+      </div>
+      <div class="form-row-grid">
+        <div class="form-row">
+          <label>Rate per Year (₹) <span class="required">*</span></label>
+          <input type="number" id="acctRate" value="${a.defaultRatePerYear}" min="0" step="1" required />
+        </div>
+        <div class="form-row">
+          <label>HSN/SAC Code</label>
+          <input type="text" id="acctHsn" value="${escapeHtml(a.hsnCode || '998412')}" />
+        </div>
+      </div>
+      <div class="form-row">
+        <label>GST Rate (%)</label>
+        <input type="number" id="acctGstRate" value="${a.gstRate}" min="0" max="28" step="0.01" />
+      </div>
+      <div class="form-row">
+        <label>Notes</label>
+        <textarea id="acctNotes" rows="2">${escapeHtml(a.notes || '')}</textarea>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary modal-confirm">Save Account</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) closeModal(); };
+
+  const confirmBtn = modal.querySelector(".modal-confirm");
+  confirmBtn.addEventListener("click", async () => {
+    if (confirmBtn.dataset.busy === "1") return;
+    const name = document.getElementById("acctName").value.trim();
+    if (!name) { showToast("Account name required.", true); return; }
+    const payload = {
+      id: existing?.id,
+      name,
+      isGstRegistered: document.getElementById("acctIsGst").checked,
+      gstin: document.getElementById("acctGstin").value.trim(),
+      pan: document.getElementById("acctPan").value.trim(),
+      phone: document.getElementById("acctPhone").value.trim(),
+      address: document.getElementById("acctAddress").value.trim(),
+      city: document.getElementById("acctCity").value.trim(),
+      pincode: document.getElementById("acctPincode").value.trim(),
+      state: document.getElementById("acctState").value.trim(),
+      stateCode: document.getElementById("acctStateCode").value.trim(),
+      contactPerson: document.getElementById("acctContact").value.trim(),
+      email: document.getElementById("acctEmail").value.trim(),
+      defaultRatePerYear: parseFloat(document.getElementById("acctRate").value) || 0,
+      hsnCode: document.getElementById("acctHsn").value.trim(),
+      gstRate: parseFloat(document.getElementById("acctGstRate").value) || 18,
+      notes: document.getElementById("acctNotes").value.trim(),
+    };
+    await runWithBusyButton(confirmBtn, async () => {
+      try {
+        const saved = await upsertRenewalAccount(payload);
+        const idx = renewalAccounts.findIndex((x) => x.id === saved.id);
+        if (idx >= 0) renewalAccounts[idx] = saved;
+        else renewalAccounts.push(saved);
+        closeModal();
+        showToast(`✓ Account "${saved.name}" saved`);
+        render();
+      } catch (err) {
+        showToast(err.message || "Save failed.", true);
+      }
+    }, "Saving…");
+  });
+}
+
+/* ============================================================
+   SUB-PAGE: SETTINGS (Seller profile)
+   ============================================================ */
+function renderRenewalSettingsSubPage() {
+  const perms = getUserPerms(currentUser);
+  const isAdmin = perms?.isAdmin;
+  if (!isAdmin) {
+    app.innerHTML = `
+      ${renderHeader("Renewal Tracker — Settings", "Admin only")}
+      <main class="main">
+        ${renderRenewalSubNav("settings", false)}
+        <section class="card"><h2>Access denied</h2><p>Only admin can configure seller profile.</p></section>
+      </main>
+    `;
+    bindRenewalSubNav();
+    bindLogout();
+    return;
+  }
+
+  const p = sellerProfile || {};
+
+  app.innerHTML = `
+    ${renderHeader("Renewal Tracker — Settings", "Seller business profile for documents")}
+    <main class="main">
+      ${renderAdminNav("renewals")}
+      ${renderRenewalSubNav("settings", true)}
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>🏢 Seller Profile</h2>
+            <p class="section-subtitle">This info appears on all PIs, invoices, and receipts you generate.</p>
+          </div>
+        </div>
+
+        <div class="payment-form">
+          <h3 style="margin-top: 0.5rem; color: #475569;">Business Info</h3>
+          <div class="form-row">
+            <label>Business Name <span class="required">*</span></label>
+            <input type="text" id="sp_businessName" value="${escapeHtml(p.businessName || '')}" required />
+          </div>
+          <div class="form-row-grid">
+            <div class="form-row">
+              <label>GSTIN</label>
+              <input type="text" id="sp_gstin" value="${escapeHtml(p.gstin || '')}" placeholder="22AAAAA0000A1Z5" />
+            </div>
+            <div class="form-row">
+              <label>PAN</label>
+              <input type="text" id="sp_pan" value="${escapeHtml(p.pan || '')}" />
+            </div>
+          </div>
+          <div class="form-row">
+            <label>Address</label>
+            <textarea id="sp_address" rows="2">${escapeHtml(p.address || '')}</textarea>
+          </div>
+          <div class="form-row-grid">
+            <div class="form-row">
+              <label>City</label>
+              <input type="text" id="sp_city" value="${escapeHtml(p.city || '')}" />
+            </div>
+            <div class="form-row">
+              <label>Pincode</label>
+              <input type="text" id="sp_pincode" value="${escapeHtml(p.pincode || '')}" />
+            </div>
+          </div>
+          <div class="form-row-grid">
+            <div class="form-row">
+              <label>State</label>
+              <input type="text" id="sp_state" value="${escapeHtml(p.state || '')}" />
+            </div>
+            <div class="form-row">
+              <label>State Code <span class="required">*</span></label>
+              <input type="text" id="sp_stateCode" value="${escapeHtml(p.stateCode || '')}" placeholder="22" maxlength="2" />
+            </div>
+          </div>
+          <div class="form-row-grid">
+            <div class="form-row">
+              <label>Phone</label>
+              <input type="text" id="sp_phone" value="${escapeHtml(p.contactPhone || '')}" />
+            </div>
+            <div class="form-row">
+              <label>Email</label>
+              <input type="email" id="sp_email" value="${escapeHtml(p.contactEmail || '')}" />
+            </div>
+          </div>
+          <div class="form-row">
+            <label>Website</label>
+            <input type="text" id="sp_website" value="${escapeHtml(p.website || '')}" />
+          </div>
+
+          <h3 style="margin-top: 1rem; color: #475569;">Bank Details (for payment on PI)</h3>
+          <div class="form-row">
+            <label>Bank Name</label>
+            <input type="text" id="sp_bankName" value="${escapeHtml(p.bankName || '')}" />
+          </div>
+          <div class="form-row-grid">
+            <div class="form-row">
+              <label>Account Holder</label>
+              <input type="text" id="sp_bankHolder" value="${escapeHtml(p.bankAccountHolder || '')}" />
+            </div>
+            <div class="form-row">
+              <label>Account No</label>
+              <input type="text" id="sp_bankAccount" value="${escapeHtml(p.bankAccountNo || '')}" />
+            </div>
+          </div>
+          <div class="form-row-grid">
+            <div class="form-row">
+              <label>IFSC</label>
+              <input type="text" id="sp_bankIfsc" value="${escapeHtml(p.bankIfsc || '')}" />
+            </div>
+            <div class="form-row">
+              <label>Branch</label>
+              <input type="text" id="sp_bankBranch" value="${escapeHtml(p.bankBranch || '')}" />
+            </div>
+          </div>
+
+          <h3 style="margin-top: 1rem; color: #475569;">Branding — Logo & Theme</h3>
+
+          <div class="form-row">
+            <label>Company Logo (shown on all documents)</label>
+            <div class="logo-upload-row">
+              ${p.logoUrl ? `<img src="${escapeHtml(p.logoUrl)}" class="logo-preview" alt="Logo" />` : '<div class="logo-placeholder">No logo</div>'}
+              <input type="file" id="sp_logoFile" accept="image/*" style="display:none;" />
+              <button type="button" class="btn btn-outline btn-sm" id="sp_uploadLogoBtn">📷 Upload Logo</button>
+              ${p.logoUrl ? '<button type="button" class="btn btn-outline btn-sm" id="sp_removeLogoBtn">🗑 Remove</button>' : ''}
+            </div>
+            <input type="hidden" id="sp_logoUrl" value="${escapeHtml(p.logoUrl || '')}" />
+            <p class="field-hint">Recommended: Square image, max 500KB. Will be shown at top-left of documents.</p>
+          </div>
+
+          <div class="form-row">
+            <label>Document Theme Color</label>
+            <div class="theme-picker">
+              ${['classic', 'teal', 'blue', 'burgundy', 'green', 'purple', 'amber'].map((t) => {
+                const meta = DOC_THEMES[t];
+                return `
+                  <label class="theme-option ${(p.themeColor || 'classic') === t ? 'selected' : ''}">
+                    <input type="radio" name="sp_theme" value="${t}" ${(p.themeColor || 'classic') === t ? 'checked' : ''} />
+                    <span class="theme-swatch" style="background: ${meta.primary}; border-color: ${meta.accent};">
+                      <span class="theme-swatch-dot" style="background: ${meta.accent};"></span>
+                    </span>
+                    <span class="theme-name">${meta.label}</span>
+                  </label>
+                `;
+              }).join("")}
+            </div>
+          </div>
+
+          <h3 style="margin-top: 1rem; color: #475569;">Terms (signature not needed — docs are electronic)</h3>
+          <input type="hidden" id="sp_sigName" value="" />
+          <input type="hidden" id="sp_sigDesig" value="" />
+          <div class="form-row">
+            <label>Terms & Conditions (shown on PI)</label>
+            <textarea id="sp_terms" rows="3" placeholder="e.g. Payment due within 7 days. Subject to Raipur jurisdiction.">${escapeHtml(p.termsText || '')}</textarea>
+          </div>
+
+          <div class="modal-actions" style="justify-content: flex-start;">
+            <button type="button" class="btn btn-primary" id="saveSellerProfileBtn">💾 Save Profile</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  `;
+
+  bindAdminNav();
+  bindRenewalSubNav();
+  bindLogout();
+
+  // Logo upload handler
+  document.getElementById("sp_uploadLogoBtn")?.addEventListener("click", () => {
+    document.getElementById("sp_logoFile")?.click();
+  });
+  document.getElementById("sp_logoFile")?.addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    if (file.size > 500 * 1024) { showToast("Logo too large (max 500KB)", true); return; }
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+      document.getElementById("sp_logoUrl").value = dataUrl;
+      showToast("✓ Logo loaded — click 💾 Save to persist");
+      render();
+    } catch (err) {
+      showToast("Logo upload failed", true);
+    }
+  });
+  document.getElementById("sp_removeLogoBtn")?.addEventListener("click", () => {
+    document.getElementById("sp_logoUrl").value = "";
+    showToast("Logo removed — click 💾 Save to persist");
+    render();
+  });
+
+  // Theme radio handlers (visual feedback only, saved on Save click)
+  modal?.querySelectorAll('input[name="sp_theme"]').forEach(() => {}); // no-op; app-level
+  app.querySelectorAll('input[name="sp_theme"]').forEach((rb) => {
+    rb.addEventListener("change", () => {
+      app.querySelectorAll(".theme-option").forEach((o) => o.classList.remove("selected"));
+      rb.closest(".theme-option")?.classList.add("selected");
+    });
+  });
+
+  document.getElementById("saveSellerProfileBtn")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const name = document.getElementById("sp_businessName").value.trim();
+    if (!name) { showToast("Business name required.", true); return; }
+    const selectedTheme = app.querySelector('input[name="sp_theme"]:checked')?.value || "classic";
+    const payload = {
+      id: p.id,
+      businessName: name,
+      gstin: document.getElementById("sp_gstin").value.trim(),
+      pan: document.getElementById("sp_pan").value.trim(),
+      address: document.getElementById("sp_address").value.trim(),
+      city: document.getElementById("sp_city").value.trim(),
+      state: document.getElementById("sp_state").value.trim(),
+      stateCode: document.getElementById("sp_stateCode").value.trim(),
+      pincode: document.getElementById("sp_pincode").value.trim(),
+      contactPhone: document.getElementById("sp_phone").value.trim(),
+      contactEmail: document.getElementById("sp_email").value.trim(),
+      website: document.getElementById("sp_website").value.trim(),
+      bankName: document.getElementById("sp_bankName").value.trim(),
+      bankAccountHolder: document.getElementById("sp_bankHolder").value.trim(),
+      bankAccountNo: document.getElementById("sp_bankAccount").value.trim(),
+      bankIfsc: document.getElementById("sp_bankIfsc").value.trim(),
+      bankBranch: document.getElementById("sp_bankBranch").value.trim(),  // keeps old field; template now uses "Current" instead
+      signatureName: document.getElementById("sp_sigName").value.trim(),
+      signatureDesignation: document.getElementById("sp_sigDesig").value.trim(),
+      termsText: document.getElementById("sp_terms").value.trim(),
+      logoUrl: document.getElementById("sp_logoUrl").value,
+      themeColor: selectedTheme,
+      updatedBy: currentUser,
+    };
+    await runWithBusyButton(btn, async () => {
+      try {
+        sellerProfile = await upsertSellerProfile(payload);
+        showToast("✓ Seller profile saved");
+        render();
+      } catch (err) {
+        showToast(err.message || "Save failed.", true);
+      }
+    }, "Saving…");
+  });
+}
+
+/* ============================================================
+   SUB-PAGE: DOCUMENTS LIST
+   ============================================================ */
+function renderRenewalDocumentsSubPage() {
+  const perms = getUserPerms(currentUser);
+  const isAdmin = perms?.isAdmin;
+  const docs = [...renewalDocuments];
+  const typeLabel = { PI: "📝 PI", INV: "🧾 Tax Invoice", R: "🧾 Receipt" };
+
+  app.innerHTML = `
+    ${renderHeader("Renewal Tracker — Documents", `${docs.length} documents generated`)}
+    <main class="main">
+      ${isAdmin ? renderAdminNav("renewals") : ""}
+      ${renderRenewalSubNav("documents", isAdmin)}
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>Generated Documents</h2>
+            <p class="section-subtitle">All PIs, invoices, and receipts you've created. Click to view/print again.</p>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Type</th>
+                <th>Number</th>
+                <th>Account</th>
+                <th>Vehicles</th>
+                <th>Total ₹</th>
+                <th>By</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${docs.length === 0 ? `
+                <tr class="empty-row"><td colspan="8">No documents generated yet. Go to Vehicles tab, select some, and click Create PI/Invoice/Receipt.</td></tr>
+              ` : docs.map((d) => `
+                <tr>
+                  <td class="date-cell">${formatDateIndian(d.docDate)}</td>
+                  <td>${typeLabel[d.docType] || d.docType}</td>
+                  <td class="mono"><strong>${escapeHtml(d.docNumber)}</strong></td>
+                  <td>${escapeHtml(d.accountName || "—")}</td>
+                  <td>${(d.vehicles || []).length}</td>
+                  <td><strong>₹${d.total.toLocaleString("en-IN")}</strong></td>
+                  <td>${escapeHtml(d.createdBy || "?")}</td>
+                  <td class="row-actions">
+                    <button type="button" class="btn btn-primary btn-sm reopen-doc-btn" data-id="${escapeHtml(d.id)}">👁 View / Print</button>
+                    <button type="button" class="btn btn-outline btn-sm edit-doc-btn" data-id="${escapeHtml(d.id)}" title="Edit this document">✏️ Edit</button>
+                    ${isAdmin ? `<button type="button" class="btn btn-outline btn-sm delete-doc-btn" data-id="${escapeHtml(d.id)}" title="Delete">🗑</button>` : ""}
+                  </td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  `;
+
+  if (isAdmin) bindAdminNav();
+  bindRenewalSubNav();
+  bindLogout();
+
+  app.querySelectorAll(".reopen-doc-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const d = renewalDocuments.find((x) => x.id === btn.dataset.id);
+      if (d?.htmlSnapshot) openDocumentPrintWindow(d.htmlSnapshot, d.docNumber);
+      else showToast("Document HTML not saved.", true);
+    });
+  });
+  app.querySelectorAll(".edit-doc-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const d = renewalDocuments.find((x) => x.id === btn.dataset.id);
+      if (!d) { showToast("Document not found.", true); return; }
+      openDocGenerationModal(d.docType, d);
+    });
+  });
+  app.querySelectorAll(".delete-doc-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (!confirm("Delete this document? This cannot be undone.")) return;
+      try {
+        await deleteRenewalDocument(btn.dataset.id);
+        renewalDocuments = renewalDocuments.filter((x) => x.id !== btn.dataset.id);
+        showToast("✓ Deleted");
+        render();
+      } catch (err) {
+        showToast(err.message || "Delete failed.", true);
+      }
+    });
+  });
+}
+
+/* ============================================================
+   BULK ACCOUNT ASSIGNMENT
+   ============================================================ */
+function openBulkAccountAssignModal() {
+  const count = selectedVehicleIds.size;
+  if (count === 0) { showToast("No vehicles selected.", true); return; }
+  const sorted = [...renewalAccounts].sort((a, b) => a.name.localeCompare(b.name));
+
+  modal.innerHTML = `
+    <h3>🔗 Assign Account to ${count} vehicles</h3>
+    <p class="modal-desc">Link selected vehicles to an existing customer account.</p>
+    <div class="payment-form">
+      <div class="form-row">
+        <label>Account <span class="required">*</span></label>
+        <select id="bulkAcctSelect">
+          <option value="">— Choose account —</option>
+          <option value="UNASSIGN">(Unassign — remove account link)</option>
+          ${sorted.map((a) => `<option value="${escapeHtml(a.id)}">${escapeHtml(a.name)}${a.isGstRegistered ? ' [GST]' : ' [Non-GST]'}</option>`).join("")}
+        </select>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary modal-confirm">Assign</button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  modal.querySelector('[data-act="cancel"]').onclick = closeModal;
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) closeModal(); };
+
+  const confirmBtn = modal.querySelector(".modal-confirm");
+  confirmBtn.addEventListener("click", async () => {
+    const sel = document.getElementById("bulkAcctSelect").value;
+    if (!sel) { showToast("Select an account.", true); return; }
+    const accountId = sel === "UNASSIGN" ? null : sel;
+    await runWithBusyButton(confirmBtn, async () => {
+      try {
+        const ids = Array.from(selectedVehicleIds);
+        await bulkUpdateRenewalAccountLinks(ids, accountId);
+        await refreshAllData();
+        selectedVehicleIds.clear();
+        closeModal();
+        showToast(`✓ Updated ${ids.length} vehicles`);
+        render();
+      } catch (err) {
+        showToast(err.message || "Assign failed.", true);
+      }
+    }, "Saving…");
+  });
+}
+
+/* ============================================================
+   DOCUMENT GENERATION
+   ============================================================ */
+function openDocGenerationModal(docType, editDoc = null) {
+  // ──────────────────────────────────────────────────────────
+  // EDIT MODE: docType overridden by the saved doc; use saved vehicles.
+  // CREATE MODE: use selectedVehicleIds from vehicles sub-page.
+  // ──────────────────────────────────────────────────────────
+  const isEdit = !!editDoc;
+  if (isEdit) {
+    docType = editDoc.docType; // force original type
+  } else {
+    const count = selectedVehicleIds.size;
+    if (count === 0) { showToast("Select vehicles first.", true); return; }
+  }
+
+  if (!sellerProfile || !sellerProfile.businessName) {
+    showToast("⚠️ Set up Seller Profile first (Settings tab).", true);
+    return;
+  }
+
+  if (renewalAccounts.length === 0) {
+    showToast("⚠️ Create at least one customer account first (Accounts tab).", true);
+    return;
+  }
+
+  // Build line-item source. In edit mode, use the stored vehicle snapshot.
+  const selectedRenewals = isEdit
+    ? (editDoc.vehicles || []).map((v) => ({
+        id: v.renewalId,
+        plateNumber: v.plateNumber,
+        vehicleName: v.vehicleName,
+        imei: v.imei,
+        simNumber: v.simNumber,
+        _snapshot: v, // keep so we don't recompute cycle
+      }))
+    : renewals.filter((r) => selectedVehicleIds.has(r.id));
+
+  // Filter accounts by GST compatibility for selected doc type
+  const filteredAccounts = renewalAccounts.filter((a) => {
+    if (docType === "INV") return a.isGstRegistered;
+    if (docType === "R")   return !a.isGstRegistered;
+    return true; // PI works for both
+  }).sort((a, b) => a.name.localeCompare(b.name));
+
+  if (filteredAccounts.length === 0 && !isEdit) {
+    const needText = docType === "INV" ? "GST-registered" : docType === "R" ? "Non-GST" : "any";
+    showToast(`⚠️ No ${needText} accounts found. Add one in Accounts tab.`, true);
+    return;
+  }
+
+  // In edit mode: lock to the doc's account (even if GST-filter would've hidden it).
+  const likelyAccountId = isEdit
+    ? editDoc.accountId
+    : filteredAccounts[0].id;
+
+  const docLabel = { PI: "Proforma Invoice", INV: "Tax Invoice", R: "Receipt" }[docType];
+
+  // Current theme — can be changed from the picker; starts from doc / seller default.
+  let currentTheme = (editDoc && editDoc.themeColor)
+    ? editDoc.themeColor
+    : (sellerProfile.themeColor || "classic");
+
+  const renderDocForm = (accountId) => {
+    const account = renewalAccounts.find((a) => a.id === accountId);
+    if (!account) {
+      return `<div class="doc-form-empty">Select a customer account above to continue.</div>`;
+    }
+    const defaultRate = account.defaultRatePerYear || 500;
+    const prefRate     = isEdit && editDoc.vehicles?.[0]?.rate ? editDoc.vehicles[0].rate : defaultRate;
+    const prefGstRate  = isEdit ? (editDoc.gstRate || 18) : (account.gstRate || 18);
+    const prefHsn      = isEdit ? (editDoc.hsnCode || '998412') : (account.hsnCode || '998412');
+    const prefDate     = isEdit ? editDoc.docDate : formatYMD(new Date());
+    const prefShipTo   = isEdit ? (editDoc.shipToAddress || '') : '';
+    const prefShowP    = isEdit ? (editDoc.showPeriod !== false) : true;
+    const prefNotes    = isEdit ? (editDoc.notes || '') : '';
+    const prefPayMode  = isEdit ? (editDoc.paymentMode || 'cash') : 'cash';
+
+    const defaultShipTo = [account.address, account.city, account.state, account.pincode].filter(Boolean).join(", ");
+    const applyGst = (docType === "INV") || (docType === "PI" && account.isGstRegistered);
+    const gstPill = applyGst
+      ? `<span class="doc-pill doc-pill-on">GST will apply</span>`
+      : `<span class="doc-pill doc-pill-off">No GST</span>`;
+
+    const themePickerHtml = `
+      <div class="doc-theme-picker">
+        ${Object.keys(DOC_THEMES).map((t) => {
+          const meta = DOC_THEMES[t];
+          const selected = currentTheme === t;
+          return `
+            <label class="doc-theme-opt ${selected ? 'selected' : ''}" title="${escapeHtml(meta.label)}">
+              <input type="radio" name="doc_theme" value="${t}" ${selected ? 'checked' : ''} />
+              <span class="doc-theme-swatch" style="background: ${meta.primary}; border-color: ${meta.accent};">
+                <span class="doc-theme-dot" style="background: ${meta.accent};"></span>
+              </span>
+              <span class="doc-theme-label">${escapeHtml(meta.label)}</span>
+            </label>
+          `;
+        }).join("")}
+      </div>
+    `;
+
+    return `
+      <div class="doc-form-section">
+        <div class="doc-section-title">
+          <span class="doc-section-icon">📋</span>
+          <span>Document Info</span>
+        </div>
+        <div class="doc-field-grid-2">
+          <div class="form-row">
+            <label>Document Date</label>
+            <input type="date" id="doc_date" value="${prefDate}" />
+          </div>
+          <div class="form-row">
+            <label>HSN / SAC Code</label>
+            <input type="text" id="doc_hsn" value="${escapeHtml(prefHsn)}" />
+          </div>
+        </div>
+      </div>
+
+      <div class="doc-form-section">
+        <div class="doc-section-title">
+          <span class="doc-section-icon">💰</span>
+          <span>Pricing &amp; Tax</span>
+          ${gstPill}
+        </div>
+        <div class="doc-field-grid-2">
+          <div class="form-row">
+            <label>Rate per SIM / Year (₹)</label>
+            <input type="number" id="doc_rate" value="${prefRate}" min="0" />
+          </div>
+          <div class="form-row">
+            <label>GST Rate (%)</label>
+            <input type="number" id="doc_gstRate" value="${prefGstRate}" min="0" max="28" step="0.01" />
+          </div>
+        </div>
+      </div>
+
+      <div class="doc-form-section">
+        <div class="doc-section-title">
+          <span class="doc-section-icon">🎨</span>
+          <span>Theme Color</span>
+          <span class="doc-pill doc-pill-off">Per-doc</span>
+        </div>
+        ${themePickerHtml}
+      </div>
+
+      <div class="doc-form-section">
+        <div class="doc-section-title">
+          <span class="doc-section-icon">📍</span>
+          <span>Ship To Address</span>
+        </div>
+        <div class="form-row">
+          <label>Ship To <span class="label-hint">(blank = same as Bill To)</span></label>
+          <textarea id="doc_shipTo" rows="2" placeholder="${escapeHtml(defaultShipTo)}">${escapeHtml(prefShipTo)}</textarea>
+        </div>
+      </div>
+
+      <div class="doc-form-section doc-toggle-section">
+        <div class="doc-section-title">
+          <span class="doc-section-icon">📅</span>
+          <span>Subscription Period Column</span>
+          <span class="doc-pill ${prefShowP ? 'doc-pill-on' : 'doc-pill-off'}" id="doc_showPeriod_pill">${prefShowP ? 'VISIBLE' : 'HIDDEN'}</span>
+        </div>
+        <label class="doc-toggle">
+          <input type="checkbox" id="doc_showPeriod" ${prefShowP ? 'checked' : ''} />
+          <span class="doc-toggle-track"><span class="doc-toggle-thumb"></span></span>
+          <span class="doc-toggle-label">Show the <strong>Subscription Period</strong> column (dates like "09 Sept 2025 → 09 Sept 2026") in the PDF</span>
+        </label>
+      </div>
+
+      <div class="doc-form-section doc-items-section">
+        <div class="doc-section-title">
+          <span class="doc-section-icon">📦</span>
+          <span>Line Items</span>
+          <span class="doc-pill doc-pill-count">${selectedRenewals.length}</span>
+        </div>
+        <div class="doc-items-list">
+          ${selectedRenewals.map((r, i) => `
+            <div class="doc-item-row">
+              <span class="doc-item-idx">${i + 1}</span>
+              <span class="doc-plate-chip">${escapeHtml(r.plateNumber)}</span>
+              <span class="doc-item-name">${escapeHtml(r.vehicleName || '—')}</span>
+              <span class="doc-item-imei mono">${escapeHtml(r.imei)}</span>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+
+      <div id="docTotalsPreview" class="doc-totals-preview"></div>
+
+      ${docType === "R" ? `
+        <div class="doc-form-section">
+          <div class="doc-section-title">
+            <span class="doc-section-icon">💵</span>
+            <span>Payment Received</span>
+            <span class="doc-pill doc-pill-req">Required</span>
+          </div>
+          <div class="form-row">
+            <select id="doc_payMode" required>
+              <option value="cash"   ${prefPayMode === 'cash'   ? 'selected' : ''}>💵 Cash</option>
+              <option value="upi"    ${prefPayMode === 'upi'    ? 'selected' : ''}>📱 UPI</option>
+              <option value="bank"   ${prefPayMode === 'bank'   ? 'selected' : ''}>🏦 Bank Transfer</option>
+              <option value="cheque" ${prefPayMode === 'cheque' ? 'selected' : ''}>📄 Cheque</option>
+            </select>
+          </div>
+        </div>
+      ` : ""}
+
+      <div class="doc-form-section">
+        <div class="doc-section-title">
+          <span class="doc-section-icon">📝</span>
+          <span>Notes <span class="label-hint">(optional)</span></span>
+        </div>
+        <div class="form-row">
+          <textarea id="doc_notes" rows="2" placeholder="Any additional notes to show on the document…">${escapeHtml(prefNotes)}</textarea>
+        </div>
+      </div>
+    `;
+  };
+
+  const docIcon = { PI: "📝", INV: "🧾", R: "💳" }[docType];
+  const docAccent = { PI: "pi", INV: "inv", R: "r" }[docType];
+
+  modal.classList.add("modal-doc-gen");
+  modal.classList.add(`modal-doc-${docAccent}`);
+  modal.innerHTML = `
+    <div class="doc-modal-head">
+      <div class="doc-modal-title">
+        <span class="doc-modal-icon">${docIcon}</span>
+        <div>
+          <h3>${isEdit ? 'Edit' : 'Create'} ${docLabel}${isEdit ? ` · <span class="doc-modal-number">${escapeHtml(editDoc.docNumber)}</span>` : ''}</h3>
+          <p class="doc-modal-sub">${selectedRenewals.length} vehicle${selectedRenewals.length !== 1 ? 's' : ''} ${isEdit ? 'in this document' : 'selected'} · Review &amp; ${isEdit ? 'update' : 'generate'} the PDF.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="doc-form-section doc-billto-section">
+      <div class="doc-section-title">
+        <span class="doc-section-icon">🏢</span>
+        <span>Bill To (Customer Account) <span class="required">*</span></span>
+        ${isEdit ? '<span class="doc-pill doc-pill-off">Locked</span>' : ''}
+      </div>
+      <select id="doc_billTo" class="doc-billto-select" ${isEdit ? 'disabled' : ''}>
+        <option value="">— Select customer account —</option>
+        ${(isEdit ? renewalAccounts : filteredAccounts).map((a) => `
+          <option value="${escapeHtml(a.id)}" ${a.id === likelyAccountId ? 'selected' : ''}>
+            ${escapeHtml(a.name)}${a.isGstRegistered ? ' [GST]' : ' [Non-GST]'}${a.state ? ` · ${escapeHtml(a.state)}` : ''}
+          </option>
+        `).join("")}
+      </select>
+    </div>
+
+    <div id="docFormBody">${renderDocForm(likelyAccountId)}</div>
+
+    <div class="modal-actions doc-modal-actions">
+      <button type="button" class="btn btn-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="btn btn-primary modal-confirm">
+        ${isEdit ? '💾 Update ' + docLabel : '📄 Generate ' + docLabel}
+      </button>
+    </div>
+  `;
+  modalOverlay.classList.remove("hidden");
+  const cleanupModalClass = () => {
+    modal.classList.remove("modal-doc-gen");
+    modal.classList.remove(`modal-doc-${docAccent}`);
+  };
+  modal.querySelector('[data-act="cancel"]').onclick = () => { cleanupModalClass(); closeModal(); };
+  modalOverlay.onclick = (e) => { if (e.target === modalOverlay) { cleanupModalClass(); closeModal(); } };
+
+  // Dynamic Bill To change — re-render form with new account defaults (CREATE MODE ONLY)
+  const billToSelect = document.getElementById("doc_billTo");
+  const refreshTotals = () => {
+    const rateEl = document.getElementById("doc_rate");
+    const gstEl = document.getElementById("doc_gstRate");
+    if (!rateEl || !gstEl) return { subtotal: 0, cgst: 0, sgst: 0, igst: 0, total: 0, rate: 0, gstRate: 0 };
+    const accountId = billToSelect.value;
+    const account = renewalAccounts.find((a) => a.id === accountId);
+    if (!account) return { subtotal: 0, cgst: 0, sgst: 0, igst: 0, total: 0, rate: 0, gstRate: 0 };
+
+    const rate = parseFloat(rateEl.value) || 0;
+    const gstRate = parseFloat(gstEl.value) || 0;
+    const subtotal = rate * selectedRenewals.length;
+    let cgst = 0, sgst = 0, igst = 0;
+    // Apply GST for Tax Invoice always, and for PI if customer is GST-registered
+    const applyGst = (docType === "INV") || (docType === "PI" && account.isGstRegistered);
+    if (applyGst) {
+      const sameState = (sellerProfile.stateCode || "").trim() === (account.stateCode || "").trim();
+      if (sameState) {
+        cgst = subtotal * (gstRate / 2) / 100;
+        sgst = subtotal * (gstRate / 2) / 100;
+      } else {
+        igst = subtotal * gstRate / 100;
+      }
+    }
+    const total = subtotal + cgst + sgst + igst;
+    const totalsEl = document.getElementById("docTotalsPreview");
+    if (totalsEl) {
+      totalsEl.innerHTML = `
+        <div class="totals-row"><span>Subtotal:</span><strong>₹${subtotal.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</strong></div>
+        ${applyGst ? (igst > 0 ? `
+          <div class="totals-row"><span>IGST (${gstRate}%):</span><strong>₹${igst.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</strong></div>
+        ` : `
+          <div class="totals-row"><span>CGST (${gstRate/2}%):</span><strong>₹${cgst.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</strong></div>
+          <div class="totals-row"><span>SGST (${gstRate/2}%):</span><strong>₹${sgst.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</strong></div>
+        `) : ""}
+        <div class="totals-row totals-grand"><span>Grand Total:</span><strong>₹${total.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</strong></div>
+      `;
+    }
+    return { subtotal, cgst, sgst, igst, total, rate, gstRate };
+  };
+
+  const wireFormFields = () => {
+    ["doc_rate", "doc_gstRate"].forEach((id) => {
+      document.getElementById(id)?.addEventListener("input", refreshTotals);
+    });
+    // Theme radios — update currentTheme + selected class visual
+    document.querySelectorAll('input[name="doc_theme"]').forEach((radio) => {
+      radio.addEventListener("change", () => {
+        currentTheme = radio.value;
+        document.querySelectorAll(".doc-theme-opt").forEach((lbl) => {
+          lbl.classList.toggle("selected", lbl.querySelector('input[name="doc_theme"]').checked);
+        });
+      });
+    });
+    // Period toggle pill — live VISIBLE/HIDDEN state
+    const showPeriodCk = document.getElementById("doc_showPeriod");
+    const showPeriodPill = document.getElementById("doc_showPeriod_pill");
+    if (showPeriodCk && showPeriodPill) {
+      showPeriodCk.addEventListener("change", () => {
+        const on = showPeriodCk.checked;
+        showPeriodPill.textContent = on ? "VISIBLE" : "HIDDEN";
+        showPeriodPill.classList.toggle("doc-pill-on",  on);
+        showPeriodPill.classList.toggle("doc-pill-off", !on);
+      });
+    }
+    refreshTotals();
+  };
+
+  if (!isEdit) {
+    billToSelect.addEventListener("change", () => {
+      document.getElementById("docFormBody").innerHTML = renderDocForm(billToSelect.value);
+      wireFormFields();
+    });
+  }
+  wireFormFields();
+
+  const confirmBtn = modal.querySelector(".modal-confirm");
+  confirmBtn.addEventListener("click", async () => {
+    const accountId = isEdit ? editDoc.accountId : billToSelect.value;
+    const account = renewalAccounts.find((a) => a.id === accountId);
+    if (!account) { showToast("Pick a Bill To account first.", true); return; }
+
+    const totals = refreshTotals();
+    const docDate = document.getElementById("doc_date").value;
+    const hsn = document.getElementById("doc_hsn").value.trim();
+    const notes = document.getElementById("doc_notes").value.trim();
+    const shipToOverride = document.getElementById("doc_shipTo").value.trim();
+    const showPeriod = document.getElementById("doc_showPeriod")?.checked !== false;
+    const paymentMode = document.getElementById("doc_payMode")?.value || null;
+    const themeColor = currentTheme;
+
+    await runWithBusyButton(confirmBtn, async () => {
+      try {
+        // Doc number: keep original in edit mode, generate new in create mode
+        let docNumber;
+        if (isEdit) {
+          docNumber = editDoc.docNumber;
+        } else {
+          const dateObj = new Date(docDate);
+          let period;
+          if (docType === "R") {
+            const m = dateObj.getMonth();
+            const y = dateObj.getFullYear();
+            const fyStart = m >= 3 ? y : y - 1;
+            period = `${String(fyStart).slice(-2)}-${String(fyStart + 1).slice(-2)}`;
+          } else {
+            period = `${String(dateObj.getFullYear()).slice(-2)}/${String(dateObj.getMonth() + 1).padStart(2, "0")}`;
+          }
+          const num = await getNextDocNumber(docType, period);
+          docNumber = `${docType}/${period}/${String(num).padStart(3, "0")}`;
+        }
+
+        // Line items. Edit mode reuses saved snapshot (period dates, year, etc.),
+        // only rate is refreshed. Create mode computes cycle fresh.
+        const finalItems = isEdit
+          ? selectedRenewals.map((r) => ({
+              ...r._snapshot,
+              rate: totals.rate,
+            }))
+          : selectedRenewals.map((r) => {
+              const status = computeRenewalStatus(r);
+              return {
+                renewalId: r.id,
+                plateNumber: r.plateNumber,
+                vehicleName: r.vehicleName,
+                imei: r.imei,
+                simNumber: r.simNumber,
+                year: status.oldestUnpaidYear || status.currentYear,
+                periodStart: formatYMD(status.cycleStart),
+                periodEnd: formatYMD(status.cycleEnd),
+                rate: totals.rate,
+              };
+            });
+
+        // Build HTML
+        const html = buildDocumentHTML(docType, {
+          docNumber,
+          docDate,
+          account,
+          seller: sellerProfile,
+          lineItems: finalItems,
+          subtotal: totals.subtotal,
+          cgst: totals.cgst,
+          sgst: totals.sgst,
+          igst: totals.igst,
+          total: totals.total,
+          hsnCode: hsn,
+          gstRate: totals.gstRate,
+          paymentMode,
+          notes,
+          shipToAddress: shipToOverride,
+          showPeriod,
+          themeColor,
+        });
+
+        // Payload
+        const docRecord = {
+          docType,
+          docNumber,
+          docDate,
+          accountId: account.id,
+          accountName: account.name,
+          accountGstin: account.gstin,
+          vehicles: finalItems,
+          subtotal: totals.subtotal,
+          cgst: totals.cgst,
+          sgst: totals.sgst,
+          igst: totals.igst,
+          total: totals.total,
+          hsnCode: hsn,
+          gstRate: totals.gstRate,
+          paymentMode,
+          linkedPayments: isEdit ? (editDoc.linkedPayments || []) : [],
+          notes,
+          shipToAddress: shipToOverride,
+          htmlSnapshot: html,
+          themeColor,
+          showPeriod,
+          createdBy: isEdit ? editDoc.createdBy : currentUser,
+        };
+
+        let saved;
+        if (isEdit) {
+          saved = await updateRenewalDocument(editDoc.id, docRecord);
+          const idx = renewalDocuments.findIndex((x) => x.id === editDoc.id);
+          if (idx >= 0) renewalDocuments[idx] = saved;
+        } else {
+          saved = await createRenewalDocument(docRecord);
+          renewalDocuments.unshift(saved);
+        }
+
+        cleanupModalClass();
+        closeModal();
+        if (!isEdit) selectedVehicleIds.clear();
+        showToast(`✓ ${docLabel} ${docNumber} ${isEdit ? 'updated' : 'created'}`);
+        openDocumentPrintWindow(html, docNumber);
+        render();
+      } catch (err) {
+        showToast(err.message || "Document generation failed.", true);
+      }
+    }, isEdit ? "Updating…" : "Generating…");
+  });
+}
+
+/* ============================================================
+   DOCUMENT HTML BUILDER — v3.9.10
+   Clean modern layout (ref: billing_app333333.html's .pdoc2 template)
+   Themeable via CSS variables; works for PI / Tax Invoice / Receipt.
+   ============================================================ */
+function buildDocumentHTML(docType, d) {
+  const typeTitle = { PI: "PROFORMA INVOICE", INV: "TAX INVOICE", R: "RECEIPT" }[docType];
+  const metaLabel = { PI: "Proforma Invoice", INV: "Tax Invoice", R: "Receipt" }[docType];
+  const seller = d.seller || {};
+  const acct = d.account || {};
+  const amountInWords = numToWords(Math.round(d.total));
+  // Theme priority: per-doc override (d.themeColor) → seller default → classic
+  const theme = DOC_THEMES[d.themeColor] || DOC_THEMES[seller.themeColor] || DOC_THEMES.classic;
+
+  // Ship To — use override if provided, else same as Bill To
+  const shipToOverride = (d.shipToAddress && d.shipToAddress.trim()) ? d.shipToAddress.trim() : null;
+  const showPeriod = d.showPeriod !== false; // default true for legacy docs
+  const applyGst = (d.cgst + d.sgst + d.igst) > 0;
+  const showIgst = d.igst > 0;
+
+  // Billed-To block (also used as "Received From" for receipts)
+  const billedToHtml = `
+    <b class="ph-strong">${escapeHtml(acct.name || "")}</b><br>
+    ${acct.address ? `${escapeHtml(acct.address)}<br>` : ""}
+    ${escapeHtml([acct.city, acct.state, acct.pincode].filter(Boolean).join(", "))}
+    ${acct.gstin ? `<br>GSTIN: <b>${escapeHtml(acct.gstin)}</b>` : ""}
+    ${acct.pan ? `<br>PAN: <b>${escapeHtml(acct.pan)}</b>` : ""}
+    ${acct.phone ? `<br>Phone: <b>${escapeHtml(acct.phone)}</b>` : ""}
+  `;
+
+  const shipToHtml = shipToOverride
+    ? `<b class="ph-strong">${escapeHtml(acct.name || "")}</b><br>${escapeHtml(shipToOverride).replace(/\n/g, "<br>")}`
+    : null;
+
+  // Items table
+  const itemsHtml = d.lineItems.map((li, i) => `
+    <tr>
+      <td style="text-align:center;">${i + 1}</td>
+      <td>
+        <b class="ph-strong">${escapeHtml(li.plateNumber)}</b>
+        ${li.vehicleName ? `<br><span class="ph-item-sub">${escapeHtml(li.vehicleName)}</span>` : ""}
+      </td>
+      <td class="mono" style="font-size:8.5px;">${escapeHtml(li.imei || "")}</td>
+      <td class="mono" style="font-size:8.5px;text-align:center;">${escapeHtml(d.hsnCode || "")}</td>
+      ${showPeriod ? `<td class="ph-item-sub" style="font-size:8.3px;">${formatDateIndian(li.periodStart)}<br>→ ${formatDateIndian(li.periodEnd)}</td>` : ""}
+      <td style="text-align:right;">₹${Number(li.rate).toLocaleString("en-IN", { minimumFractionDigits: 2 })}</td>
+    </tr>
+  `).join("");
+
+  // Terms block — fall back to generic text per doc type
+  const defaultTerms = {
+    PI:  "Payment terms: Payment is due within 7 days from the invoice date unless otherwise agreed in writing.\n\nThe charges listed are for GPS SIM subscription renewal for the vehicles listed above.\n\nAny additional service outside the agreed scope will be billed separately.",
+    INV: "Payment terms: Payment is due within 7 days from the invoice date unless otherwise agreed in writing.\n\nThe charges listed are for GPS SIM subscription renewal for the vehicles listed above.\n\nAll disputes subject to local jurisdiction.",
+    R:   "Received the above amount towards GPS SIM subscription renewal for the listed vehicles. Subject to realisation of the instrument where applicable.",
+  }[docType];
+  const termsText = seller.termsText || defaultTerms;
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${typeTitle} — ${d.docNumber}</title>
+<style>
+  @page { size: A4; margin: 0; background: #fff; }
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    color-adjust: exact !important;
+  }
+  html, body { background: #f1f5f9; }
+  body {
+    font-family: 'Calibri', 'Carlito', Arial, Helvetica, sans-serif;
+    color: #1a2430;
+    font-size: 10.7px;
+    line-height: 1.45;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  /* Non-printable toolbar */
+  .no-print { padding: 12px 14px; background: ${theme.primary}; color: ${theme.fg}; border-bottom: 2px solid ${theme.accent}; }
+  .no-print-title { font-weight: 800; margin-bottom: 6px; font-size: 13px; color: ${theme.accent}; letter-spacing: 0.3px; }
+  .no-print button { background: #fff; color: ${theme.accent}; border: 1.5px solid ${theme.accent}; padding: 7px 14px; border-radius: 4px; font-weight: 700; cursor: pointer; margin: 4px 4px 0 0; font-size: 12px; }
+  .no-print-hint { font-size: 11px; background: rgba(255,255,255,0.6); padding: 8px 10px; border-radius: 4px; margin-top: 6px; line-height: 1.5; color: #0f172a; }
+  .no-print-hint strong { font-weight: 700; }
+  @media print { .no-print { display: none !important; } html, body { background: #fff !important; } }
+
+  /* Document — themeable via CSS variables */
+  .pdoc2 {
+    --ph-primary: ${theme.accent};
+    --ph-border: ${theme.accent};
+    --ph-border-w: 1px;
+    --ph-header-bg: ${theme.primary};
+    --ph-header-text: ${theme.fg};
+    --ph-transform: uppercase;
+    font-family: 'Calibri', 'Carlito', Arial, sans-serif;
+    color: #1a2430;
+    padding: 30px 34px 40px;
+    max-width: 840px;
+    margin: 0 auto;
+    font-size: 10.7px;
+    line-height: 1.45;
+    background: #fff;
+    text-transform: var(--ph-transform);
+    min-height: 100vh;
+  }
+  .pdoc2 table { border-collapse: collapse; width: 100%; font-family: inherit; }
+  .pdoc2 b { font-weight: 400; }
+
+  .ph-headrow td { vertical-align: top; padding: 0; }
+  .ph-logo { height: 86px; max-width: 320px; object-fit: contain; display: block; margin-bottom: 6px; }
+  .ph-bizname { font-size: 19.5px; font-weight: 700; color: var(--ph-primary); letter-spacing: -0.01em; }
+  .ph-bizmeta { font-size: 9px; line-height: 1.6; color: #334155; margin-top: 4px; text-transform: none; }
+  .ph-doctitle { font-size: 15.5px; font-weight: 400; color: var(--ph-primary); letter-spacing: -0.005em; }
+
+  /* v3.9.15 — Removed .ph-outline-wrap dependency.
+     Each table now has its own full border so page-break
+     continuations keep left/right borders cleanly (fixes
+     Safari print issue where div borders break across pages). */
+
+  .ph-info {
+    margin-top: 16px;
+    border: var(--ph-border-w) solid var(--ph-border);
+  }
+  .ph-info td {
+    border-right: var(--ph-border-w) solid var(--ph-border);
+    padding: 12px 14px;
+    font-size: 10px;
+    vertical-align: top;
+  }
+  .ph-info td:last-child { border-right: none; }
+  .ph-info-col { width: 24%; }
+  .ph-info-col > div { margin-bottom: 9px; }
+  .ph-label { color: #5B6B7A; font-size: 8px; letter-spacing: 0.05em; font-weight: 400; }
+  .ph-box { width: 38%; font-size: 8.8px; line-height: 1.55; }
+  .ph-box-billed { font-size: 7.8px; line-height: 1.5; }
+  .ph-box-label { font-weight: 700; font-size: 11.5px; margin-bottom: 7px; color: var(--ph-primary); letter-spacing: 0.03em; }
+  .ph-sub-label { font-weight: 700; font-size: 9.5px; margin-top: 9px; margin-bottom: 4px; color: var(--ph-primary); letter-spacing: 0.03em; }
+
+  .ph-items {
+    margin-top: 10px;
+    border: var(--ph-border-w) solid var(--ph-border);
+  }
+  .ph-items th, .ph-items td {
+    border: var(--ph-border-w) solid var(--ph-border);
+    padding: 7px 8px;
+    font-size: 9.3px;
+    vertical-align: top;
+  }
+  .ph-items th {
+    background: var(--ph-header-bg);
+    color: var(--ph-header-text);
+    text-align: left;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    font-size: 8px;
+  }
+  .ph-item-sub { color: #475569; font-weight: 400; text-transform: none; }
+  .mono { font-family: 'Courier New', monospace; }
+
+  .ph-stack-totals {
+    width: auto;
+    margin-left: auto;
+    margin-top: 0;
+    border: var(--ph-border-w) solid var(--ph-border);
+    border-top: none;
+    max-width: 320px;
+  }
+  .ph-stack-totals td {
+    padding: 6px 12px;
+    font-size: 10px;
+    border-top: 1px solid #ddd;
+    font-weight: 400;
+  }
+  .ph-stack-totals td:last-child { text-align: right; font-weight: 700; }
+  .ph-stack-totals tr.strong td { border-top: 1.5px solid var(--ph-border); font-weight: 700; }
+  .ph-stack-totals tr.grand td {
+    background: var(--ph-header-bg);
+    color: var(--ph-primary);
+    font-weight: 800;
+    font-size: 11.5px;
+    border-top: 1.5px solid var(--ph-border);
+    border-bottom: 1.5px solid var(--ph-border);
+  }
+
+  .ph-terms-bank { margin-top: 16px; border: var(--ph-border-w) solid var(--ph-border); }
+  .ph-terms-bank td {
+    border-right: var(--ph-border-w) solid var(--ph-border);
+    padding: 12px 14px;
+    vertical-align: top;
+    width: 50%;
+    font-size: 9px;
+    line-height: 1.6;
+  }
+  .ph-terms-bank td:last-child { border-right: none; }
+  .ph-terms-body { white-space: pre-line; text-transform: none; }
+
+  .ph-amount-words {
+    font-size: 9.5px;
+    font-weight: 700;
+    margin-top: 8px;
+    color: var(--ph-primary);
+    letter-spacing: 0.02em;
+  }
+
+  .ph-notes {
+    margin-top: 10px;
+    padding: 10px 14px;
+    border: 1px dashed var(--ph-border);
+    background: #fafbfc;
+    font-size: 9px;
+    text-transform: none;
+    color: #334155;
+  }
+  .ph-notes b { font-weight: 700; color: var(--ph-primary); text-transform: uppercase; letter-spacing: 0.04em; }
+
+  .ph-footer { margin-top: 34px; text-align: center; }
+  .ph-electronic-note {
+    font-size: 9px;
+    color: #64748b;
+    text-transform: none;
+    letter-spacing: 0.02em;
+    padding: 10px;
+    border-top: 1px solid #e2e8f0;
+  }
+
+  /* v3.9.15 — Robust page-break control (Safari/Chrome/Firefox) */
+  @media print {
+    @page { size: A4; margin: 10mm 12mm 10mm 12mm; }
+    html, body { background: #fff !important; }
+    .pdoc2 { padding: 0; margin: 0 auto; max-width: 100%; }
+
+    /* Header + info card: never split */
+    .ph-headrow,
+    .ph-info,
+    .ph-info tr,
+    .ph-info td {
+      page-break-inside: avoid !important;
+      break-inside: avoid !important;
+    }
+
+    /* Items table — the critical one for long docs */
+    .ph-items {
+      border-collapse: collapse !important;
+    }
+    /* Thead repeats on every page */
+    .ph-items thead {
+      display: table-header-group !important;
+    }
+    .ph-items tbody {
+      display: table-row-group !important;
+    }
+    /* Each row stays whole; cell borders stay intact across pages */
+    .ph-items tr {
+      page-break-inside: avoid !important;
+      break-inside: avoid !important;
+    }
+    .ph-items th,
+    .ph-items td {
+      border: var(--ph-border-w) solid var(--ph-border) !important;
+    }
+
+    /* Totals + Terms/Bank + Amount-in-words + Footer:
+       keep EACH block intact AND try to group them together */
+    .ph-stack-totals,
+    .ph-stack-totals tr,
+    .ph-terms-bank,
+    .ph-terms-bank tr,
+    .ph-terms-bank td,
+    .ph-amount-words,
+    .ph-notes,
+    .ph-footer {
+      page-break-inside: avoid !important;
+      break-inside: avoid !important;
+    }
+    /* Keep totals attached to terms-bank where possible */
+    .ph-stack-totals { page-break-after: avoid; break-after: avoid; }
+    .ph-terms-bank  { page-break-after: avoid; break-after: avoid; }
+    .ph-amount-words{ page-break-after: avoid; break-after: avoid; }
+
+    /* Avoid lonely headings at page bottom */
+    .ph-box-label { page-break-after: avoid; break-after: avoid; }
+
+    /* No orphan electronic footer */
+    .ph-electronic-note { page-break-before: avoid; break-before: avoid; }
+  }
+
+  /* Screen preview — apply inside the viewport too */
+  .ph-items tr,
+  .ph-stack-totals,
+  .ph-terms-bank,
+  .ph-terms-bank tr,
+  .ph-amount-words,
+  .ph-notes,
+  .ph-footer { page-break-inside: avoid; break-inside: avoid; }
+</style>
+</head>
+<body>
+
+<div class="no-print">
+  <div class="no-print-title">${typeTitle} · ${escapeHtml(d.docNumber)}</div>
+  <button onclick="window.print()">🖨 Print / Save as PDF</button>
+  <button onclick="window.close()">✕ Close</button>
+  <div class="no-print-hint">
+    <strong>📌 For clean PDF (no date/URL at top):</strong>
+    Chrome print dialog → <strong>"More settings"</strong> → <strong>uncheck "Headers and footers"</strong> + <strong>check "Background graphics"</strong>
+  </div>
+</div>
+
+<div class="pdoc2">
+  <!-- Header: biz name/logo (left) + doc title (right) -->
+  <table class="ph-headrow">
+    <tr>
+      <td style="width:60%;">
+        ${seller.logoUrl
+          ? `<img src="${escapeHtml(seller.logoUrl)}" class="ph-logo" alt="Logo">
+             <div class="ph-bizname">${escapeHtml(seller.businessName || "")}</div>`
+          : `<div class="ph-bizname">${escapeHtml(seller.businessName || "")}</div>`}
+      </td>
+      <td style="width:40%; text-align:right; vertical-align:top;">
+        <div class="ph-doctitle">${typeTitle}</div>
+      </td>
+    </tr>
+  </table>
+
+  <!-- 3-column info: metadata / Billed By (seller) / Billed To (customer) -->
+  <table class="ph-info">
+    <tr>
+      <td class="ph-info-col">
+        <div>
+          <span class="ph-label">${metaLabel} No #</span><br>
+          <b class="ph-strong">${escapeHtml(d.docNumber)}</b>
+        </div>
+        <div>
+          <span class="ph-label">${metaLabel} Date</span><br>
+          <b class="ph-strong">${formatDateIndian(d.docDate)}</b>
+        </div>
+        ${docType === "PI" ? `
+          <div>
+            <span class="ph-label">Valid Until</span><br>
+            <b class="ph-strong">30 days from issue</b>
+          </div>` : ""}
+        ${docType === "R" && d.paymentMode ? `
+          <div>
+            <span class="ph-label">Payment Mode</span><br>
+            <b class="ph-strong">${escapeHtml(d.paymentMode.toUpperCase())}</b>
+          </div>` : ""}
+      </td>
+
+      <td class="ph-box ph-box-billed">
+        <div class="ph-box-label">Billed By</div>
+        <b class="ph-strong">${escapeHtml(seller.businessName || "")}</b><br>
+        ${seller.address ? `${escapeHtml(seller.address)}<br>` : ""}
+        ${escapeHtml([seller.city, seller.state, seller.pincode].filter(Boolean).join(", "))}
+        ${seller.gstin ? `<br>GSTIN: <b>${escapeHtml(seller.gstin)}</b>` : ""}
+        ${seller.pan ? `<br>PAN: <b>${escapeHtml(seller.pan)}</b>` : ""}
+        ${seller.contactPhone ? `<br>Phone: <b>${escapeHtml(seller.contactPhone)}</b>` : ""}
+        ${seller.contactEmail ? `<br>Email: <b>${escapeHtml(seller.contactEmail)}</b>` : ""}
+      </td>
+
+      <td class="ph-box ph-box-billed">
+        <div class="ph-box-label">${docType === "R" ? "Received From" : "Billed To"}</div>
+        ${billedToHtml}
+        ${shipToHtml ? `
+          <div class="ph-sub-label">Ship To</div>
+          ${shipToHtml}` : ""}
+      </td>
+    </tr>
+  </table>
+
+  <!-- Items table — self-contained borders so page breaks keep left/right lines -->
+  <table class="ph-items">
+    <thead>
+      <tr>
+        <th style="width:22px; text-align:center;">#</th>
+        <th>Vehicle</th>
+        <th>IMEI</th>
+        <th style="text-align:center;">HSN/SAC</th>
+        ${showPeriod ? `<th>Subscription Period</th>` : ""}
+        <th style="text-align:right;">Rate / Amount (₹)</th>
+      </tr>
+    </thead>
+    <tbody>${itemsHtml}</tbody>
+  </table>
+
+  <!-- Right-aligned stack totals -->
+  <table class="ph-stack-totals">
+    <tr>
+      <td>${applyGst ? "Amount (Taxable)" : "Amount"}</td>
+      <td>₹${d.subtotal.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</td>
+    </tr>
+    ${applyGst && !showIgst ? `
+      <tr>
+        <td>CGST @ ${d.gstRate / 2}%</td>
+        <td>₹${d.cgst.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</td>
+      </tr>
+      <tr>
+        <td>SGST @ ${d.gstRate / 2}%</td>
+        <td>₹${d.sgst.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</td>
+      </tr>` : ""}
+    ${applyGst && showIgst ? `
+      <tr>
+        <td>IGST @ ${d.gstRate}%</td>
+        <td>₹${d.igst.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</td>
+      </tr>` : ""}
+    <tr class="grand">
+      <td>${docType === "R" ? "Total Received (INR)" : "Total (INR)"}</td>
+      <td>₹${d.total.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</td>
+    </tr>
+  </table>
+
+  <!-- Terms + Bank -->
+  <table class="ph-terms-bank">
+    <tr>
+      <td>
+        <div class="ph-box-label">Terms and Conditions</div>
+        <div class="ph-terms-body">${escapeHtml(termsText)}</div>
+      </td>
+      <td>
+        <div class="ph-box-label">${docType === "R" ? "Received With Thanks" : "Bank Details"}</div>
+        ${docType === "R" ? `
+          <div style="text-transform:none; font-size:9px; line-height:1.6;">
+            Received the sum of <b style="font-weight:700;">₹${d.total.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</b>
+            (${escapeHtml(amountInWords)} Rupees Only)
+            towards GPS SIM subscription renewal for the vehicles listed above${d.paymentMode ? ` via <b style="font-weight:700;">${escapeHtml(d.paymentMode.toUpperCase())}</b>` : ""}.
+          </div>
+        ` : `
+          <div style="text-transform:none; font-size:9px; line-height:1.7;">
+            Account Name &nbsp;·&nbsp; <b style="font-weight:700;">${escapeHtml(seller.bankAccountHolder || seller.businessName || "")}</b><br>
+            Account Number &nbsp;·&nbsp; <b style="font-weight:700;">${escapeHtml(seller.bankAccountNo || "—")}</b><br>
+            IFSC &nbsp;·&nbsp; <b style="font-weight:700;">${escapeHtml(seller.bankIfsc || "—")}</b><br>
+            Account Type &nbsp;·&nbsp; <b style="font-weight:700;">Current</b><br>
+            Bank &nbsp;·&nbsp; <b style="font-weight:700;">${escapeHtml(seller.bankName || "—")}</b>
+          </div>
+        `}
+      </td>
+    </tr>
+  </table>
+
+  <!-- Amount in words -->
+  <div class="ph-amount-words">
+    Amount In Words: ${escapeHtml(amountInWords.toUpperCase())} RUPEES ONLY
+  </div>
+
+  ${d.notes ? `
+  <div class="ph-notes">
+    <b>Notes:</b> ${escapeHtml(d.notes).replace(/\n/g, "<br>")}
+  </div>` : ""}
+
+  <!-- Electronic footer -->
+  <div class="ph-footer">
+    <p class="ph-electronic-note">This is an electronically generated document, no signature is required.</p>
+  </div>
+
+</div>
+</body>
+</html>`;
+}
+
+function openDocumentPrintWindow(html, title) {
+  const win = window.open("", "_blank", "width=900,height=1100");
+  if (!win) {
+    showToast("Popup blocked — allow popups for this site.", true);
+    return;
+  }
+  win.document.write(html);
+  win.document.close();
+  win.document.title = title || "Document";
+}
+
+/* Number to words (Indian system — thousands, lakhs, crores) */
+function numToWords(n) {
+  if (n === 0) return "Zero";
+  const a = ["","One","Two","Three","Four","Five","Six","Seven","Eight","Nine","Ten","Eleven","Twelve","Thirteen","Fourteen","Fifteen","Sixteen","Seventeen","Eighteen","Nineteen"];
+  const b = ["","","Twenty","Thirty","Forty","Fifty","Sixty","Seventy","Eighty","Ninety"];
+  const inWords = (num) => {
+    if (num < 20) return a[num];
+    if (num < 100) return b[Math.floor(num / 10)] + (num % 10 ? " " + a[num % 10] : "");
+    if (num < 1000) return a[Math.floor(num / 100)] + " Hundred" + (num % 100 ? " " + inWords(num % 100) : "");
+    return "";
+  };
+  n = Math.abs(Math.round(n));
+  const crore = Math.floor(n / 10000000);
+  n %= 10000000;
+  const lakh = Math.floor(n / 100000);
+  n %= 100000;
+  const thousand = Math.floor(n / 1000);
+  n %= 1000;
+  const hundred = n;
+  let out = "";
+  if (crore) out += inWords(crore) + " Crore ";
+  if (lakh) out += inWords(lakh) + " Lakh ";
+  if (thousand) out += inWords(thousand) + " Thousand ";
+  if (hundred) out += inWords(hundred);
+  return out.trim();
 }
 
 initApp();
